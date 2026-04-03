@@ -1,0 +1,84 @@
+[package]
+name = "rust-agent"
+version = "0.1.0"
+edition = "2021"
+description = "Rust-based AI Agent Core Engine"
+authors = ["Paul Yu <yhc007@gmail.com>"]
+repository = "https://github.com/yhc007/rust-agent"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# HTTP client
+reqwest = { version = "0.12", features = ["json", "stream"] }
+
+# JSON
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Terminal UI
+ratatui = "0.29"
+crossterm = "0.28"
+
+# Async traits
+async-trait = "0.1"
+
+# Error handling
+anyhow = "1"
+thiserror = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Streaming
+tokio-stream = "0.1"
+futures = "0.3"
+eventsource-stream = "0.2"
+
+# File watching
+notify = "7"
+
+# Fuzzy search
+fuzzy-matcher = "0.3"
+
+# UUID
+uuid = { version = "1", features = ["v4"] }
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Shell parsing (for AST security)
+tree-sitter = "0.24"
+tree-sitter-bash = "0.23"
+
+# Process management
+nix = { version = "0.29", features = ["process", "signal"] }
+
+# Directory walking
+walkdir = "2"
+globset = "0.4"
+grep-regex = "0.1"
+grep-searcher = "0.1"
+
+# Template (for prompts)
+minijinja = "2"
+
+[dev-dependencies]
+tokio-test = "0.4"
+tempfile = "3"
+assert_cmd = "2"
+predicates = "3"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+
+[[bin]]
+name = "rust-agent"
+path = "src/main.rs"
