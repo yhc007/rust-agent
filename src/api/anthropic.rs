@@ -134,8 +134,9 @@ impl AnthropicClient {
             api_key,
         }
     }
-    
-    /// Create a message (non-streaming)
+
+    /// Create a message (non-streaming). Used by both the inherent
+    /// API (back-compat) and the [`ApiClient`] trait impl below.
     pub async fn create_message(&self, request: CreateMessageRequest) -> Result<CreateMessageResponse> {
         let response = self.client
             .post(API_URL)
@@ -285,5 +286,24 @@ impl AnthropicClient {
         } else {
             None
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ApiClient trait — used by QueryEngine via Box<dyn ApiClient>.
+// AnthropicClient's wire format IS the canonical internal shape, so
+// the trait impl is just a method-forward.
+// ---------------------------------------------------------------------------
+
+#[async_trait::async_trait]
+impl super::client::ApiClient for AnthropicClient {
+    fn label(&self) -> &'static str {
+        "anthropic"
+    }
+    async fn create_message(
+        &self,
+        request: CreateMessageRequest,
+    ) -> Result<CreateMessageResponse> {
+        AnthropicClient::create_message(self, request).await
     }
 }

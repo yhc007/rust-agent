@@ -14,7 +14,7 @@ mod memory;
 mod tui;
 
 use engine::QueryEngine;
-use config::Config;
+use config::{Backend, Config};
 
 #[derive(Parser)]
 #[command(name = "rust-agent")]
@@ -170,9 +170,25 @@ fn list_tools() {
 
 fn show_config(config: &Config) {
     println!("⚙️  Configuration:\n");
-    println!("  API Key: {}...{}", 
-        &config.api_key[..8], 
-        &config.api_key[config.api_key.len()-4..]);
+    println!("  Backend: {}", config.backend.label());
+    match &config.backend {
+        Backend::Anthropic { api_key } => {
+            println!("  API Key: {}", masked(api_key));
+        }
+        Backend::OpenAICompat { api_key, base_url } => {
+            println!("  Base URL: {base_url}");
+            println!("  API Key: {}", masked(api_key));
+        }
+    }
+    println!("  Model: {}", config.model);
     println!("  Max Tokens: {}", config.max_tokens);
     println!("  Tool Timeout: {:?}", config.tool_timeout);
+}
+
+fn masked(key: &str) -> String {
+    if key.len() < 12 {
+        // Short keys (e.g. "dummy") are clearly placeholders — show as-is.
+        return key.to_string();
+    }
+    format!("{}...{}", &key[..8], &key[key.len() - 4..])
 }
