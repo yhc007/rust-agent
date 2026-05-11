@@ -26,8 +26,13 @@ struct Cli {
     #[arg(short, long)]
     verbose: bool,
     
-    /// Model to use
-    #[arg(short, long, default_value = "claude-sonnet-4-20250514")]
+    /// Model to use. Empty / unset → fall back to whatever
+    /// `Config::load` picked for the active backend (default
+    /// `claude-sonnet-4-20250514` on Anthropic, `OPENAI_MODEL` on
+    /// the OpenAI-compat backend). Setting this here previously
+    /// hard-coded an Anthropic id that the OpenAI path then sent to
+    /// vLLM, which rejected the request with 404.
+    #[arg(short, long, default_value = "")]
     model: String,
     
     /// Run a single prompt and exit
@@ -104,9 +109,10 @@ async fn main() -> Result<()> {
 
 async fn run_chat(config: Config, model: String, initial_prompt: Option<String>) -> Result<()> {
     println!("🦀 Rust Agent v0.1.0");
-    println!("Model: {}", model);
+    let resolved = if model.is_empty() { config.model.clone() } else { model.clone() };
+    println!("Model: {}", resolved);
     println!("Type 'exit' or Ctrl+C to quit\n");
-    
+
     let mut engine = QueryEngine::new(config, model)?;
     
     // Handle initial prompt if provided
