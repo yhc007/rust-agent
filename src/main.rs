@@ -151,12 +151,21 @@ async fn run_task(config: Config, model: String, task: String) -> Result<()> {
 
 fn list_tools() {
     println!("📦 Available Tools:\n");
-    println!("  bash        - Execute shell commands");
-    println!("  file_read   - Read file contents");
-    println!("  file_write  - Write to files");
-    println!("  file_edit   - Edit files with search/replace");
-    println!("  grep        - Search file contents");
-    println!("  glob        - Find files by pattern");
+    println!("  Local:");
+    println!("    bash               - Execute shell commands");
+    println!("    file_read          - Read file contents");
+    println!("    file_write         - Write to files");
+    println!("    file_edit          - Edit files with search/replace");
+    println!("    grep               - Search file contents");
+    println!("    glob               - Find files by pattern");
+    println!();
+    println!("  pdf-kg (registered when PDFKG_BACKEND_URL is set or default :8088 reachable):");
+    println!("    pdfkg_list_jobs    - Enumerate indexed PDFs");
+    println!("    pdfkg_search       - Retrieve top-k graph nodes (no LLM)");
+    println!("    pdfkg_ask          - End-to-end RAG with multimodal answer");
+    println!("    pdfkg_get_page     - Read one page's chunks + image refs");
+    println!("    pdfkg_get_image    - Image metadata + bytes_url");
+    println!("    pdfkg_get_subgraph - Ego-subgraph traversal");
 }
 
 fn show_config(config: &Config) {
