@@ -40,6 +40,10 @@ tokio-stream = "0.1"
 futures = "0.3"
 eventsource-stream = "0.2"
 
+# Embedded web server for the agent-stream UI (rust-agent serve)
+axum = { version = "0.7", features = ["macros"] }
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+
 # File watching
 notify = "7"
 

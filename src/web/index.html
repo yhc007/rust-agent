@@ -1,0 +1,308 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>rust-agent — live agent loop</title>
+  <style>
+    :root {
+      --bg: #0b0d10;
+      --panel: #14171c;
+      --panel-2: #1c2026;
+      --border: #2a3038;
+      --text: #d9dde3;
+      --muted: #8a929b;
+      --accent: #7aa2f7;
+      --tool: #e6b96d;
+      --error: #f7768e;
+      --good: #9ece6a;
+      --code: #c0caf5;
+    }
+    html, body {
+      margin: 0; padding: 0;
+      background: var(--bg); color: var(--text);
+      font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      height: 100%;
+    }
+    .container {
+      max-width: 960px;
+      margin: 0 auto;
+      padding: 24px 16px 80px;
+    }
+    h1 {
+      margin: 0 0 6px;
+      font-size: 18px;
+      font-weight: 600;
+    }
+    .sub {
+      color: var(--muted);
+      font-size: 12px;
+      margin-bottom: 20px;
+    }
+    .sub code { background: var(--panel); padding: 1px 5px; border-radius: 3px; color: var(--code); }
+    .input-row {
+      display: flex; gap: 8px;
+      margin-bottom: 16px;
+    }
+    .input-row textarea {
+      flex: 1; min-height: 56px; max-height: 200px;
+      background: var(--panel); color: var(--text);
+      border: 1px solid var(--border); border-radius: 6px;
+      padding: 10px 12px; font: inherit; resize: vertical;
+    }
+    .input-row textarea:focus { outline: 1px solid var(--accent); }
+    .input-row button {
+      background: var(--accent); color: #0b0d10; border: 0; border-radius: 6px;
+      padding: 0 18px; font-weight: 600; cursor: pointer;
+      align-self: flex-end; height: 38px;
+    }
+    .input-row button[disabled] { opacity: 0.5; cursor: not-allowed; }
+    .events { display: flex; flex-direction: column; gap: 10px; }
+    .ev {
+      border: 1px solid var(--border); border-radius: 6px;
+      background: var(--panel);
+      padding: 10px 12px;
+    }
+    .ev.text { background: var(--panel-2); }
+    .ev.tool {
+      border-color: rgba(230, 185, 109, 0.4);
+      background: rgba(230, 185, 109, 0.06);
+    }
+    .ev.result {
+      background: var(--panel-2);
+      border-color: rgba(158, 206, 106, 0.3);
+    }
+    .ev.result.is-error {
+      border-color: rgba(247, 118, 142, 0.5);
+      background: rgba(247, 118, 142, 0.06);
+    }
+    .ev.error {
+      border-color: var(--error);
+      color: var(--error);
+    }
+    .ev.done {
+      border-color: var(--good);
+      color: var(--good);
+      font-style: italic;
+      text-align: center;
+      padding: 4px;
+    }
+    .head {
+      display: flex; align-items: center; gap: 6px;
+      font-size: 11px;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      color: var(--muted);
+      margin-bottom: 4px;
+    }
+    .head .tag {
+      color: var(--accent);
+      font-weight: 600;
+    }
+    .ev.tool .head .tag { color: var(--tool); }
+    .ev.result .head .tag { color: var(--good); }
+    .ev.result.is-error .head .tag { color: var(--error); }
+    pre {
+      margin: 0;
+      white-space: pre-wrap;
+      word-break: break-word;
+      font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+      font-size: 12.5px;
+      color: var(--code);
+    }
+    .body-text {
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    details summary {
+      cursor: pointer; user-select: none;
+      color: var(--muted);
+      font-size: 12px;
+    }
+    details[open] summary { margin-bottom: 6px; }
+    .footer {
+      margin-top: 24px;
+      color: var(--muted);
+      font-size: 12px;
+      text-align: center;
+    }
+    .footer code { color: var(--code); }
+    .examples {
+      display: flex; gap: 6px; flex-wrap: wrap;
+      margin-bottom: 16px;
+    }
+    .examples button {
+      background: var(--panel); color: var(--muted);
+      border: 1px solid var(--border); border-radius: 14px;
+      padding: 3px 10px; font: inherit; font-size: 12px; cursor: pointer;
+    }
+    .examples button:hover { color: var(--text); border-color: var(--accent); }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>rust-agent — live agent loop</h1>
+    <div class="sub">
+      Each prompt spawns the agent in <code>QueryEngine::process_input_streamed</code>; tool calls
+      and results stream back over SSE as they happen. Tools include local
+      (<code>bash</code>, <code>file_*</code>, <code>grep</code>) and pdf-kg
+      (<code>pdfkg_search</code>, <code>pdfkg_ask</code>, …).
+    </div>
+    <div class="examples">
+      <button data-q="지게차 안전수칙을 알려줘. 어느 PDF의 몇 페이지에 있는지도 표시.">지게차 안전수칙</button>
+      <button data-q="안전모 착용 사진을 찾고 어디 페이지에 있는지 알려줘.">안전모 사진</button>
+      <button data-q="고소작업대 사용 시 주의사항을 정리해줘.">고소작업대</button>
+      <button data-q="List the PDFs available and how many nodes each has.">list PDFs</button>
+    </div>
+    <div class="input-row">
+      <textarea id="prompt" placeholder="질문을 입력하세요. 예: 지게차 안전수칙 한 가지만 인용해줘"></textarea>
+      <button id="send">Run</button>
+    </div>
+    <div class="events" id="events"></div>
+  </div>
+<script>
+const promptEl = document.getElementById("prompt");
+const eventsEl = document.getElementById("events");
+const sendBtn = document.getElementById("send");
+
+document.querySelectorAll(".examples button").forEach(b => {
+  b.addEventListener("click", () => {
+    promptEl.value = b.dataset.q;
+    promptEl.focus();
+  });
+});
+
+promptEl.addEventListener("keydown", e => {
+  if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+    e.preventDefault(); sendBtn.click();
+  }
+});
+
+function el(tag, opts = {}, children = []) {
+  const e = document.createElement(tag);
+  if (opts.className) e.className = opts.className;
+  if (opts.text) e.textContent = opts.text;
+  if (opts.html) e.innerHTML = opts.html;
+  for (const c of children) e.appendChild(c);
+  return e;
+}
+
+function preview(s, n=600) {
+  if (!s) return "";
+  if (s.length <= n) return s;
+  return s.slice(0, n) + "\n… (" + (s.length - n) + " more chars; expand to see all)";
+}
+
+function renderEvent(ev) {
+  switch (ev.type) {
+    case "start": {
+      eventsEl.innerHTML = "";
+      const e = el("div", { className: "ev done", text: "agent loop started" });
+      eventsEl.appendChild(e);
+      return;
+    }
+    case "text": {
+      const e = el("div", { className: "ev text" });
+      e.appendChild(el("div", { className: "head", html: '<span class="tag">assistant</span>' }));
+      e.appendChild(el("div", { className: "body-text", text: ev.content }));
+      eventsEl.appendChild(e);
+      break;
+    }
+    case "tool_use": {
+      const e = el("div", { className: "ev tool" });
+      const head = el("div", { className: "head" });
+      head.innerHTML = `<span class="tag">tool</span> ${ev.name} <span style="color:#5a626c">${ev.id}</span>`;
+      e.appendChild(head);
+      const det = el("details");
+      det.appendChild(el("summary", { text: "arguments" }));
+      const pre = el("pre", { text: JSON.stringify(ev.input, null, 2) });
+      det.appendChild(pre);
+      e.appendChild(det);
+      eventsEl.appendChild(e);
+      break;
+    }
+    case "tool_result": {
+      const e = el("div", { className: "ev result" + (ev.is_error ? " is-error" : "") });
+      const head = el("div", { className: "head" });
+      head.innerHTML = `<span class="tag">${ev.is_error ? "tool error" : "tool result"}</span> <span style="color:#5a626c">${ev.tool_use_id}</span>`;
+      e.appendChild(head);
+      const det = el("details");
+      const sumTxt = ev.is_error ? "error content (click)" : "result (" + ev.content.length + " chars)";
+      det.appendChild(el("summary", { text: sumTxt }));
+      det.appendChild(el("pre", { text: ev.content }));
+      e.appendChild(det);
+      const previewBox = el("pre", {
+        text: preview(ev.content, 240),
+        className: "preview",
+      });
+      previewBox.style.color = "#8a929b";
+      previewBox.style.fontSize = "12px";
+      e.appendChild(previewBox);
+      eventsEl.appendChild(e);
+      break;
+    }
+    case "done": {
+      eventsEl.appendChild(el("div", { className: "ev done", text: "loop complete" }));
+      break;
+    }
+    case "error": {
+      const e = el("div", { className: "ev error" });
+      e.appendChild(el("div", { className: "head", html: '<span class="tag">error</span>' }));
+      e.appendChild(el("div", { className: "body-text", text: ev.message }));
+      eventsEl.appendChild(e);
+      break;
+    }
+  }
+  window.scrollTo(0, document.body.scrollHeight);
+}
+
+async function runAgent(prompt) {
+  sendBtn.disabled = true;
+  sendBtn.textContent = "Running…";
+  try {
+    const resp = await fetch("/api/agent/run", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ prompt }),
+    });
+    if (!resp.ok) {
+      renderEvent({ type: "error", message: "HTTP " + resp.status + ": " + await resp.text() });
+      return;
+    }
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = "";
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      // SSE: events separated by blank lines; payload on "data:" lines.
+      let idx;
+      while ((idx = buf.indexOf("\n\n")) !== -1) {
+        const block = buf.slice(0, idx);
+        buf = buf.slice(idx + 2);
+        const dataLines = block.split("\n")
+          .filter(l => l.startsWith("data:"))
+          .map(l => l.slice(5).trimStart());
+        if (!dataLines.length) continue;
+        const payload = dataLines.join("\n");
+        try { renderEvent(JSON.parse(payload)); }
+        catch (e) { console.warn("bad SSE payload", payload, e); }
+      }
+    }
+  } catch (e) {
+    renderEvent({ type: "error", message: String(e) });
+  } finally {
+    sendBtn.disabled = false;
+    sendBtn.textContent = "Run";
+  }
+}
+
+sendBtn.addEventListener("click", () => {
+  const q = promptEl.value.trim();
+  if (!q) return;
+  runAgent(q);
+});
+</script>
+</body>
+</html>

@@ -12,6 +12,7 @@ mod engine;
 mod tools;
 mod memory;
 mod tui;
+mod web;
 
 use engine::QueryEngine;
 use config::{Backend, Config};
@@ -60,6 +61,16 @@ enum Commands {
     Tools,
     /// Show configuration
     Config,
+    /// Serve the agent over HTTP — opens a browser-friendly SSE
+    /// endpoint at /api/agent/run and a single-page UI at /.
+    Serve {
+        /// Port to bind. Defaults to 8090.
+        #[arg(short = 'P', long, default_value = "8090")]
+        port: u16,
+        /// Bind address. Defaults to 127.0.0.1; use 0.0.0.0 to expose.
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+    },
 }
 
 #[tokio::main]
@@ -93,6 +104,9 @@ async fn main() -> Result<()> {
         }
         Some(Commands::Config) => {
             show_config(&config);
+        }
+        Some(Commands::Serve { port, host }) => {
+            run_serve(config, cli.model, host, port).await?;
         }
         None => {
             // Default: interactive chat
@@ -152,6 +166,24 @@ async fn run_chat(config: Config, model: String, initial_prompt: Option<String>)
 async fn run_task(config: Config, model: String, task: String) -> Result<()> {
     let mut engine = QueryEngine::new(config, model)?;
     engine.process_input(&task).await?;
+    Ok(())
+}
+
+async fn run_serve(config: Config, model: String, host: String, port: u16) -> Result<()> {
+    let addr: std::net::SocketAddr = format!("{host}:{port}").parse()?;
+    let resolved_model = if model.is_empty() {
+        config.model.clone()
+    } else {
+        model.clone()
+    };
+    println!("🦀 rust-agent serve");
+    println!("  backend: {}", config.backend.label());
+    println!("  model:   {}", resolved_model);
+    println!("  open:    http://{addr}/");
+    println!();
+    let app = web::build_router(config, model);
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    axum::serve(listener, app).await?;
     Ok(())
 }
 

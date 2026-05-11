@@ -1,7 +1,19 @@
-//! Query Engine - the main agent loop
+//! Query Engine — the main agent loop.
+//!
+//! Two entry points share the same internal state machine:
+//!
+//! - [`QueryEngine::process_input`] — CLI-friendly. Prints text /
+//!   tool previews to stdout, returns when the loop exits.
+//! - [`QueryEngine::process_input_streamed`] — emits structured
+//!   [`AgentEvent`]s on an mpsc channel as they happen. Used by the
+//!   web SSE endpoint so a browser can render the chain live.
+//!
+//! Both go through the same private [`Self::run_loop`] which drives
+//! the conversation + tool execution; only the event sink differs.
 
 use anyhow::Result;
-use std::io::Write;
+use serde::Serialize;
+use tokio::sync::mpsc;
 
 use crate::api::{
     ApiClient, AnthropicClient, ContentBlock, CreateMessageRequest, Message, MessageRole,
@@ -10,18 +22,56 @@ use crate::api::{
 use crate::config::{Backend, Config};
 use crate::tools::{create_default_registry, tool_to_definition, ToolContext, ToolRegistry};
 
-const SYSTEM_PROMPT: &str = r#"You are a helpful AI assistant with access to tools for interacting with the local system.
+const SYSTEM_PROMPT: &str = r#"You are a helpful AI assistant with access to tools for interacting with the local system and the indexed pdf-kg knowledge graph.
 
 When using tools:
 - Use the bash tool for shell commands
 - Use file_read to examine file contents
 - Use file_write to create or modify files
 - Use grep to search for patterns in files
+- Use pdfkg_list_jobs / pdfkg_search / pdfkg_ask / pdfkg_get_page / pdfkg_get_image / pdfkg_get_subgraph for PDF retrieval and question-answering
 
 Be concise but thorough. When you make changes, verify they worked.
 "#;
 
-/// Query Engine - manages the conversation and tool execution
+/// One observable step in the agent loop. Serializable so the web
+/// SSE endpoint can stringify each event into a `data:` line.
+///
+/// Lifecycle: `Start` (once) → zero or more
+/// `Text` / `ToolUse` / `ToolResult` → `Done` (once, on success) or
+/// `Error` (once, on failure). Consumers can rely on at most one
+/// terminal event.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum AgentEvent {
+    /// First event in the stream — useful for UIs that want to clear
+    /// previous run state before the new chain starts.
+    Start,
+    /// Plain assistant text. The model may emit multiple of these
+    /// across multiple turns; render in order.
+    Text { content: String },
+    /// Assistant decided to call a tool. `id` correlates with the
+    /// subsequent `ToolResult.tool_use_id`.
+    ToolUse {
+        id: String,
+        name: String,
+        input: serde_json::Value,
+    },
+    /// Tool finished executing. `is_error: true` means the model
+    /// should adapt on the next turn rather than the loop bailing.
+    ToolResult {
+        tool_use_id: String,
+        content: String,
+        is_error: bool,
+    },
+    /// Loop exited cleanly (no more tool_use blocks in the latest
+    /// assistant response). Terminal.
+    Done,
+    /// Transport / API / I/O failure that broke the loop. Terminal.
+    Error { message: String },
+}
+
+/// Query Engine — manages the conversation and tool execution
 pub struct QueryEngine {
     /// Boxed so the engine doesn't care whether it's talking to
     /// Anthropic or an OpenAI-compat endpoint (vLLM etc.).
@@ -63,21 +113,127 @@ impl QueryEngine {
             ctx: ToolContext::default(),
         })
     }
-    
-    /// Process user input
+
+    /// CLI entry point — runs the agent loop and prints text + tool
+    /// previews to stdout. Internally just consumes the event stream
+    /// of [`Self::process_input_streamed`] and renders each event,
+    /// so it stays in sync with the web path automatically.
     pub async fn process_input(&mut self, input: &str) -> Result<()> {
+        use std::io::Write;
+        let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
+        // Drain the events on the same task — keeps stdout output
+        // ordered with the loop's progress. (A background task would
+        // race the parent returning.)
+        let input = input.to_string();
+        let loop_fut = self.run_loop(input, tx);
+        // Use a join-style pattern: poll the loop and the receiver
+        // together so events print as they fire.
+        tokio::pin!(loop_fut);
+        loop {
+            tokio::select! {
+                biased;
+                Some(ev) = rx.recv() => print_event(&ev)?,
+                res = &mut loop_fut => {
+                    // Drain any trailing events before returning.
+                    while let Ok(ev) = rx.try_recv() {
+                        print_event(&ev)?;
+                    }
+                    return res;
+                }
+            }
+        }
+        // Unreachable
+        fn print_event(ev: &AgentEvent) -> Result<()> {
+            match ev {
+                AgentEvent::Text { content } => {
+                    println!("{content}");
+                }
+                AgentEvent::ToolUse { name, input, .. } => {
+                    print!("\n[Tool: {name}] ");
+                    std::io::stdout().flush().ok();
+                    if let Some(cmd) = input.get("command").and_then(|v| v.as_str()) {
+                        println!("{cmd}");
+                    } else if let Some(path) = input.get("path").and_then(|v| v.as_str()) {
+                        println!("{path}");
+                    } else {
+                        println!("{}", serde_json::to_string_pretty(input)?);
+                    }
+                }
+                AgentEvent::ToolResult { content, .. } => {
+                    let preview: String =
+                        content.lines().take(5).collect::<Vec<_>>().join("\n");
+                    if !preview.is_empty() {
+                        println!("→ {preview}");
+                        if content.lines().count() > 5 {
+                            println!(
+                                "  ... ({} more lines)",
+                                content.lines().count() - 5
+                            );
+                        }
+                    }
+                }
+                AgentEvent::Start | AgentEvent::Done => {}
+                AgentEvent::Error { message } => {
+                    eprintln!("Error: {message}");
+                }
+            }
+            Ok(())
+        }
+    }
+
+    /// Web / SSE entry point — emits structured [`AgentEvent`]s as
+    /// the agent loop progresses. Caller owns the receiving half of
+    /// `tx` and decides how to render them. The returned future
+    /// resolves when the loop ends (cleanly or with an error event
+    /// already sent), so dropping the receiver after that point is
+    /// safe.
+    pub async fn process_input_streamed(
+        &mut self,
+        input: &str,
+        tx: mpsc::UnboundedSender<AgentEvent>,
+    ) -> Result<()> {
+        self.run_loop(input.to_string(), tx).await
+    }
+
+    /// Internal loop driver. Sends events on `tx`. Errors bubble
+    /// out via the `Result` AND get an `AgentEvent::Error` so SSE
+    /// consumers see the failure even if they're not awaiting the
+    /// future directly.
+    async fn run_loop(
+        &mut self,
+        input: String,
+        tx: mpsc::UnboundedSender<AgentEvent>,
+    ) -> Result<()> {
+        let _ = tx.send(AgentEvent::Start);
+
         // Add user message
         self.messages.push(Message {
             role: MessageRole::User,
-            content: vec![ContentBlock::Text { text: input.to_string() }],
+            content: vec![ContentBlock::Text { text: input }],
         });
-        
-        // Agent loop - continue until no more tool calls
+
+        let res = self.iterate(&tx).await;
+        match &res {
+            Ok(_) => {
+                let _ = tx.send(AgentEvent::Done);
+            }
+            Err(e) => {
+                let _ = tx.send(AgentEvent::Error {
+                    message: e.to_string(),
+                });
+            }
+        }
+        res
+    }
+
+    async fn iterate(&mut self, tx: &mpsc::UnboundedSender<AgentEvent>) -> Result<()> {
         loop {
             let response = self.send_message().await?;
-            
+
             // Collect tool uses from response
-            let tool_uses: Vec<ToolUse> = response.content.iter()
+            let tool_uses: Vec<ToolUse> = response
+                .content
+                .iter()
                 .filter_map(|block| {
                     if let ContentBlock::ToolUse(tu) = block {
                         Some(tu.clone())
@@ -86,89 +242,78 @@ impl QueryEngine {
                     }
                 })
                 .collect();
-            
-            // Print text content
+
+            // Emit text content
             for block in &response.content {
                 if let ContentBlock::Text { text } = block {
-                    println!("{}", text);
+                    let _ = tx.send(AgentEvent::Text {
+                        content: text.clone(),
+                    });
                 }
             }
-            
+
             // Add assistant message
             self.messages.push(Message {
                 role: MessageRole::Assistant,
                 content: response.content,
             });
-            
+
             // If no tool uses, we're done
             if tool_uses.is_empty() {
-                break;
+                return Ok(());
             }
-            
+
             // Execute tools and collect results
             let mut tool_results = Vec::new();
-            
             for tool_use in &tool_uses {
-                print!("\n[Tool: {}] ", tool_use.name);
-                std::io::stdout().flush()?;
-                
-                // Print a preview of the input
-                if let Some(cmd) = tool_use.input.get("command").and_then(|v| v.as_str()) {
-                    println!("{}", cmd);
-                } else if let Some(path) = tool_use.input.get("path").and_then(|v| v.as_str()) {
-                    println!("{}", path);
-                } else {
-                    println!("{}", serde_json::to_string_pretty(&tool_use.input)?);
-                }
-                
-                // Execute the tool
-                let result = self.tools.execute(
-                    &tool_use.name,
-                    tool_use.input.clone(),
-                    &self.ctx,
-                ).await;
-                
+                let _ = tx.send(AgentEvent::ToolUse {
+                    id: tool_use.id.clone(),
+                    name: tool_use.name.clone(),
+                    input: tool_use.input.clone(),
+                });
+
+                let result = self
+                    .tools
+                    .execute(&tool_use.name, tool_use.input.clone(), &self.ctx)
+                    .await;
                 let (content, is_error) = match result {
                     Ok(r) => (r.output, r.is_error),
                     Err(e) => (format!("Error: {}", e), true),
                 };
-                
-                // Print result preview
-                let preview: String = content.lines().take(5).collect::<Vec<_>>().join("\n");
-                if !preview.is_empty() {
-                    println!("→ {}", preview);
-                    if content.lines().count() > 5 {
-                        println!("  ... ({} more lines)", content.lines().count() - 5);
-                    }
-                }
-                
+
+                let _ = tx.send(AgentEvent::ToolResult {
+                    tool_use_id: tool_use.id.clone(),
+                    content: content.clone(),
+                    is_error,
+                });
+
                 tool_results.push(ToolResultBlock {
                     tool_use_id: tool_use.id.clone(),
                     content,
                     is_error,
                 });
             }
-            
+
             // Add tool results as user message
             self.messages.push(Message {
                 role: MessageRole::User,
-                content: tool_results.into_iter()
+                content: tool_results
+                    .into_iter()
                     .map(ContentBlock::ToolResult)
                     .collect(),
             });
         }
-        
-        Ok(())
     }
-    
-    /// Send message to Claude API
+
+    /// Send the current conversation to the underlying API.
     async fn send_message(&self) -> Result<crate::api::CreateMessageResponse> {
-        // Build tool definitions
-        let tool_defs: Vec<ToolDefinition> = self.tools.all()
+        let tool_defs: Vec<ToolDefinition> = self
+            .tools
+            .all()
             .iter()
             .map(|t| tool_to_definition(t.as_ref()))
             .collect();
-        
+
         let request = CreateMessageRequest {
             model: self.model.clone(),
             max_tokens: self.max_tokens,
@@ -177,7 +322,7 @@ impl QueryEngine {
             tools: Some(tool_defs),
             stream: None,
         };
-        
+
         self.client.create_message(request).await
     }
 }
