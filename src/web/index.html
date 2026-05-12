@@ -193,6 +193,51 @@ function preview(s, n=600) {
   return s.slice(0, n) + "\n… (" + (s.length - n) + " more chars; expand to see all)";
 }
 
+// Pull `job_id` strings out of a tool_result content blob and pair
+// each with a short label (the source filename when we can find it,
+// otherwise a truncated job_id). Used to render "Open in graph view"
+// chips that deep-link into pdf.coreon.build's standalone graph tab.
+// Tolerates non-JSON content — falls back to a regex pass so even
+// raw text mentioning a job_id surfaces the link.
+function extractGraphLinks(content) {
+  const out = [];
+  const seen = new Set();
+
+  function pushJob(jobId, sourceLabel) {
+    if (seen.has(jobId)) return;
+    seen.add(jobId);
+    const label = sourceLabel
+      ? sourceLabel.replace(/\.pdf$/i, "").slice(0, 32)
+      : jobId.slice(0, 16) + "…";
+    out.push({ jobId, label });
+  }
+
+  // Parse JSON when possible — the structured shape lets us pair
+  // job_id with source filename for nicer labels.
+  let parsed = null;
+  try { parsed = JSON.parse(content); } catch {}
+  if (parsed != null) {
+    const walk = (node) => {
+      if (Array.isArray(node)) { node.forEach(walk); return; }
+      if (node && typeof node === "object") {
+        // list_jobs row: {job_id, source, ...}
+        if (typeof node.job_id === "string" && /^job_[A-Za-z0-9]{8,64}$/.test(node.job_id)) {
+          pushJob(node.job_id, typeof node.source === "string" ? node.source : null);
+        }
+        for (const v of Object.values(node)) walk(v);
+      }
+    };
+    walk(parsed);
+  } else {
+    // Fallback: regex over raw content.
+    const re = /"job_id"\s*:\s*"(job_[A-Za-z0-9]{8,64})"/g;
+    let m;
+    while ((m = re.exec(content)) !== null) pushJob(m[1], null);
+  }
+  // Cap to keep the link row scannable.
+  return out.slice(0, 4);
+}
+
 function renderEvent(ev) {
   switch (ev.type) {
     case "start": {
@@ -238,6 +283,29 @@ function renderEvent(ev) {
       previewBox.style.color = "#8a929b";
       previewBox.style.fontSize = "12px";
       e.appendChild(previewBox);
+      // Cross-link: if the tool result contains job_ids (search hits,
+      // get_page response, etc.), surface "Open in graph view" chips
+      // pointing at pdf.coreon.build's standalone graph tab. Doesn't
+      // help text-only results — silently skips when no job_id found.
+      const links = extractGraphLinks(ev.content);
+      if (links.length > 0) {
+        const linkRow = el("div");
+        linkRow.style.marginTop = "6px";
+        linkRow.style.display = "flex";
+        linkRow.style.gap = "6px";
+        linkRow.style.flexWrap = "wrap";
+        for (const { jobId, label } of links) {
+          const a = document.createElement("a");
+          a.href = `https://pdf.coreon.build/#graph/${jobId}`;
+          a.target = "_blank";
+          a.rel = "noopener";
+          a.textContent = `↗ ${label}`;
+          a.style.cssText =
+            "background:#1c2026;color:#7aa2f7;border:1px solid #2a3038;border-radius:14px;padding:2px 10px;font-size:11px;text-decoration:none;";
+          linkRow.appendChild(a);
+        }
+        e.appendChild(linkRow);
+      }
       eventsEl.appendChild(e);
       break;
     }
@@ -303,6 +371,21 @@ sendBtn.addEventListener("click", () => {
   if (!q) return;
   runAgent(q);
 });
+
+// URL params: ?q=...  (or ?prompt=, ?question=) prefills the textarea.
+// Add &run=1 to auto-fire (useful for share links).
+(function preloadFromUrl() {
+  const params = new URLSearchParams(window.location.search);
+  const q = params.get("q") || params.get("prompt") || params.get("question");
+  if (q) {
+    promptEl.value = q;
+    if (params.get("run") === "1") {
+      runAgent(q);
+    } else {
+      promptEl.focus();
+    }
+  }
+})();
 </script>
 </body>
 </html>
