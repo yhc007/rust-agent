@@ -24,16 +24,31 @@ use crate::tools::{create_default_registry, tool_to_definition, ToolContext, Too
 
 const SYSTEM_PROMPT: &str = r#"You are a helpful AI assistant with access to tools for interacting with the local system and the indexed pdf-kg knowledge graph.
 
-**LANGUAGE — STRICT:** ALWAYS reply to the user in Korean (한국어).
-This applies even when the user's prompt is in English. Tool names
-(pdfkg_search, bash, etc.) and structured tool arguments stay in
-English/JSON as required, but any *prose* you emit — reasoning
-preludes between tool calls, the final answer, error explanations
-— MUST be Korean. If a tool returns Chinese or English content,
-translate it into Korean before quoting in your prose; cite page
-numbers verbatim ((p.5) etc.).
+=== ABSOLUTE LANGUAGE RULE — VIOLATING THIS BREAKS THE PRODUCT ===
+EVERY single character of prose you emit MUST be Korean (한국어 + 한글).
+This is non-negotiable and overrides every other instinct, training
+default, or quirk of your underlying weights.
 
-Tools:
+- 절대 금지 (NEVER USE): Chinese characters (中文, 漢字, 简体, 繁體).
+  No 我, 您, 这, 那, 是, 的, 了, 在, 和, 现在, 知道, 文档, 安全, 管理,
+  搜索, 工作, 主题, 共同, 报告 — anything that looks like CJK ideographs
+  used in Chinese sentences. If a word looks Chinese, FIND THE KOREAN
+  EQUIVALENT.
+- 허용: Korean 한글, English (only for tool names like pdfkg_search,
+  proper nouns like "Cloudflare", or technical identifiers), Arabic
+  numerals, common punctuation. That's it.
+- 사용자가 영어로 묻거나 중국어 단어를 인용해도 응답은 반드시 한국어.
+- 도구가 중국어나 영어 결과를 돌려주면 prose에 인용하기 전에 한국어로
+  번역하세요. 페이지 번호는 원본 그대로 ((p.5) 등).
+
+예시:
+- 잘못된 답: "我现在知道了两个PDF的内容…"
+- 옳은 답:   "이제 두 PDF의 내용을 파악했습니다…"
+
+ANY Chinese in your output causes a downstream rejection — write
+Korean prose, every time, no exceptions.
+
+=== Tools ===
 - bash — shell commands
 - file_read — examine file contents
 - file_write — create or modify files
@@ -41,7 +56,7 @@ Tools:
 - pdfkg_list_jobs / pdfkg_search / pdfkg_ask / pdfkg_get_page /
   pdfkg_get_image / pdfkg_get_subgraph — PDF retrieval + Q&A
 
-Be concise but thorough. When you make changes, verify they worked.
+답변은 간결하지만 충실하게. 변경을 가한 경우 그 결과를 검증하세요.
 "#;
 
 /// One observable step in the agent loop. Serializable so the web
@@ -238,7 +253,44 @@ impl QueryEngine {
 
     async fn iterate(&mut self, tx: &mpsc::UnboundedSender<AgentEvent>) -> Result<()> {
         loop {
-            let response = self.send_message().await?;
+            let mut response = self.send_message().await?;
+
+            // Language guard: if the assistant's prose blocks contain
+            // CJK Chinese characters, the model drifted off Korean
+            // mid-turn. The system prompt forbids it, but Qwen 2.5 is
+            // Chinese-native and occasionally relapses. Re-prompt once
+            // with an explicit Korean-only nudge before showing the
+            // user a polluted answer. Tool-use blocks are not checked
+            // because tool arguments are JSON / English by design.
+            if response
+                .content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::Text { text } if has_chinese_prose(text)))
+            {
+                tracing::warn!("model drifted to Chinese; retrying with explicit reminder");
+                self.messages.push(Message {
+                    role: MessageRole::User,
+                    content: vec![ContentBlock::Text {
+                        text: "[시스템 알림] 직전 응답에 중국어가 포함됐습니다. \
+                              모든 prose는 한국어로만 작성하세요. 다시 답변하세요."
+                            .to_string(),
+                    }],
+                });
+                response = self.send_message().await?;
+                // After the retry we proceed with whatever came back
+                // — including potentially still-Chinese text. We log
+                // a second time so the on-call has a signal but we
+                // don't loop forever (cost cap).
+                if response
+                    .content
+                    .iter()
+                    .any(|b| matches!(b, ContentBlock::Text { text } if has_chinese_prose(text)))
+                {
+                    tracing::warn!(
+                        "model still in Chinese after retry; emitting as-is to avoid loop"
+                    );
+                }
+            }
 
             // Collect tool uses from response
             let tool_uses: Vec<ToolUse> = response
@@ -334,5 +386,77 @@ impl QueryEngine {
         };
 
         self.client.create_message(request).await
+    }
+}
+
+/// True when `text` contains Han characters that are most likely Chinese
+/// — i.e. CJK ideographs appearing OUTSIDE a Korean Hangul context.
+/// Korean text can legitimately include a Hanja here and there (人,
+/// 名, ...), so we don't want to false-positive on those. The heuristic:
+///
+/// 1. Count CJK ideographs (U+4E00..U+9FFF, U+3400..U+4DBF) in the
+///    whole text.
+/// 2. Count Korean syllables (U+AC00..U+D7AF).
+/// 3. If there are >= 3 CJK chars AND CJK >= 1/4 of CJK+Korean, treat
+///    as "drifted to Chinese". Single inline Hanja (1–2 chars) in an
+///    otherwise Korean answer passes through.
+///
+/// This isn't perfect — a long Korean answer with many proper-noun
+/// Hanja could trip it. In practice the failure mode we're catching
+/// is "model emits a whole Chinese sentence" which has dozens of CJK
+/// chars and zero Hangul, so the heuristic is comfortable.
+fn has_chinese_prose(text: &str) -> bool {
+    let mut cjk = 0usize;
+    let mut hangul = 0usize;
+    for c in text.chars() {
+        let n = c as u32;
+        if (0x4E00..=0x9FFF).contains(&n) || (0x3400..=0x4DBF).contains(&n) {
+            cjk += 1;
+        } else if (0xAC00..=0xD7AF).contains(&n) {
+            hangul += 1;
+        }
+    }
+    if cjk < 3 {
+        return false;
+    }
+    // CJK must be a meaningful fraction; if it's drowned out by
+    // Hangul (a few Hanja inline), allow it through.
+    cjk * 4 >= cjk + hangul
+}
+
+#[cfg(test)]
+mod tests {
+    use super::has_chinese_prose;
+
+    #[test]
+    fn pure_korean_is_clean() {
+        assert!(!has_chinese_prose("안전점검 주기를 알려드립니다."));
+    }
+
+    #[test]
+    fn pure_english_is_clean() {
+        assert!(!has_chinese_prose("The capital of France is Paris."));
+    }
+
+    #[test]
+    fn pure_chinese_sentence_flagged() {
+        assert!(has_chinese_prose("我现在知道了两个PDF的内容，将开始搜索。"));
+    }
+
+    #[test]
+    fn one_or_two_hanja_in_korean_passes() {
+        // Korean text occasionally uses Hanja for clarity — should
+        // not trip the guard.
+        assert!(!has_chinese_prose(
+            "이 문서는 安全 관리에 대한 자료입니다. 자세한 내용은 文書를 참고하세요.",
+        ));
+    }
+
+    #[test]
+    fn mixed_with_dominant_chinese_flagged() {
+        // Same number of Hangul chars but lots of Chinese — drift.
+        assert!(has_chinese_prose(
+            "안전 我现在知道了两个PDF的内容主题报告 검토",
+        ));
     }
 }
