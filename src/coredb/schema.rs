@@ -54,7 +54,9 @@ pub const MIGRATIONS: &[&str] = &[
      )",
     "CREATE INDEX idx_markets_open ON polymarket_btc.markets (closed)",
 
-    // ---- Agent decisions (LLM outputs). partition = bucket_day. ----
+    // ---- Agent decisions (LLM outputs). partition = bucket_day.
+    // entry_price = YES price at decision time, needed by `compare-pnl`
+    // to mark each decision to current market.
     "CREATE TABLE IF NOT EXISTS polymarket_btc.decisions ( \
         bucket_day   TIMESTAMP, \
         ts           TIMESTAMP, \
@@ -66,9 +68,14 @@ pub const MIGRATIONS: &[&str] = &[
         edge_bps     INT, \
         reasoning    TEXT, \
         raw_response TEXT, \
+        entry_price  DOUBLE, \
         PRIMARY KEY (bucket_day, ts, decision_id) \
      )",
     "CREATE INDEX idx_decisions_market ON polymarket_btc.decisions (market_slug)",
+    // For databases provisioned before entry_price was part of CREATE TABLE.
+    // CoreDB returns "Column 'X' already exists" on duplicate, which migrate()
+    // swallows, so re-running is safe on either old or new schema state.
+    "ALTER TABLE polymarket_btc.decisions ADD entry_price DOUBLE",
 
     // ---- Orders / fills. partition = bucket_day. ----
     "CREATE TABLE IF NOT EXISTS polymarket_btc.orders ( \

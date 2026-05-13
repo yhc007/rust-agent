@@ -47,7 +47,11 @@ pub struct Market {
     pub updated_at_ms: Millis,
 }
 
-/// LLM decision record.
+/// LLM decision record. `entry_price` is the market's YES price at the
+/// instant the decision was made; persisted so a later PnL comparison
+/// can mark-to-market without depending on a separate price timeseries.
+/// Decisions written before the schema column existed will read back
+/// as `0.0` and should be excluded from comparisons.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Decision {
     pub bucket_day_ms: Millis,
@@ -60,6 +64,7 @@ pub struct Decision {
     pub edge_bps: i32,
     pub reasoning: String,
     pub raw_response: String,
+    pub entry_price: f64,
 }
 
 /// Order lifecycle record. `status` is `pending|filled|canceled|partial`.

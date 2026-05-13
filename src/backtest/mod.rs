@@ -9,6 +9,8 @@
 //! side-by-side on real captured data.
 
 pub mod baseline;
+pub mod compare;
+pub mod ledger;
 pub mod llm;
 pub mod run;
 

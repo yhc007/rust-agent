@@ -16,7 +16,9 @@ use serde::Deserialize;
 use uuid::Uuid;
 
 use crate::api::{AnthropicClient, ApiClient, OpenAICompatClient};
-use crate::backtest::{baseline::evaluate as baseline_evaluate, llm as llm_mod, BacktestMode};
+use crate::backtest::{
+    baseline::evaluate as baseline_evaluate, ledger, llm as llm_mod, BacktestMode,
+};
 use crate::config::{Backend, Config};
 use crate::coredb::decisions::DecisionRepo;
 use crate::coredb::types::{bucket_day, now_ms, Decision, Market};
@@ -114,17 +116,34 @@ pub async fn run(coredb_uri: &str, mode: BacktestMode) -> Result<()> {
             edge_bps,
             reasoning,
             raw_response,
+            // YES price at decision time. The mark-to-market PnL comparator
+            // needs an entry price; capturing it here avoids a separate
+            // price-history table.
+            entry_price: m.last_price,
         };
+        // Two-step persistence: write to CoreDB (the canonical store)
+        // AND append to the JSONL ledger (the readable backup) since
+        // CoreDB's SELECT side mis-types every column. See
+        // crate::backtest::ledger for the why. A ledger append failure
+        // is logged but doesn't bail — losing one row in the ledger
+        // shouldn't take down the whole backtest run.
         match dec_repo.insert(&decision).await {
             Ok(()) => stored += 1,
             Err(e) => eprintln!("  ! decisions insert failed for {}: {e}", m.slug),
+        }
+        if let Err(e) = ledger::append(&decision) {
+            eprintln!("  ! ledger append failed for {}: {e}", m.slug);
         }
     }
     println!("✓ backtest complete:");
     for side in ["YES", "NO", "PASS"] {
         println!("   {side:<5} {}", counts.get(side).copied().unwrap_or(0));
     }
-    println!("   stored {} decisions in polymarket_btc.decisions", stored);
+    println!(
+        "   stored {} decisions in polymarket_btc.decisions + ledger {}",
+        stored,
+        ledger::path().display()
+    );
     Ok(())
 }
 

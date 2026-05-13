@@ -1,3 +1,7 @@
 target/
 .env
 *.log
+# Local decision audit log produced by backtest::ledger. Each line is
+# one JSON-encoded Decision row. Bound to the cwd of whoever runs the
+# backtest; commit-time noise, not source.
+decisions.jsonl

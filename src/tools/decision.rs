@@ -25,6 +25,10 @@ struct RecordDecisionInput {
     edge_bps: i32,
     #[serde(default)]
     reasoning: String,
+    /// Market's YES price at decision time. Optional; needed for the
+    /// `compare-pnl` mark-to-market readout to include this row.
+    #[serde(default)]
+    entry_price: f64,
 }
 
 pub struct RecordDecisionTool {
@@ -67,7 +71,9 @@ impl Tool for RecordDecisionTool {
                 "edge_bps":     {"type": "integer",
                                  "description": "Estimated edge over market price, in bps"},
                 "reasoning":    {"type": "string",
-                                 "description": "One-paragraph rationale"}
+                                 "description": "One-paragraph rationale"},
+                "entry_price":  {"type": "number", "minimum": 0, "maximum": 1,
+                                 "description": "YES price observed at decision time; lets compare-pnl mark this row to market"}
             },
             "required": ["market_slug", "side"]
         })
@@ -101,6 +107,7 @@ impl Tool for RecordDecisionTool {
             edge_bps: input.edge_bps,
             reasoning: input.reasoning,
             raw_response,
+            entry_price: input.entry_price,
         };
         repo.insert(&decision).await
             .map_err(|e| ToolError::ExecutionFailed(format!("decisions insert: {e}")))?;
