@@ -83,13 +83,60 @@ fn default_model_for_anthropic() -> String {
     "claude-sonnet-4-20250514".to_string()
 }
 
+/// Read an API key from a dotfile under `$HOME`. Returns `None` when
+/// the file is missing, unreadable, or empty. We trim whitespace so a
+/// trailing newline (the typical `echo "$KEY" > ~/.deepseek` shape)
+/// doesn't get sent as part of the key.
+fn read_key_file(filename: &str) -> Option<String> {
+    let home = std::env::var("HOME").ok()?;
+    let path = std::path::Path::new(&home).join(filename);
+    let raw = std::fs::read_to_string(path).ok()?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+/// Resolve a DeepSeek API key from the supported sources in priority
+/// order: `DEEPSEEK_API_KEY` env var, then `~/.deepseek`.
+fn deepseek_key() -> Option<String> {
+    std::env::var("DEEPSEEK_API_KEY")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| read_key_file(".deepseek"))
+}
+
+/// Pick a backend name when `AGENT_BACKEND` is unset. Preserves the old
+/// "anthropic by default" behavior whenever `ANTHROPIC_API_KEY` is in
+/// the env, so existing setups don't silently flip backends. Falls
+/// through to deepseek when only a DeepSeek key is reachable — natural
+/// for the polymarket-btc project, which is deepseek-first.
+fn detect_default_backend() -> &'static str {
+    if std::env::var("ANTHROPIC_API_KEY")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .is_some()
+    {
+        return "anthropic";
+    }
+    if deepseek_key().is_some() {
+        return "deepseek";
+    }
+    // No key in sight — keep the historical default so the resulting
+    // error message ("ANTHROPIC_API_KEY not set") matches what users
+    // who haven't configured anything used to see.
+    "anthropic"
+}
+
 impl Config {
     /// Load configuration from environment. Backend selection
     /// happens here so the rest of the codebase doesn't have to
     /// re-read env vars.
     pub fn load() -> Result<Self> {
         let backend_name = std::env::var("AGENT_BACKEND")
-            .unwrap_or_else(|_| "anthropic".to_string());
+            .unwrap_or_else(|_| detect_default_backend().to_string());
         let (backend, default_model) = match backend_name.to_ascii_lowercase().as_str() {
             "anthropic" => {
                 let api_key = std::env::var("ANTHROPIC_API_KEY")
@@ -123,10 +170,10 @@ impl Config {
                 // DeepSeek speaks the OpenAI chat-completions wire format,
                 // so we route through the same OpenAICompat client. Only
                 // the env-var lookup and defaults differ.
-                let api_key = std::env::var("DEEPSEEK_API_KEY")
-                    .or_else(|_| std::env::var("OPENAI_API_KEY"))
+                let api_key = deepseek_key()
+                    .or_else(|| std::env::var("OPENAI_API_KEY").ok())
                     .context(
-                        "DEEPSEEK_API_KEY not set (OPENAI_API_KEY also accepted as fallback)",
+                        "DEEPSEEK_API_KEY not set (also tried ~/.deepseek and OPENAI_API_KEY)",
                     )?;
                 let base_url = std::env::var("OPENAI_BASE_URL")
                     .unwrap_or_else(|_| "https://api.deepseek.com/v1".to_string());
