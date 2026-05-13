@@ -4,8 +4,16 @@
 //! the `polymarket_btc` keyspace and tables. Wraps a `scylla::Session`
 //! that other repositories will share via `Arc`.
 
+pub mod btc;
+pub mod decisions;
 pub mod error;
+pub mod markets;
+pub mod orderbook;
+pub mod orders;
+pub mod pnl;
 pub mod schema;
+pub mod types;
+pub mod util;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -46,6 +54,28 @@ impl CoreDb {
         "positions",
         "pnl_daily",
     ];
+
+    /// Approximate row count for each known table. CoreDB's CQL parser
+    /// does not accept WHERE-less COUNT plus ALLOW FILTERING in some
+    /// versions, so we fall back to streaming rows and tallying client
+    /// side. Fine for the few-thousand-row daily volumes the agent
+    /// produces; do not call this in a hot path.
+    pub async fn count_rows(&self) -> Result<Vec<(String, i64)>, CoreDbError> {
+        let mut out = Vec::with_capacity(Self::TABLES.len());
+        for t in Self::TABLES {
+            let q = format!("SELECT * FROM {}.{}", schema::KEYSPACE, t);
+            let qr = self
+                .session
+                .query_unpaged(q, &[])
+                .await
+                .map_err(|e| CoreDbError::Query(format!("count `{}`: {}", t, e)))?;
+            let rows = qr
+                .into_rows_result()
+                .map_err(|e| CoreDbError::Query(format!("count rows `{}`: {}", t, e)))?;
+            out.push(((*t).to_string(), rows.rows_num() as i64));
+        }
+        Ok(out)
+    }
 
     /// Probe each expected table with a `SELECT ... LIMIT 1`. Returns the
     /// list of tables that responded successfully. Use as a post-migrate

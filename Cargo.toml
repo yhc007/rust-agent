@@ -51,7 +51,7 @@ notify = "7"
 fuzzy-matcher = "0.3"
 
 # UUID
-uuid = { version = "1", features = ["v4"] }
+uuid = { version = "1", features = ["v4", "serde"] }
 
 # Time
 chrono = { version = "0.4", features = ["serde"] }
@@ -74,6 +74,9 @@ minijinja = "2"
 
 # CoreDB (Cassandra-compatible) driver — used by polymarket-btc subsystem
 scylla = "0.15"
+
+# Regex for threshold extraction in backtest baseline
+regex = "1"
 
 [dev-dependencies]
 tokio-test = "0.4"

@@ -2,9 +2,13 @@
 
 mod registry;
 pub mod bash;
+pub mod btc;
+pub mod decision;
 pub mod file;
 pub mod grep;
 pub mod pdfkg;
+pub mod place_order;
+pub mod polymarket;
 
 pub use registry::{Tool, ToolRegistry, ToolResult, ToolError, ToolContext};
 use serde_json::Value;
@@ -29,6 +33,12 @@ pub fn create_default_registry() -> ToolRegistry {
     registry.register(Box::new(file::FileReadTool::new()));
     registry.register(Box::new(file::FileWriteTool::new()));
     registry.register(Box::new(grep::GrepTool::new()));
+
+    // Polymarket BTC subsystem — read-only Gamma/CLOB tools + decision recorder + paper trading.
+    polymarket::register(&mut registry);
+    btc::register(&mut registry);
+    decision::register(&mut registry);
+    place_order::register(&mut registry);
 
     // Optional: pdf-kg integration. Adds 6 tools (pdfkg_*) when the
     // PDFKG_BACKEND_URL env var points at a reachable pdf-kg backend,

@@ -7,9 +7,13 @@ use clap::{Parser, Subcommand};
 use tracing_subscriber::{fmt, EnvFilter};
 
 mod api;
+mod backtest;
 mod config;
 mod coredb;
+mod data;
 mod engine;
+mod execution;
+mod risk;
 mod tools;
 mod memory;
 mod tui;
@@ -78,6 +82,24 @@ enum Commands {
         #[arg(long, default_value = "127.0.0.1:9042")]
         coredb_uri: String,
     },
+    /// Run Binance + Polymarket ingestion daemons that populate CoreDB.
+    /// Stays in the foreground; Ctrl+C for a clean shutdown.
+    Ingest {
+        /// CoreDB endpoint. Defaults to 127.0.0.1:9042.
+        #[arg(long, default_value = "127.0.0.1:9042")]
+        coredb_uri: String,
+    },
+    /// Print row counts for each polymarket_btc table.
+    Stats {
+        #[arg(long, default_value = "127.0.0.1:9042")]
+        coredb_uri: String,
+    },
+    /// Run the deterministic baseline rule over every open BTC market in
+    /// CoreDB, recording one decision per market.
+    Backtest {
+        #[arg(long, default_value = "127.0.0.1:9042")]
+        coredb_uri: String,
+    },
 }
 
 #[tokio::main]
@@ -117,6 +139,15 @@ async fn main() -> Result<()> {
         }
         Some(Commands::Migrate { coredb_uri }) => {
             run_migrate(coredb_uri).await?;
+        }
+        Some(Commands::Ingest { coredb_uri }) => {
+            data::ingest::run(&coredb_uri).await?;
+        }
+        Some(Commands::Stats { coredb_uri }) => {
+            run_stats(coredb_uri).await?;
+        }
+        Some(Commands::Backtest { coredb_uri }) => {
+            backtest::run::run(&coredb_uri).await?;
         }
         None => {
             // Default: interactive chat
@@ -176,6 +207,18 @@ async fn run_chat(config: Config, model: String, initial_prompt: Option<String>)
 async fn run_task(config: Config, model: String, task: String) -> Result<()> {
     let mut engine = QueryEngine::new(config, model)?;
     engine.process_input(&task).await?;
+    Ok(())
+}
+
+async fn run_stats(coredb_uri: String) -> Result<()> {
+    let db = coredb::CoreDb::connect(&coredb_uri).await?;
+    let counts = db.count_rows().await?;
+    println!("📊 CoreDB polymarket_btc row counts:");
+    for (t, n) in &counts {
+        println!("   {t:<20} {n}");
+    }
+    let total: i64 = counts.iter().map(|(_, n)| n).sum();
+    println!("   {:<20} {}", "Σ", total);
     Ok(())
 }
 
