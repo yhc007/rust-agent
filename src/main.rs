@@ -116,26 +116,27 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .init();
-    
-    // Load config
-    let config = Config::load()?;
-    
-    // Handle commands
+
+    // Config is loaded lazily inside the arms that need it — the coredb /
+    // ingest / backtest / stats / tools subcommands have no LLM dependency
+    // and should not require ANTHROPIC_API_KEY (or the active backend's key)
+    // just to read the keyspace.
+
     match cli.command {
         Some(Commands::Chat { prompt }) => {
-            run_chat(config, cli.model, prompt).await?;
+            run_chat(Config::load()?, cli.model, prompt).await?;
         }
         Some(Commands::Run { task }) => {
-            run_task(config, cli.model, task).await?;
+            run_task(Config::load()?, cli.model, task).await?;
         }
         Some(Commands::Tools) => {
             list_tools();
         }
         Some(Commands::Config) => {
-            show_config(&config);
+            show_config(&Config::load()?);
         }
         Some(Commands::Serve { port, host }) => {
-            run_serve(config, cli.model, host, port).await?;
+            run_serve(Config::load()?, cli.model, host, port).await?;
         }
         Some(Commands::Migrate { coredb_uri }) => {
             run_migrate(coredb_uri).await?;
@@ -151,6 +152,7 @@ async fn main() -> Result<()> {
         }
         None => {
             // Default: interactive chat
+            let config = Config::load()?;
             if let Some(prompt) = cli.prompt {
                 run_task(config, cli.model, prompt).await?;
             } else {
