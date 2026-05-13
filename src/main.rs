@@ -105,6 +105,13 @@ enum Commands {
         #[arg(long)]
         llm: bool,
     },
+    /// Compare baseline vs LLM strategy PnL on today's decisions, marked
+    /// to the current Polymarket YES prices. Reads `polymarket_btc.decisions`
+    /// and prints aggregates + per-market disagreements.
+    ComparePnl {
+        #[arg(long, default_value = "127.0.0.1:9042")]
+        coredb_uri: String,
+    },
 }
 
 #[tokio::main]
@@ -159,6 +166,9 @@ async fn main() -> Result<()> {
                 backtest::BacktestMode::Baseline
             };
             backtest::run::run(&coredb_uri, mode).await?;
+        }
+        Some(Commands::ComparePnl { coredb_uri }) => {
+            backtest::compare::run(&coredb_uri).await?;
         }
         None => {
             // Default: interactive chat
