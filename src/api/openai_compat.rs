@@ -65,6 +65,8 @@ impl OpenAICompatClient {
         let base_url = base_url.into().trim_end_matches('/').to_string();
         let label = if base_url.contains("api.openai.com") {
             "openai"
+        } else if base_url.contains("api.deepseek.com") {
+            "deepseek"
         } else {
             "openai-compat"
         };
