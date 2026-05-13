@@ -8,6 +8,7 @@ use tracing_subscriber::{fmt, EnvFilter};
 
 mod api;
 mod config;
+mod coredb;
 mod engine;
 mod tools;
 mod memory;
@@ -71,6 +72,12 @@ enum Commands {
         #[arg(long, default_value = "127.0.0.1")]
         host: String,
     },
+    /// Apply CoreDB schema migrations for the polymarket_btc keyspace.
+    Migrate {
+        /// CoreDB native-protocol endpoint (host:port). Defaults to 127.0.0.1:9042.
+        #[arg(long, default_value = "127.0.0.1:9042")]
+        coredb_uri: String,
+    },
 }
 
 #[tokio::main]
@@ -107,6 +114,9 @@ async fn main() -> Result<()> {
         }
         Some(Commands::Serve { port, host }) => {
             run_serve(config, cli.model, host, port).await?;
+        }
+        Some(Commands::Migrate { coredb_uri }) => {
+            run_migrate(coredb_uri).await?;
         }
         None => {
             // Default: interactive chat
@@ -166,6 +176,21 @@ async fn run_chat(config: Config, model: String, initial_prompt: Option<String>)
 async fn run_task(config: Config, model: String, task: String) -> Result<()> {
     let mut engine = QueryEngine::new(config, model)?;
     engine.process_input(&task).await?;
+    Ok(())
+}
+
+async fn run_migrate(coredb_uri: String) -> Result<()> {
+    println!("🗄️  Connecting to CoreDB at {coredb_uri} ...");
+    let db = coredb::CoreDb::connect(&coredb_uri).await?;
+    println!("📐 Applying polymarket_btc schema migrations ...");
+    db.migrate().await?;
+    println!("✓ Migrations applied. Keyspace `polymarket_btc` is ready.");
+    println!("🔎 Verifying tables ...");
+    let tables = db.verify_tables().await?;
+    for t in &tables {
+        println!("   ✓ polymarket_btc.{t}");
+    }
+    println!("✓ {} tables present.", tables.len());
     Ok(())
 }
 

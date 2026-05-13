@@ -72,6 +72,9 @@ grep-searcher = "0.1"
 # Template (for prompts)
 minijinja = "2"
 
+# CoreDB (Cassandra-compatible) driver — used by polymarket-btc subsystem
+scylla = "0.15"
+
 [dev-dependencies]
 tokio-test = "0.4"
 tempfile = "3"

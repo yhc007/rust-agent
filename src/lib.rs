@@ -4,6 +4,7 @@
 
 pub mod api;
 pub mod config;
+pub mod coredb;
 pub mod engine;
 pub mod tools;
 pub mod memory;
