@@ -2,10 +2,20 @@
 //! moment — a real time-replay backtest needs months of orderbook
 //! history we don't have yet).
 //!
-//! Snapshots every open BTC market in CoreDB, runs a deterministic
-//! baseline rule against the current Binance spot price, and records
-//! one Decision per market. Future Phase-3.5: swap the baseline for a
-//! DeepSeek call and compare PnL.
+//! Snapshots every open BTC market in CoreDB and produces one Decision
+//! per market using either the deterministic [`baseline`] rule or the
+//! [`llm`] path (DeepSeek by default). Both paths land their rows in
+//! `polymarket_btc.decisions` so the two strategies can be compared
+//! side-by-side on real captured data.
 
 pub mod baseline;
+pub mod llm;
 pub mod run;
+
+/// Which decision engine [`run::run`] should use. Selected by the CLI's
+/// `--llm` flag (or `--baseline`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BacktestMode {
+    Baseline,
+    Llm,
+}

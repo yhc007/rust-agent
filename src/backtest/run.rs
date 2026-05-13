@@ -15,7 +15,9 @@ use reqwest::Client;
 use serde::Deserialize;
 use uuid::Uuid;
 
-use crate::backtest::baseline::evaluate;
+use crate::api::{AnthropicClient, ApiClient, OpenAICompatClient};
+use crate::backtest::{baseline::evaluate as baseline_evaluate, llm as llm_mod, BacktestMode};
+use crate::config::{Backend, Config};
 use crate::coredb::decisions::DecisionRepo;
 use crate::coredb::types::{bucket_day, now_ms, Decision, Market};
 use crate::coredb::CoreDb;
@@ -26,10 +28,21 @@ struct BinanceTicker {
     last_price: String,
 }
 
-pub async fn run(coredb_uri: &str) -> Result<()> {
-    println!("🔍 backtest: connecting to CoreDB at {coredb_uri}");
+pub async fn run(coredb_uri: &str, mode: BacktestMode) -> Result<()> {
+    println!("🔍 backtest: connecting to CoreDB at {coredb_uri} (mode={mode:?})");
     let db = CoreDb::connect(coredb_uri).await.context("connect coredb")?;
     let dec_repo = DecisionRepo::new(db.session()).await?;
+
+    // Build the LLM client only when we'll actually use it — Config::load
+    // touches the env (or ~/.deepseek), and we don't want to demand any
+    // credentials for the baseline-only path.
+    let llm_ctx = match mode {
+        BacktestMode::Baseline => None,
+        BacktestMode::Llm => Some(LlmCtx::from_config(Config::load()?)?),
+    };
+    if let Some(ctx) = &llm_ctx {
+        println!("🧠 backtest: LLM = {} ({})", ctx.label, ctx.model);
+    }
 
     let http = Client::builder()
         .timeout(Duration::from_secs(15))
@@ -51,22 +64,56 @@ pub async fn run(coredb_uri: &str) -> Result<()> {
 
     let ts = now_ms();
     let bd = bucket_day(ts);
-    let mut counts = std::collections::HashMap::<&str, u32>::new();
+    let mut counts = std::collections::HashMap::<String, u32>::new();
     let mut stored = 0u32;
-    for m in &markets {
-        let b = evaluate(m, btc_price);
-        *counts.entry(b.side).or_insert(0) += 1;
+    for (i, m) in markets.iter().enumerate() {
+        let (side, size_usd, confidence, edge_bps, reasoning, raw_response) =
+            match (&llm_ctx, mode) {
+                (Some(ctx), BacktestMode::Llm) => {
+                    if (i + 1) % 5 == 0 || i == 0 {
+                        println!("   llm: {}/{}  ({})", i + 1, markets.len(), m.slug);
+                    }
+                    let d = llm_mod::evaluate(
+                        m,
+                        btc_price,
+                        ctx.client.as_ref(),
+                        &ctx.model,
+                        ctx.max_tokens,
+                    )
+                    .await;
+                    (
+                        d.side,
+                        d.size_usd,
+                        d.confidence,
+                        d.edge_bps,
+                        d.reasoning,
+                        d.raw_response,
+                    )
+                }
+                _ => {
+                    let b = baseline_evaluate(m, btc_price);
+                    (
+                        b.side.to_string(),
+                        b.size_usd,
+                        b.confidence,
+                        b.edge_bps,
+                        b.reasoning,
+                        "baseline-rule".to_string(),
+                    )
+                }
+            };
+        *counts.entry(side.clone()).or_insert(0) += 1;
         let decision = Decision {
             bucket_day_ms: bd,
             ts_ms: ts,
             decision_id: Uuid::new_v4(),
             market_slug: m.slug.clone(),
-            side: b.side.to_string(),
-            size_usd: b.size_usd,
-            confidence: b.confidence,
-            edge_bps: b.edge_bps,
-            reasoning: b.reasoning,
-            raw_response: "baseline-rule".to_string(),
+            side,
+            size_usd,
+            confidence,
+            edge_bps,
+            reasoning,
+            raw_response,
         };
         match dec_repo.insert(&decision).await {
             Ok(()) => stored += 1,
@@ -79,6 +126,43 @@ pub async fn run(coredb_uri: &str) -> Result<()> {
     }
     println!("   stored {} decisions in polymarket_btc.decisions", stored);
     Ok(())
+}
+
+/// Bundle of everything the LLM path needs at call time. Built once
+/// per `run` invocation so we don't re-resolve the backend per market.
+struct LlmCtx {
+    client: Box<dyn ApiClient>,
+    model: String,
+    max_tokens: u32,
+    label: &'static str,
+}
+
+impl LlmCtx {
+    fn from_config(config: Config) -> Result<Self> {
+        let label;
+        let client: Box<dyn ApiClient> = match config.backend.clone() {
+            Backend::Anthropic { api_key } => {
+                label = "anthropic";
+                Box::new(AnthropicClient::new(api_key))
+            }
+            Backend::OpenAICompat { api_key, base_url } => {
+                label = if base_url.contains("api.deepseek.com") {
+                    "deepseek"
+                } else if base_url.contains("api.openai.com") {
+                    "openai"
+                } else {
+                    "openai-compat"
+                };
+                Box::new(OpenAICompatClient::new(base_url, api_key))
+            }
+        };
+        Ok(Self {
+            client,
+            model: config.model,
+            max_tokens: config.max_tokens,
+            label,
+        })
+    }
 }
 
 async fn fetch_btc_markets(http: &Client) -> Result<Vec<Market>> {

@@ -94,11 +94,16 @@ enum Commands {
         #[arg(long, default_value = "127.0.0.1:9042")]
         coredb_uri: String,
     },
-    /// Run the deterministic baseline rule over every open BTC market in
-    /// CoreDB, recording one decision per market.
+    /// Run a decision pass over every open BTC market in CoreDB,
+    /// recording one decision per market. Default uses the deterministic
+    /// baseline rule; `--llm` switches to the configured LLM (DeepSeek
+    /// by default — see `Config::load`).
     Backtest {
         #[arg(long, default_value = "127.0.0.1:9042")]
         coredb_uri: String,
+        /// Use the LLM-driven decision path instead of the baseline rule.
+        #[arg(long)]
+        llm: bool,
     },
 }
 
@@ -147,8 +152,13 @@ async fn main() -> Result<()> {
         Some(Commands::Stats { coredb_uri }) => {
             run_stats(coredb_uri).await?;
         }
-        Some(Commands::Backtest { coredb_uri }) => {
-            backtest::run::run(&coredb_uri).await?;
+        Some(Commands::Backtest { coredb_uri, llm }) => {
+            let mode = if llm {
+                backtest::BacktestMode::Llm
+            } else {
+                backtest::BacktestMode::Baseline
+            };
+            backtest::run::run(&coredb_uri, mode).await?;
         }
         None => {
             // Default: interactive chat
