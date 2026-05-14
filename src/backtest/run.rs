@@ -19,6 +19,7 @@ use uuid::Uuid;
 use crate::api::{AnthropicClient, ApiClient, OpenAICompatClient};
 use crate::backtest::{baseline::evaluate as baseline_evaluate, llm as llm_mod, BacktestMode};
 use crate::config::{Backend, Config};
+use crate::coredb::btc::BtcTickRepo;
 use crate::coredb::decisions::DecisionRepo;
 use crate::coredb::orders::{OrderRepo, PositionRepo};
 use crate::coredb::types::{bucket_day, now_ms, Decision, Market};
@@ -26,6 +27,12 @@ use crate::coredb::CoreDb;
 use crate::execution::auto::{route_decision, Outcome};
 use crate::execution::paper::PaperExec;
 use crate::risk::RiskLimits;
+
+/// CoreDB tick is considered fresh if its `ts_ms` is within this many
+/// milliseconds of "now". Outside that window we fall through to a
+/// Binance REST quote so a stale or stopped ingest doesn't poison the
+/// decision. 60 s is generous given the WS ingest writes ~2 rows/s.
+const CACHE_FRESHNESS_MS: i64 = 60_000;
 
 #[derive(Debug, Deserialize)]
 struct BinanceTicker {
@@ -71,13 +78,41 @@ pub async fn run(coredb_uri: &str, mode: BacktestMode, execute: bool) -> Result<
         .build()
         .context("reqwest client")?;
 
-    println!("💰 backtest: fetching BTC spot from Binance");
-    let t: BinanceTicker = http
-        .get("https://api.binance.com/api/v3/ticker/24hr?symbol=BTCUSDT")
-        .send().await.context("binance HTTP")?
-        .error_for_status().context("binance status")?
-        .json().await.context("binance JSON")?;
-    let btc_price: f64 = t.last_price.parse().context("parse lastPrice")?;
+    // Prefer the CoreDB cache when the WS ingest has populated a fresh
+    // tick. Falls through to Binance REST when the cache is missing or
+    // stale (>CACHE_FRESHNESS_MS), so this still works in setups
+    // without `rust-agent ingest` running. Picking the cache also
+    // means decisions made during a single ingest session use prices
+    // consistent with what the ingest pipeline is actually recording.
+    let btc_tick_repo = BtcTickRepo::new(db.session()).await?;
+    let btc_price = match btc_tick_repo.latest("BTCUSDT").await {
+        Ok(Some(t)) if (now_ms() - t.ts_ms) < CACHE_FRESHNESS_MS => {
+            let age_ms = now_ms() - t.ts_ms;
+            println!(
+                "💰 backtest: BTC spot from CoreDB cache ({} ms old): ${:.2}",
+                age_ms, t.price
+            );
+            t.price
+        }
+        Ok(other) => {
+            if let Some(stale) = other {
+                let age_ms = now_ms() - stale.ts_ms;
+                println!(
+                    "💰 backtest: cache tick is stale ({} ms old); falling back to Binance REST",
+                    age_ms
+                );
+            } else {
+                println!(
+                    "💰 backtest: no CoreDB cache yet; fetching BTC spot from Binance REST"
+                );
+            }
+            fetch_btc_rest(&http).await?
+        }
+        Err(e) => {
+            eprintln!("  ! btc cache read failed ({e}); falling back to Binance REST");
+            fetch_btc_rest(&http).await?
+        }
+    };
     println!("   BTC spot: ${btc_price:.2}");
 
     println!("📦 backtest: pulling open BTC markets from Polymarket Gamma");
@@ -241,6 +276,23 @@ impl LlmCtx {
             label,
         })
     }
+}
+
+/// Pull the latest BTCUSDT price from Binance's 24hr ticker REST
+/// endpoint. Used as the fallback when CoreDB has no recent cached
+/// tick. Returns the parsed `lastPrice` field.
+async fn fetch_btc_rest(http: &Client) -> Result<f64> {
+    let t: BinanceTicker = http
+        .get("https://api.binance.com/api/v3/ticker/24hr?symbol=BTCUSDT")
+        .send()
+        .await
+        .context("binance HTTP")?
+        .error_for_status()
+        .context("binance status")?
+        .json()
+        .await
+        .context("binance JSON")?;
+    t.last_price.parse().context("parse lastPrice")
 }
 
 async fn fetch_btc_markets(http: &Client) -> Result<Vec<Market>> {
