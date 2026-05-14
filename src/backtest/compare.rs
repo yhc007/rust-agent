@@ -18,7 +18,8 @@ use anyhow::{Context, Result};
 use reqwest::Client;
 
 use crate::coredb::decisions::DecisionRepo;
-use crate::coredb::types::{bucket_day, now_ms, Decision};
+use crate::coredb::strategy_pnl::StrategyPnlRepo;
+use crate::coredb::types::{bucket_day, now_ms, Decision, StrategyPnlSnapshot};
 use crate::coredb::CoreDb;
 
 /// Strategy bucket for a single decision row.
@@ -55,8 +56,10 @@ pub async fn run(coredb_uri: &str) -> Result<()> {
     println!("📊 compare-pnl: connecting to CoreDB at {coredb_uri}");
     let db = CoreDb::connect(coredb_uri).await.context("connect coredb")?;
     let repo = DecisionRepo::new(db.session()).await?;
+    let snap_repo = StrategyPnlRepo::new(db.session()).await?;
 
-    let bd = bucket_day(now_ms());
+    let snapshot_ts = now_ms();
+    let bd = bucket_day(snapshot_ts);
     let decisions = repo
         .list_day(bd)
         .await
@@ -122,6 +125,49 @@ pub async fn run(coredb_uri: &str) -> Result<()> {
 
     print_summary(&by_strategy);
     print_disagreements(&usable);
+
+    // Persist per-strategy aggregates as time-series snapshots so the
+    // history can be reconstructed later (or scraped by a cron-driven
+    // pnl-history readout). One row per strategy per invocation; failures
+    // are logged but don't bail the run since the human-readable output
+    // already landed.
+    for (strategy, rows) in &by_strategy {
+        let mut n_yes = 0i32;
+        let mut n_no = 0i32;
+        let mut n_pass = 0i32;
+        let mut sum_size = 0.0;
+        let mut sum_pnl = 0.0;
+        for r in rows {
+            match r.decision.side.as_str() {
+                "YES" => {
+                    n_yes += 1;
+                    sum_size += r.decision.size_usd;
+                }
+                "NO" => {
+                    n_no += 1;
+                    sum_size += r.decision.size_usd;
+                }
+                _ => n_pass += 1,
+            }
+            if let Some(p) = r.pnl {
+                sum_pnl += p;
+            }
+        }
+        let snap = StrategyPnlSnapshot {
+            bucket_day_ms: bd,
+            ts_ms: snapshot_ts,
+            strategy: strategy.label().to_string(),
+            n_decisions: rows.len() as i32,
+            sum_size_usd: sum_size,
+            sum_pnl,
+            n_yes,
+            n_no,
+            n_pass,
+        };
+        if let Err(e) = snap_repo.insert(&snap).await {
+            eprintln!("  ! strategy_pnl_snapshots insert failed for {}: {e}", strategy.label());
+        }
+    }
 
     Ok(())
 }

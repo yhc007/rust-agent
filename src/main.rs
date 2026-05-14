@@ -107,8 +107,16 @@ enum Commands {
     },
     /// Compare baseline vs LLM strategy PnL on today's decisions, marked
     /// to the current Polymarket YES prices. Reads `polymarket_btc.decisions`
-    /// and prints aggregates + per-market disagreements.
+    /// and prints aggregates + per-market disagreements. Also persists a
+    /// per-strategy snapshot into `polymarket_btc.strategy_pnl_snapshots`
+    /// so the run can be replayed as a time series via `pnl-history`.
     ComparePnl {
+        #[arg(long, default_value = "127.0.0.1:9042")]
+        coredb_uri: String,
+    },
+    /// Dump today's strategy PnL snapshots from CoreDB as a time series.
+    /// Intended consumer of the cron-driven `compare-pnl` writes.
+    PnlHistory {
         #[arg(long, default_value = "127.0.0.1:9042")]
         coredb_uri: String,
     },
@@ -169,6 +177,9 @@ async fn main() -> Result<()> {
         }
         Some(Commands::ComparePnl { coredb_uri }) => {
             backtest::compare::run(&coredb_uri).await?;
+        }
+        Some(Commands::PnlHistory { coredb_uri }) => {
+            backtest::history::run(&coredb_uri).await?;
         }
         None => {
             // Default: interactive chat

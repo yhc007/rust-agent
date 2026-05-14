@@ -93,6 +93,22 @@ pub struct Position {
     pub updated_at_ms: Millis,
 }
 
+/// One mark-to-market snapshot for a single strategy, captured during a
+/// `compare-pnl` run. Rows accumulate over time so the time series can
+/// be reconstructed even after the server restarts.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StrategyPnlSnapshot {
+    pub bucket_day_ms: Millis,
+    pub ts_ms: Millis,
+    pub strategy: String, // "baseline" | "llm"
+    pub n_decisions: i32,
+    pub sum_size_usd: f64,
+    pub sum_pnl: f64,
+    pub n_yes: i32,
+    pub n_no: i32,
+    pub n_pass: i32,
+}
+
 /// Daily PnL roll-up.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PnlDaily {

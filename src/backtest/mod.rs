@@ -10,6 +10,7 @@
 
 pub mod baseline;
 pub mod compare;
+pub mod history;
 pub mod llm;
 pub mod run;
 

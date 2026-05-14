@@ -12,6 +12,7 @@ pub mod orderbook;
 pub mod orders;
 pub mod pnl;
 pub mod schema;
+pub mod strategy_pnl;
 pub mod types;
 pub mod util;
 
@@ -53,6 +54,7 @@ impl CoreDb {
         "orders",
         "positions",
         "pnl_daily",
+        "strategy_pnl_snapshots",
     ];
 
     /// Approximate row count for each known table. CoreDB's CQL parser

@@ -112,4 +112,20 @@ pub const MIGRATIONS: &[&str] = &[
         n_trades     INT, \
         llm_cost_usd DOUBLE \
      )",
+
+    // ---- Per-strategy PnL snapshots. One row per (compare-pnl run, strategy).
+    // partition = bucket_day so a day's worth of snapshots clusters together.
+    // Mark-to-market only; resolution-based realized PnL goes into pnl_daily.
+    "CREATE TABLE IF NOT EXISTS polymarket_btc.strategy_pnl_snapshots ( \
+        bucket_day   TIMESTAMP, \
+        ts           TIMESTAMP, \
+        strategy     TEXT, \
+        n_decisions  INT, \
+        sum_size_usd DOUBLE, \
+        sum_pnl      DOUBLE, \
+        n_yes        INT, \
+        n_no         INT, \
+        n_pass       INT, \
+        PRIMARY KEY (bucket_day, ts, strategy) \
+     )",
 ];
