@@ -1,11 +1,12 @@
 //! Backtest orchestrator.
 //!
-//! CoreDB's SELECT responses currently advertise every column as
-//! `Text`, which trips the scylla driver's typed-row deserializer for
-//! TIMESTAMP / DOUBLE / BOOLEAN columns. Until that's smoothed over,
-//! the read path here goes straight to Polymarket Gamma so the
-//! backtest can actually run. CoreDB stays the write target — every
-//! produced decision still lands in `polymarket_btc.decisions`.
+//! Decisions are pulled live from Polymarket Gamma (the read side of
+//! CoreDB has historically been brittle and we only need market
+//! metadata here, not stored rows). Every produced decision still
+//! lands in `polymarket_btc.decisions` for downstream comparison /
+//! audit. With `--execute`, non-PASS decisions are also routed through
+//! the risk gate + paper executor and persisted as Order + Position
+//! rows.
 
 use std::time::Duration;
 
@@ -19,8 +20,12 @@ use crate::api::{AnthropicClient, ApiClient, OpenAICompatClient};
 use crate::backtest::{baseline::evaluate as baseline_evaluate, llm as llm_mod, BacktestMode};
 use crate::config::{Backend, Config};
 use crate::coredb::decisions::DecisionRepo;
+use crate::coredb::orders::{OrderRepo, PositionRepo};
 use crate::coredb::types::{bucket_day, now_ms, Decision, Market};
 use crate::coredb::CoreDb;
+use crate::execution::auto::{route_decision, Outcome};
+use crate::execution::paper::PaperExec;
+use crate::risk::RiskLimits;
 
 #[derive(Debug, Deserialize)]
 struct BinanceTicker {
@@ -28,10 +33,27 @@ struct BinanceTicker {
     last_price: String,
 }
 
-pub async fn run(coredb_uri: &str, mode: BacktestMode) -> Result<()> {
-    println!("🔍 backtest: connecting to CoreDB at {coredb_uri} (mode={mode:?})");
+pub async fn run(coredb_uri: &str, mode: BacktestMode, execute: bool) -> Result<()> {
+    println!(
+        "🔍 backtest: connecting to CoreDB at {coredb_uri} (mode={mode:?}, execute={execute})"
+    );
     let db = CoreDb::connect(coredb_uri).await.context("connect coredb")?;
     let dec_repo = DecisionRepo::new(db.session()).await?;
+
+    // The auto-execution wiring is only built when --execute is set, so
+    // a vanilla backtest run keeps its current zero-write footprint on
+    // the orders / positions tables and doesn't pay for the extra repo
+    // construction.
+    let exec_ctx = if execute {
+        Some(ExecCtx {
+            order_repo: OrderRepo::new(db.session()).await?,
+            pos_repo: PositionRepo::new(db.session()).await?,
+            exec: PaperExec,
+            limits: RiskLimits::default(),
+        })
+    } else {
+        None
+    };
 
     // Build the LLM client only when we'll actually use it — Config::load
     // touches the env (or ~/.deepseek), and we don't want to demand any
@@ -66,6 +88,7 @@ pub async fn run(coredb_uri: &str, mode: BacktestMode) -> Result<()> {
     let bd = bucket_day(ts);
     let mut counts = std::collections::HashMap::<String, u32>::new();
     let mut stored = 0u32;
+    let mut exec_stats = ExecStats::default();
     for (i, m) in markets.iter().enumerate() {
         let (side, size_usd, confidence, edge_bps, reasoning, raw_response) =
             match (&llm_ctx, mode) {
@@ -123,13 +146,64 @@ pub async fn run(coredb_uri: &str, mode: BacktestMode) -> Result<()> {
             Ok(()) => stored += 1,
             Err(e) => eprintln!("  ! decisions insert failed for {}: {e}", m.slug),
         }
+
+        // --execute: route every non-PASS decision through risk gate +
+        // PaperExec immediately after the decisions row lands. Skips,
+        // blocks, exec errors all roll into exec_stats so the final
+        // summary is one place to look. We don't bail on individual
+        // failures — backtest is a batch operation and partial
+        // execution is more useful than no execution.
+        if let Some(ctx) = exec_ctx.as_ref() {
+            match route_decision(&decision, &ctx.exec, &ctx.limits, &ctx.order_repo, &ctx.pos_repo).await {
+                Ok(Outcome::Filled(_)) => exec_stats.filled += 1,
+                Ok(Outcome::Skipped(_)) => exec_stats.skipped += 1,
+                Ok(Outcome::Blocked(reason)) => {
+                    exec_stats.blocked += 1;
+                    if exec_stats.blocked <= 3 {
+                        eprintln!("  ! risk gate blocked {}: {reason}", m.slug);
+                    }
+                }
+                Ok(Outcome::ExecError(reason)) => {
+                    exec_stats.errors += 1;
+                    eprintln!("  ! exec failed for {}: {reason}", m.slug);
+                }
+                Err(e) => {
+                    exec_stats.errors += 1;
+                    eprintln!("  ! route_decision raised for {}: {e}", m.slug);
+                }
+            }
+        }
     }
     println!("✓ backtest complete:");
     for side in ["YES", "NO", "PASS"] {
         println!("   {side:<5} {}", counts.get(side).copied().unwrap_or(0));
     }
     println!("   stored {} decisions in polymarket_btc.decisions", stored);
+    if exec_ctx.is_some() {
+        println!(
+            "   execute: {} filled, {} blocked, {} skipped, {} errors",
+            exec_stats.filled, exec_stats.blocked, exec_stats.skipped, exec_stats.errors
+        );
+    }
     Ok(())
+}
+
+/// Repositories + executor + limits constructed once per `run`
+/// invocation when `--execute` is set. Kept in one place so the per-
+/// market loop body stays readable.
+struct ExecCtx {
+    order_repo: OrderRepo,
+    pos_repo: PositionRepo,
+    exec: PaperExec,
+    limits: RiskLimits,
+}
+
+#[derive(Default)]
+struct ExecStats {
+    filled: u32,
+    blocked: u32,
+    skipped: u32,
+    errors: u32,
 }
 
 /// Bundle of everything the LLM path needs at call time. Built once

@@ -5,6 +5,7 @@
 //! and submits to Polymarket's CLOB. Same Executor trait so the rest of
 //! the codebase doesn't change when you flip paper → live.
 
+pub mod auto;
 pub mod live;
 pub mod paper;
 
