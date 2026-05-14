@@ -150,6 +150,11 @@ enum Commands {
         #[arg(long, default_value = "127.0.0.1:9042")]
         coredb_uri: String,
     },
+    /// Connect to Polymarket's user-channel WebSocket and log
+    /// incoming fill/order notifications. Requires
+    /// POLYMARKET_CLOB_API_KEY / _SECRET / _PASSPHRASE. Log-only —
+    /// does not write back to CoreDB yet.
+    UserChannel {},
     /// Live operator dashboard. Polls CoreDB every 5 s and shows
     /// strategy PnL, open positions, and recent decisions. `q` to quit.
     Dashboard {
@@ -278,6 +283,9 @@ async fn main() -> Result<()> {
         Some(Commands::Positions { coredb_uri }) => {
             run_positions(&coredb_uri).await?;
         }
+        Some(Commands::UserChannel {}) => {
+            run_user_channel().await?;
+        }
         Some(Commands::Dashboard { coredb_uri }) => {
             tui::run(&coredb_uri).await?;
         }
@@ -361,6 +369,35 @@ async fn run_clob_auth() -> Result<()> {
     println!("    export POLYMARKET_CLOB_API_KEY={}", creds.api_key);
     println!("    export POLYMARKET_CLOB_SECRET={}", creds.secret);
     println!("    export POLYMARKET_CLOB_PASSPHRASE={}", creds.passphrase);
+    Ok(())
+}
+
+/// Standalone wrapper around `data::user_channel::run`. Loads CLOB
+/// credentials from the env vars `rust-agent clob-auth` prints, sets
+/// up an ad-hoc shutdown channel wired to Ctrl+C, and runs until the
+/// user interrupts.
+async fn run_user_channel() -> Result<()> {
+    use std::sync::Arc;
+    use tokio::signal;
+    use tokio::sync::watch;
+    let api_key = std::env::var("POLYMARKET_CLOB_API_KEY")
+        .map_err(|_| anyhow::anyhow!("POLYMARKET_CLOB_API_KEY not set"))?;
+    let secret = std::env::var("POLYMARKET_CLOB_SECRET")
+        .map_err(|_| anyhow::anyhow!("POLYMARKET_CLOB_SECRET not set"))?;
+    let passphrase = std::env::var("POLYMARKET_CLOB_PASSPHRASE")
+        .map_err(|_| anyhow::anyhow!("POLYMARKET_CLOB_PASSPHRASE not set"))?;
+    let creds = Arc::new(execution::clob_auth::ApiCreds {
+        api_key,
+        secret,
+        passphrase,
+    });
+    let (tx, rx) = watch::channel(false);
+    let listener = tokio::spawn(data::user_channel::run(creds, rx));
+    println!("🔔 user-channel: subscribed. Ctrl+C to stop.");
+    signal::ctrl_c().await?;
+    let _ = tx.send(true);
+    let _ = listener.await;
+    println!("✓ user-channel: clean exit");
     Ok(())
 }
 

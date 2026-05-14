@@ -11,3 +11,4 @@
 pub mod binance;
 pub mod ingest;
 pub mod polymarket;
+pub mod user_channel;
