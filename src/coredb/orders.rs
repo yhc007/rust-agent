@@ -130,21 +130,31 @@ impl PositionRepo {
             .map_err(|e| CoreDbError::Query(format!("positions.list_all: {e}")))?;
         let rows = qr.into_rows_result()
             .map_err(|e| CoreDbError::Query(format!("positions.list_all rows: {e}")))?;
+        // Name-keyed: CoreDB returns columns in HashMap iteration order so
+        // tuple-position deserialization is unsafe.
         let typed = rows
-            .rows::<(String, String, f64, f64, CqlTimestamp)>()
+            .rows::<PositionRow>()
             .map_err(|e| CoreDbError::Query(format!("positions.list_all typed: {e}")))?;
         let mut out = Vec::new();
         for row in typed {
-            let (slug, side, size, avg, upd) =
-                row.map_err(|e| CoreDbError::Query(format!("positions row: {e}")))?;
+            let r = row.map_err(|e| CoreDbError::Query(format!("positions row: {e}")))?;
             out.push(Position {
-                market_slug: slug,
-                side,
-                size,
-                avg_price: avg,
-                updated_at_ms: upd.0,
+                market_slug: r.market_slug.unwrap_or_default(),
+                side: r.side.unwrap_or_default(),
+                size: r.size.unwrap_or(0.0),
+                avg_price: r.avg_price.unwrap_or(0.0),
+                updated_at_ms: r.updated_at.map(|t| t.0).unwrap_or(0),
             });
         }
         Ok(out)
     }
+}
+
+#[derive(scylla::DeserializeRow)]
+struct PositionRow {
+    market_slug: Option<String>,
+    side: Option<String>,
+    size: Option<f64>,
+    avg_price: Option<f64>,
+    updated_at: Option<CqlTimestamp>,
 }

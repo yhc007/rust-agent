@@ -138,6 +138,12 @@ enum Commands {
         #[arg(long, default_value = "127.0.0.1:9042")]
         coredb_uri: String,
     },
+    /// Live operator dashboard. Polls CoreDB every 5 s and shows
+    /// strategy PnL, open positions, and recent decisions. `q` to quit.
+    Dashboard {
+        #[arg(long, default_value = "127.0.0.1:9042")]
+        coredb_uri: String,
+    },
     /// Run ingest + periodic backtest/compare-pnl/settle-pnl under one
     /// process. The "do everything" mode — replaces a cron stack for
     /// day-to-day paper trading. Ctrl+C tears the whole pipeline down.
@@ -223,6 +229,9 @@ async fn main() -> Result<()> {
         }
         Some(Commands::SettlePnl { coredb_uri }) => {
             backtest::settle::run(&coredb_uri).await?;
+        }
+        Some(Commands::Dashboard { coredb_uri }) => {
+            tui::run(&coredb_uri).await?;
         }
         Some(Commands::Daemon {
             coredb_uri,
