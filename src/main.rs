@@ -149,6 +149,29 @@ enum Commands {
     /// `POLYMARKET_PRIVATE_KEY` and print the issued API key /
     /// secret / passphrase. Run once per wallet; persist the output.
     ClobAuth {},
+    /// USDC `approve` the Polymarket CTF Exchange as a spender. One-
+    /// time per wallet. Without this, even a successful `POST /order`
+    /// is rejected at fill. Default DRY_RUN — pass `--send` to
+    /// actually broadcast the transaction.
+    UsdcApprove {
+        /// Polygon mainnet RPC URL (HTTP). Falls back to
+        /// `POLYGON_RPC_URL` env when not passed.
+        #[arg(long)]
+        rpc_url: Option<String>,
+        /// USDC base units (6 decimals). Default: `U256::MAX` (unlimited).
+        #[arg(long)]
+        amount: Option<String>,
+        /// Override the spender address (default: CTF Exchange).
+        #[arg(long)]
+        spender: Option<String>,
+        /// Override the USDC token address (default: PoS-bridged USDC.e).
+        #[arg(long)]
+        usdc: Option<String>,
+        /// Actually broadcast the approve transaction. Without this
+        /// flag the helper only reads + prints the intended call.
+        #[arg(long)]
+        send: bool,
+    },
     /// Run ingest + periodic backtest/compare-pnl/settle-pnl under one
     /// process. The "do everything" mode — replaces a cron stack for
     /// day-to-day paper trading. Ctrl+C tears the whole pipeline down.
@@ -241,6 +264,15 @@ async fn main() -> Result<()> {
         Some(Commands::ClobAuth {}) => {
             run_clob_auth().await?;
         }
+        Some(Commands::UsdcApprove {
+            rpc_url,
+            amount,
+            spender,
+            usdc,
+            send,
+        }) => {
+            run_usdc_approve(rpc_url, amount, spender, usdc, send).await?;
+        }
         Some(Commands::Daemon {
             coredb_uri,
             backtest_every,
@@ -308,6 +340,48 @@ async fn run_clob_auth() -> Result<()> {
     println!("    export POLYMARKET_CLOB_SECRET={}", creds.secret);
     println!("    export POLYMARKET_CLOB_PASSPHRASE={}", creds.passphrase);
     Ok(())
+}
+
+async fn run_usdc_approve(
+    rpc_url: Option<String>,
+    amount: Option<String>,
+    spender: Option<String>,
+    usdc: Option<String>,
+    send: bool,
+) -> Result<()> {
+    use std::str::FromStr;
+    use alloy::primitives::{Address, U256};
+    use execution::usdc_approve::{
+        run as approve_run, ApproveConfig, POLYGON_USDC_E, POLYMARKET_CTF_EXCHANGE,
+    };
+
+    let rpc_url = rpc_url
+        .or_else(|| std::env::var("POLYGON_RPC_URL").ok())
+        .ok_or_else(|| {
+            anyhow::anyhow!("--rpc-url not passed and POLYGON_RPC_URL env not set")
+        })?;
+    let usdc_address = match usdc {
+        Some(s) => Address::from_str(&s)?,
+        None => Address::from_str(POLYGON_USDC_E)?,
+    };
+    let spender_address = match spender {
+        Some(s) => Address::from_str(&s)?,
+        None => Address::from_str(POLYMARKET_CTF_EXCHANGE)?,
+    };
+    let amount_value = match amount {
+        Some(s) if s.eq_ignore_ascii_case("max") => U256::MAX,
+        Some(s) => U256::from_str_radix(&s, 10)
+            .map_err(|e| anyhow::anyhow!("parse --amount: {e}"))?,
+        None => U256::MAX,
+    };
+    approve_run(ApproveConfig {
+        rpc_url,
+        usdc_address,
+        spender: spender_address,
+        amount: amount_value,
+        send,
+    })
+    .await
 }
 
 async fn run_chat(config: Config, model: String, initial_prompt: Option<String>) -> Result<()> {

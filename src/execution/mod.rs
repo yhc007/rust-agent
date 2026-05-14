@@ -9,6 +9,7 @@ pub mod auto;
 pub mod clob_auth;
 pub mod live;
 pub mod paper;
+pub mod usdc_approve;
 
 use async_trait::async_trait;
 use thiserror::Error;

@@ -83,7 +83,15 @@ regex = "1"
 # the signer + sol-types features; no provider / RPC bits are needed
 # while the live path is sign-only. hex is used to parse the
 # POLYMARKET_PRIVATE_KEY env var.
-alloy = { version = "0.8", default-features = false, features = ["signer-local", "sol-types"] }
+alloy = { version = "0.8", default-features = false, features = [
+    "signer-local",
+    "sol-types",
+    "contract",
+    "providers",
+    "network",
+    "rpc-types-eth",
+    "reqwest",
+] }
 hex = "0.4"
 
 # HMAC-SHA256 for Polymarket CLOB L2 request signatures.
