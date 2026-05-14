@@ -144,6 +144,11 @@ enum Commands {
         #[arg(long, default_value = "127.0.0.1:9042")]
         coredb_uri: String,
     },
+    /// Run the Polymarket CLOB L1 handshake against
+    /// `POST https://clob.polymarket.com/auth/api-key` using
+    /// `POLYMARKET_PRIVATE_KEY` and print the issued API key /
+    /// secret / passphrase. Run once per wallet; persist the output.
+    ClobAuth {},
     /// Run ingest + periodic backtest/compare-pnl/settle-pnl under one
     /// process. The "do everything" mode — replaces a cron stack for
     /// day-to-day paper trading. Ctrl+C tears the whole pipeline down.
@@ -233,6 +238,9 @@ async fn main() -> Result<()> {
         Some(Commands::Dashboard { coredb_uri }) => {
             tui::run(&coredb_uri).await?;
         }
+        Some(Commands::ClobAuth {}) => {
+            run_clob_auth().await?;
+        }
         Some(Commands::Daemon {
             coredb_uri,
             backtest_every,
@@ -258,6 +266,47 @@ async fn main() -> Result<()> {
         }
     }
     
+    Ok(())
+}
+
+/// One-time setup: ask Polymarket's CLOB for an API key for the wallet
+/// loaded from `POLYMARKET_PRIVATE_KEY` and print the issued
+/// credentials. The handshake is an L1 (wallet signature) call; once
+/// you have the creds you persist them yourself and feed them into
+/// later L2 (HMAC) authenticated calls. Polymarket only mints the
+/// secret once per key, so save the output before re-running.
+async fn run_clob_auth() -> Result<()> {
+    use alloy::signers::local::PrivateKeySigner;
+    let raw = std::env::var("POLYMARKET_PRIVATE_KEY")
+        .map_err(|_| anyhow::anyhow!("POLYMARKET_PRIVATE_KEY not set"))?;
+    let stripped = raw.trim().trim_start_matches("0x");
+    if stripped.len() != 64 {
+        anyhow::bail!(
+            "POLYMARKET_PRIVATE_KEY must be 32 bytes (64 hex chars); got {}",
+            stripped.len()
+        );
+    }
+    let bytes = hex::decode(stripped)?;
+    let signer = PrivateKeySigner::from_slice(&bytes)?;
+    println!("🔑 wallet: {}", signer.address());
+    println!(
+        "🌐 POST {}/auth/api-key (L1 EIP-712 ClobAuth)",
+        execution::clob_auth::CLOB_BASE_URL
+    );
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()?;
+    let creds = execution::clob_auth::request_api_creds(&http, &signer).await?;
+    println!();
+    println!("✓ credentials issued — save these:");
+    println!("    api_key:    {}", creds.api_key);
+    println!("    secret:     {}", creds.secret);
+    println!("    passphrase: {}", creds.passphrase);
+    println!();
+    println!("Suggested:");
+    println!("    export POLYMARKET_CLOB_API_KEY={}", creds.api_key);
+    println!("    export POLYMARKET_CLOB_SECRET={}", creds.secret);
+    println!("    export POLYMARKET_CLOB_PASSPHRASE={}", creds.passphrase);
     Ok(())
 }
 

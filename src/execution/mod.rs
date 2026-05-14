@@ -6,6 +6,7 @@
 //! the codebase doesn't change when you flip paper → live.
 
 pub mod auto;
+pub mod clob_auth;
 pub mod live;
 pub mod paper;
 
