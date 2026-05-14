@@ -56,6 +56,9 @@ impl OrderRepo {
         let rows = qr
             .into_rows_result()
             .map_err(|e| CoreDbError::Query(format!("orders.list_day rows: {e}")))?;
+        if rows.rows_num() == 0 {
+            return Ok(Vec::new());
+        }
         // CoreDB returns columns in HashMap-iteration order, not SELECT-list
         // order — see the equivalent shim in decisions.rs. Name-keyed
         // DeserializeRow sidesteps the reshuffle.

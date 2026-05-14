@@ -52,6 +52,9 @@ impl OrderbookRepo {
             .map_err(|e| CoreDbError::Query(format!("orderbook.list_hour: {e}")))?;
         let rows = qr.into_rows_result()
             .map_err(|e| CoreDbError::Query(format!("orderbook.list_hour rows: {e}")))?;
+        if rows.rows_num() == 0 {
+            return Ok(Vec::new());
+        }
         let typed = rows
             .rows::<(CqlTimestamp, String, CqlTimestamp, String, String, String, String)>()
             .map_err(|e| CoreDbError::Query(format!("orderbook.list_hour typed: {e}")))?;

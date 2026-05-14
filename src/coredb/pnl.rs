@@ -42,6 +42,9 @@ impl PnlRepo {
             .map_err(|e| CoreDbError::Query(format!("pnl.range: {e}")))?;
         let rows = qr.into_rows_result()
             .map_err(|e| CoreDbError::Query(format!("pnl.range rows: {e}")))?;
+        if rows.rows_num() == 0 {
+            return Ok(Vec::new());
+        }
         let typed = rows
             .rows::<(CqlTimestamp, f64, f64, i32, f64)>()
             .map_err(|e| CoreDbError::Query(format!("pnl.range typed: {e}")))?;

@@ -63,6 +63,9 @@ impl StrategyPnlRepo {
         let rows = qr
             .into_rows_result()
             .map_err(|e| CoreDbError::Query(format!("strategy_pnl.list_day rows: {e}")))?;
+        if rows.rows_num() == 0 {
+            return Ok(Vec::new());
+        }
         let typed = rows
             .rows::<NamedRow>()
             .map_err(|e| CoreDbError::Query(format!("strategy_pnl.list_day typed: {e}")))?;

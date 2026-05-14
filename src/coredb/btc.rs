@@ -58,6 +58,9 @@ impl BtcTickRepo {
         let rows = qr
             .into_rows_result()
             .map_err(|e| CoreDbError::Query(format!("btc_ticks.list_hour rows: {e}")))?;
+        if rows.rows_num() == 0 {
+            return Ok(Vec::new());
+        }
         // Name-keyed deser so HashMap-iteration column order doesn't trip us
         // up (same pattern as decisions / orders / strategy_pnl repos).
         let typed = rows

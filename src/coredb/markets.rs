@@ -54,6 +54,11 @@ impl MarketRepo {
         let rows = qr
             .into_rows_result()
             .map_err(|e| CoreDbError::Query(format!("markets.list_open rows: {e}")))?;
+        // Empty-rowset guard: CoreDB serves 0-column metadata for
+        // empty selects; skip the typed deser before it trips.
+        if rows.rows_num() == 0 {
+            return Ok(Vec::new());
+        }
         // Name-keyed deser, same shim as decisions / btc_ticks / orders.
         let typed = rows
             .rows::<MarketRow>()
@@ -81,6 +86,9 @@ impl MarketRepo {
         let rows = qr
             .into_rows_result()
             .map_err(|e| CoreDbError::Query(format!("markets.get rows: {e}")))?;
+        if rows.rows_num() == 0 {
+            return Ok(None);
+        }
         let typed = rows
             .rows::<MarketRow>()
             .map_err(|e| CoreDbError::Query(format!("markets.get typed: {e}")))?;

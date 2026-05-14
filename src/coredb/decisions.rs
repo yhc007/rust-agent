@@ -58,6 +58,13 @@ impl DecisionRepo {
         let rows = qr
             .into_rows_result()
             .map_err(|e| CoreDbError::Query(format!("decisions.list_day rows: {e}")))?;
+        // Empty-rowset short-circuit (see positions_v2 for the same
+        // pattern): CoreDB advertises 0 columns when the result is
+        // empty, and scylla's typed-row check rejects that. Skip the
+        // typed deser entirely.
+        if rows.rows_num() == 0 {
+            return Ok(Vec::new());
+        }
         // Column order in the response follows CoreDB's HashMap iteration
         // (Row.columns is HashMap<String, CassandraValue>), which is not the
         // SELECT-list order. Using a `(Name, Type)` typed-tuple risks a
