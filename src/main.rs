@@ -144,6 +144,12 @@ enum Commands {
         #[arg(long, default_value = "127.0.0.1:9042")]
         coredb_uri: String,
     },
+    /// Dump every row in `polymarket_btc.positions`, newest first.
+    /// The headless analogue of the dashboard's positions panel.
+    Positions {
+        #[arg(long, default_value = "127.0.0.1:9042")]
+        coredb_uri: String,
+    },
     /// Live operator dashboard. Polls CoreDB every 5 s and shows
     /// strategy PnL, open positions, and recent decisions. `q` to quit.
     Dashboard {
@@ -269,6 +275,9 @@ async fn main() -> Result<()> {
         Some(Commands::SettlePnl { coredb_uri }) => {
             backtest::settle::run(&coredb_uri).await?;
         }
+        Some(Commands::Positions { coredb_uri }) => {
+            run_positions(&coredb_uri).await?;
+        }
         Some(Commands::Dashboard { coredb_uri }) => {
             tui::run(&coredb_uri).await?;
         }
@@ -353,6 +362,56 @@ async fn run_clob_auth() -> Result<()> {
     println!("    export POLYMARKET_CLOB_SECRET={}", creds.secret);
     println!("    export POLYMARKET_CLOB_PASSPHRASE={}", creds.passphrase);
     Ok(())
+}
+
+async fn run_positions(coredb_uri: &str) -> Result<()> {
+    use chrono::{DateTime, Utc};
+    use coredb::orders::PositionRepo;
+    use coredb::CoreDb;
+
+    let db = CoreDb::connect(coredb_uri).await?;
+    let repo = PositionRepo::new(db.session()).await?;
+    let mut positions = repo.list_all().await?;
+    // Newest first; everything else is alphabetical for stable
+    // diffability across consecutive dumps.
+    positions.sort_by(|a, b| {
+        b.updated_at_ms
+            .cmp(&a.updated_at_ms)
+            .then_with(|| a.market_slug.cmp(&b.market_slug))
+    });
+
+    println!("📜 positions ({} open)", positions.len());
+    if positions.is_empty() {
+        return Ok(());
+    }
+    println!(
+        "   {:<40} {:<5} {:>10} {:>10} {:>10}",
+        "market_slug", "side", "size", "avg_price", "updated"
+    );
+    for p in &positions {
+        let ts = DateTime::<Utc>::from_timestamp_millis(p.updated_at_ms)
+            .map(|d| d.format("%H:%M:%S").to_string())
+            .unwrap_or_default();
+        println!(
+            "   {:<40} {:<5} {:>10.2} {:>10.4} {:>10}",
+            truncate(&p.market_slug, 40),
+            p.side,
+            p.size,
+            p.avg_price,
+            ts
+        );
+    }
+    Ok(())
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let mut out: String = s.chars().take(max - 1).collect();
+        out.push('…');
+        out
+    }
 }
 
 async fn run_usdc_approve(
