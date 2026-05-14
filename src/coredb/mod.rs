@@ -53,6 +53,7 @@ impl CoreDb {
         "decisions",
         "orders",
         "positions",
+        "positions_v2",
         "pnl_daily",
         "strategy_pnl_snapshots",
     ];

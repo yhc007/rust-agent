@@ -111,11 +111,11 @@ pub async fn route_decision(
         return Ok(Outcome::ExecError(format!("orders.insert: {e}")));
     }
 
-    // Naive position tracking: each fill overwrites the previous row
-    // for this market — same approach as PlaceOrderTool. A proper
-    // average-price implementation needs a read-modify-write inside an
-    // LWT, which CoreDB's protocol layer can't reliably round-trip
-    // today. The decisions / orders tables retain the audit trail.
+    // apply_fill does the read-modify-write so cumulative size +
+    // volume-weighted avg_price accumulate correctly across multiple
+    // fills on the same (market_slug, side). Race-prone in principle,
+    // but the agent serialises orders through route_decision so two
+    // fills on the same key can't be in flight simultaneously.
     let pos = Position {
         market_slug: req.market_slug.clone(),
         side: req.side.clone(),
@@ -123,8 +123,8 @@ pub async fn route_decision(
         avg_price: fill.fill_price,
         updated_at_ms: ts,
     };
-    if let Err(e) = pos_repo.upsert(&pos).await {
-        return Ok(Outcome::ExecError(format!("positions.upsert: {e}")));
+    if let Err(e) = pos_repo.apply_fill(&pos).await {
+        return Ok(Outcome::ExecError(format!("positions.apply_fill: {e}")));
     }
 
     Ok(Outcome::Filled(order))

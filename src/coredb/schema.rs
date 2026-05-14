@@ -102,12 +102,26 @@ pub const MIGRATIONS: &[&str] = &[
     "CREATE INDEX idx_orders_status ON polymarket_btc.orders (status)",
 
     // ---- Current positions (overwritten via LWT). ----
+    // v1: kept for backward-compat with rows that already landed before
+    // the v2 schema; the runtime no longer writes here.
     "CREATE TABLE IF NOT EXISTS polymarket_btc.positions ( \
         market_slug TEXT PRIMARY KEY, \
         side        TEXT, \
         size        DOUBLE, \
         avg_price   DOUBLE, \
         updated_at  TIMESTAMP \
+     )",
+    // v2: PK is (market_slug, side) so YES and NO positions on the
+    // same market are tracked independently. `apply_fill` does a
+    // read-modify-write to maintain volume-weighted average price +
+    // cumulative size across fills.
+    "CREATE TABLE IF NOT EXISTS polymarket_btc.positions_v2 ( \
+        market_slug TEXT, \
+        side        TEXT, \
+        size        DOUBLE, \
+        avg_price   DOUBLE, \
+        updated_at  TIMESTAMP, \
+        PRIMARY KEY (market_slug, side) \
      )",
 
     // ---- Daily PnL summary. CoreDB has no DATE type so day uses TIMESTAMP. ----

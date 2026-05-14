@@ -129,10 +129,11 @@ impl Tool for PlaceOrderTool {
         order_repo.insert(&order).await
             .map_err(|e| ToolError::ExecutionFailed(format!("orders insert: {e}")))?;
 
-        // Naive position tracking: overwrite. A proper averaging
-        // implementation needs a read+write inside an LWT, which we
-        // can't do today (CoreDB SELECT type-deserialization is
-        // brittle). This is good enough for paper trading audit.
+        // Position tracking via apply_fill: read existing row for
+        // (market_slug, side) and combine with this fill using a
+        // volume-weighted average price. Non-atomic (no LWT), but the
+        // tool dispatcher serializes calls per agent loop so two fills
+        // on the same key can't be in flight at once.
         let pos = Position {
             market_slug: req.market_slug.clone(),
             side: req.side.clone(),
@@ -140,8 +141,8 @@ impl Tool for PlaceOrderTool {
             avg_price: fill.fill_price,
             updated_at_ms: ts,
         };
-        pos_repo.upsert(&pos).await
-            .map_err(|e| ToolError::ExecutionFailed(format!("positions upsert: {e}")))?;
+        pos_repo.apply_fill(&pos).await
+            .map_err(|e| ToolError::ExecutionFailed(format!("positions apply_fill: {e}")))?;
 
         let body = json!({
             "order_id":    fill.order_id,
