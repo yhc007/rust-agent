@@ -39,6 +39,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tokio-stream = "0.1"
 futures = "0.3"
 eventsource-stream = "0.2"
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
 
 # Embedded web server for the agent-stream UI (rust-agent serve)
 axum = { version = "0.7", features = ["macros"] }
