@@ -79,6 +79,13 @@ scylla = "0.15"
 # Regex for threshold extraction in backtest baseline
 regex = "1"
 
+# EIP-712 signing for the Polymarket CLOB live executor. We pull only
+# the signer + sol-types features; no provider / RPC bits are needed
+# while the live path is sign-only. hex is used to parse the
+# POLYMARKET_PRIVATE_KEY env var.
+alloy = { version = "0.8", default-features = false, features = ["signer-local", "sol-types"] }
+hex = "0.4"
+
 [dev-dependencies]
 tokio-test = "0.4"
 tempfile = "3"
