@@ -97,15 +97,20 @@ enum Commands {
     /// Run a decision pass over every open BTC market in CoreDB,
     /// recording one decision per market. Default uses the deterministic
     /// baseline rule; `--llm` switches to the configured LLM (DeepSeek
-    /// by default — see `Config::load`). With `--execute`, every non-
-    /// PASS decision is also routed through the risk gate + paper
-    /// executor, writing Order + Position rows.
+    /// by default — see `Config::load`); `--both` runs both strategies
+    /// against the same market state and emits two decision rows per
+    /// market, which makes downstream PnL comparisons timing-honest.
+    /// With `--execute`, every non-PASS decision is also routed through
+    /// the risk gate + paper executor, writing Order + Position rows.
     Backtest {
         #[arg(long, default_value = "127.0.0.1:9042")]
         coredb_uri: String,
         /// Use the LLM-driven decision path instead of the baseline rule.
         #[arg(long)]
         llm: bool,
+        /// Run BOTH baseline and LLM strategies per market (overrides --llm).
+        #[arg(long)]
+        both: bool,
         /// Auto-execute non-PASS decisions via risk gate + PaperExec.
         #[arg(long)]
         execute: bool,
@@ -179,8 +184,10 @@ async fn main() -> Result<()> {
         Some(Commands::Stats { coredb_uri }) => {
             run_stats(coredb_uri).await?;
         }
-        Some(Commands::Backtest { coredb_uri, llm, execute }) => {
-            let mode = if llm {
+        Some(Commands::Backtest { coredb_uri, llm, both, execute }) => {
+            let mode = if both {
+                backtest::BacktestMode::Both
+            } else if llm {
                 backtest::BacktestMode::Llm
             } else {
                 backtest::BacktestMode::Baseline

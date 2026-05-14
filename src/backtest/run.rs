@@ -71,9 +71,10 @@ pub async fn run(coredb_uri: &str, mode: BacktestMode, execute: bool) -> Result<
     // Build the LLM client only when we'll actually use it — Config::load
     // touches the env (or ~/.deepseek), and we don't want to demand any
     // credentials for the baseline-only path.
-    let llm_ctx = match mode {
-        BacktestMode::Baseline => None,
-        BacktestMode::Llm => Some(LlmCtx::from_config(Config::load()?)?),
+    let llm_ctx = if mode.wants_llm() {
+        Some(LlmCtx::from_config(Config::load()?)?)
+    } else {
+        None
     };
     if let Some(ctx) = &llm_ctx {
         println!("🧠 backtest: LLM = {} ({})", ctx.label, ctx.model);
@@ -138,97 +139,134 @@ pub async fn run(coredb_uri: &str, mode: BacktestMode, execute: bool) -> Result<
 
     let ts = now_ms();
     let bd = bucket_day(ts);
-    let mut counts = std::collections::HashMap::<String, u32>::new();
+    // counts: strategy → (side → count). Per-strategy in --both mode so
+    // the final summary stays comparable; in single-strategy modes the
+    // outer map only holds one key.
+    let mut counts: std::collections::HashMap<&'static str, std::collections::HashMap<String, u32>> =
+        std::collections::HashMap::new();
     let mut stored = 0u32;
     let mut exec_stats = ExecStats::default();
     for (i, m) in markets.iter().enumerate() {
-        let (side, size_usd, confidence, edge_bps, reasoning, raw_response) =
-            match (&llm_ctx, mode) {
-                (Some(ctx), BacktestMode::Llm) => {
-                    if (i + 1) % 5 == 0 || i == 0 {
-                        println!("   llm: {}/{}  ({})", i + 1, markets.len(), m.slug);
-                    }
-                    let d = llm_mod::evaluate(
-                        m,
-                        btc_price,
-                        ctx.client.as_ref(),
-                        &ctx.model,
-                        ctx.max_tokens,
-                    )
-                    .await;
-                    (
-                        d.side,
-                        d.size_usd,
-                        d.confidence,
-                        d.edge_bps,
-                        d.reasoning,
-                        d.raw_response,
-                    )
-                }
-                _ => {
-                    let b = baseline_evaluate(m, btc_price);
-                    (
-                        b.side.to_string(),
-                        b.size_usd,
-                        b.confidence,
-                        b.edge_bps,
-                        b.reasoning,
-                        "baseline-rule".to_string(),
-                    )
-                }
-            };
-        *counts.entry(side.clone()).or_insert(0) += 1;
-        let decision = Decision {
-            bucket_day_ms: bd,
-            ts_ms: ts,
-            decision_id: Uuid::new_v4(),
-            market_slug: m.slug.clone(),
-            side,
-            size_usd,
-            confidence,
-            edge_bps,
-            reasoning,
-            raw_response,
-            // YES price at decision time. The mark-to-market PnL comparator
-            // needs an entry price; capturing it here avoids a separate
-            // price-history table.
-            entry_price: m.last_price,
-        };
-        match dec_repo.insert(&decision).await {
-            Ok(()) => stored += 1,
-            Err(e) => eprintln!("  ! decisions insert failed for {}: {e}", m.slug),
+        // Buffer the per-strategy evaluations for THIS market before
+        // any inserts so all rows share the same `ts` / `entry_price`.
+        // In --both mode that's what makes the head-to-head fair: same
+        // BTC spot, same Polymarket yes_price, same decision instant.
+        let mut emissions: Vec<(&'static str, Decision)> = Vec::new();
+
+        if mode.wants_baseline() {
+            let b = baseline_evaluate(m, btc_price);
+            emissions.push((
+                "baseline",
+                Decision {
+                    bucket_day_ms: bd,
+                    ts_ms: ts,
+                    decision_id: Uuid::new_v4(),
+                    market_slug: m.slug.clone(),
+                    side: b.side.to_string(),
+                    size_usd: b.size_usd,
+                    confidence: b.confidence,
+                    edge_bps: b.edge_bps,
+                    reasoning: b.reasoning,
+                    raw_response: "baseline-rule".to_string(),
+                    entry_price: m.last_price,
+                },
+            ));
         }
 
-        // --execute: route every non-PASS decision through risk gate +
-        // PaperExec immediately after the decisions row lands. Skips,
-        // blocks, exec errors all roll into exec_stats so the final
-        // summary is one place to look. We don't bail on individual
-        // failures — backtest is a batch operation and partial
-        // execution is more useful than no execution.
-        if let Some(ctx) = exec_ctx.as_ref() {
-            match route_decision(&decision, &ctx.exec, &ctx.limits, &ctx.order_repo, &ctx.pos_repo).await {
-                Ok(Outcome::Filled(_)) => exec_stats.filled += 1,
-                Ok(Outcome::Skipped(_)) => exec_stats.skipped += 1,
-                Ok(Outcome::Blocked(reason)) => {
-                    exec_stats.blocked += 1;
-                    if exec_stats.blocked <= 3 {
-                        eprintln!("  ! risk gate blocked {}: {reason}", m.slug);
-                    }
-                }
-                Ok(Outcome::ExecError(reason)) => {
-                    exec_stats.errors += 1;
-                    eprintln!("  ! exec failed for {}: {reason}", m.slug);
-                }
+        if mode.wants_llm() {
+            let ctx = llm_ctx
+                .as_ref()
+                .expect("llm_ctx must be initialized when mode.wants_llm()");
+            if (i + 1) % 5 == 0 || i == 0 {
+                println!("   llm: {}/{}  ({})", i + 1, markets.len(), m.slug);
+            }
+            let d = llm_mod::evaluate(
+                m,
+                btc_price,
+                ctx.client.as_ref(),
+                &ctx.model,
+                ctx.max_tokens,
+            )
+            .await;
+            emissions.push((
+                "llm",
+                Decision {
+                    bucket_day_ms: bd,
+                    ts_ms: ts,
+                    decision_id: Uuid::new_v4(),
+                    market_slug: m.slug.clone(),
+                    side: d.side,
+                    size_usd: d.size_usd,
+                    confidence: d.confidence,
+                    edge_bps: d.edge_bps,
+                    reasoning: d.reasoning,
+                    raw_response: d.raw_response,
+                    entry_price: m.last_price,
+                },
+            ));
+        }
+
+        for (strategy, decision) in &emissions {
+            *counts
+                .entry(strategy)
+                .or_default()
+                .entry(decision.side.clone())
+                .or_insert(0) += 1;
+            match dec_repo.insert(decision).await {
+                Ok(()) => stored += 1,
                 Err(e) => {
-                    exec_stats.errors += 1;
-                    eprintln!("  ! route_decision raised for {}: {e}", m.slug);
+                    eprintln!("  ! decisions insert failed for {} ({}): {e}", m.slug, strategy)
                 }
             }
-        }
-    }
+
+            // --execute: route every non-PASS decision through risk gate +
+            // PaperExec immediately after the decisions row lands. Skips,
+            // blocks, exec errors all roll into exec_stats so the final
+            // summary is one place to look. We don't bail on individual
+            // failures — backtest is a batch operation and partial
+            // execution is more useful than no execution. In --both mode
+            // this runs once per strategy per market.
+            if let Some(ctx) = exec_ctx.as_ref() {
+                match route_decision(
+                    decision,
+                    &ctx.exec,
+                    &ctx.limits,
+                    &ctx.order_repo,
+                    &ctx.pos_repo,
+                )
+                .await
+                {
+                    Ok(Outcome::Filled(_)) => exec_stats.filled += 1,
+                    Ok(Outcome::Skipped(_)) => exec_stats.skipped += 1,
+                    Ok(Outcome::Blocked(reason)) => {
+                        exec_stats.blocked += 1;
+                        if exec_stats.blocked <= 3 {
+                            eprintln!("  ! risk gate blocked {}: {reason}", m.slug);
+                        }
+                    }
+                    Ok(Outcome::ExecError(reason)) => {
+                        exec_stats.errors += 1;
+                        eprintln!("  ! exec failed for {}: {reason}", m.slug);
+                    }
+                    Err(e) => {
+                        exec_stats.errors += 1;
+                        eprintln!("  ! route_decision raised for {}: {e}", m.slug);
+                    }
+                }
+            }
+        } // end inner per-strategy loop
+    } // end outer per-market loop
+
     println!("✓ backtest complete:");
-    for side in ["YES", "NO", "PASS"] {
-        println!("   {side:<5} {}", counts.get(side).copied().unwrap_or(0));
+    let mut strategies: Vec<&'static str> = counts.keys().copied().collect();
+    strategies.sort();
+    for strategy in &strategies {
+        let sides = &counts[strategy];
+        let line: Vec<String> = ["YES", "NO", "PASS"]
+            .iter()
+            .map(|s| format!("{s}={}", sides.get(*s).copied().unwrap_or(0)))
+            .collect();
+        println!("   {strategy:<8} {}", line.join(" "));
     }
     println!("   stored {} decisions in polymarket_btc.decisions", stored);
     if exec_ctx.is_some() {
