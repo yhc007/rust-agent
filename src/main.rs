@@ -10,6 +10,7 @@ mod api;
 mod backtest;
 mod config;
 mod coredb;
+mod daemon;
 mod data;
 mod engine;
 mod execution;
@@ -137,6 +138,26 @@ enum Commands {
         #[arg(long, default_value = "127.0.0.1:9042")]
         coredb_uri: String,
     },
+    /// Run ingest + periodic backtest/compare-pnl/settle-pnl under one
+    /// process. The "do everything" mode — replaces a cron stack for
+    /// day-to-day paper trading. Ctrl+C tears the whole pipeline down.
+    Daemon {
+        #[arg(long, default_value = "127.0.0.1:9042")]
+        coredb_uri: String,
+        /// Seconds between backtest --both --execute runs.
+        #[arg(long, default_value_t = 1800)]
+        backtest_every: u64,
+        /// Seconds between compare-pnl runs.
+        #[arg(long, default_value_t = 900)]
+        compare_every: u64,
+        /// Seconds between settle-pnl runs.
+        #[arg(long, default_value_t = 3600)]
+        settle_every: u64,
+        /// Suppress paper-execute on the periodic backtests (decisions
+        /// only). Off by default — paper trading is the point.
+        #[arg(long)]
+        no_execute: bool,
+    },
 }
 
 #[tokio::main]
@@ -202,6 +223,20 @@ async fn main() -> Result<()> {
         }
         Some(Commands::SettlePnl { coredb_uri }) => {
             backtest::settle::run(&coredb_uri).await?;
+        }
+        Some(Commands::Daemon {
+            coredb_uri,
+            backtest_every,
+            compare_every,
+            settle_every,
+            no_execute,
+        }) => {
+            let mut cfg = daemon::DaemonConfig::new(coredb_uri);
+            cfg.backtest_every_secs = backtest_every;
+            cfg.compare_every_secs = compare_every;
+            cfg.settle_every_secs = settle_every;
+            cfg.execute = !no_execute;
+            daemon::run(cfg).await?;
         }
         None => {
             // Default: interactive chat

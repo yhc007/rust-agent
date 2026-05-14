@@ -6,6 +6,7 @@ pub mod api;
 pub mod backtest;
 pub mod config;
 pub mod coredb;
+pub mod daemon;
 pub mod data;
 pub mod engine;
 pub mod execution;
