@@ -49,22 +49,14 @@ impl MarketRepo {
         let rows = qr
             .into_rows_result()
             .map_err(|e| CoreDbError::Query(format!("markets.list_open rows: {e}")))?;
+        // Name-keyed deser, same shim as decisions / btc_ticks / orders.
         let typed = rows
-            .rows::<(String, String, CqlTimestamp, String, bool, f64, CqlTimestamp)>()
+            .rows::<MarketRow>()
             .map_err(|e| CoreDbError::Query(format!("markets.list_open typed: {e}")))?;
         let mut out = Vec::new();
         for row in typed {
-            let (slug, question, end_date, outcomes, closed, last_price, updated_at) =
-                row.map_err(|e| CoreDbError::Query(format!("markets.list_open row: {e}")))?;
-            out.push(Market {
-                slug,
-                question,
-                end_date_ms: end_date.0,
-                outcomes,
-                closed,
-                last_price,
-                updated_at_ms: updated_at.0,
-            });
+            let r = row.map_err(|e| CoreDbError::Query(format!("markets.list_open row: {e}")))?;
+            out.push(market_from_row(r));
         }
         Ok(out)
     }
@@ -84,21 +76,35 @@ impl MarketRepo {
             .into_rows_result()
             .map_err(|e| CoreDbError::Query(format!("markets.get rows: {e}")))?;
         let typed = rows
-            .rows::<(String, String, CqlTimestamp, String, bool, f64, CqlTimestamp)>()
+            .rows::<MarketRow>()
             .map_err(|e| CoreDbError::Query(format!("markets.get typed: {e}")))?;
         for row in typed {
-            let (slug, question, end_date, outcomes, closed, last_price, updated_at) =
-                row.map_err(|e| CoreDbError::Query(format!("markets.get row: {e}")))?;
-            return Ok(Some(Market {
-                slug,
-                question,
-                end_date_ms: end_date.0,
-                outcomes,
-                closed,
-                last_price,
-                updated_at_ms: updated_at.0,
-            }));
+            let r = row.map_err(|e| CoreDbError::Query(format!("markets.get row: {e}")))?;
+            return Ok(Some(market_from_row(r)));
         }
         Ok(None)
+    }
+}
+
+#[derive(scylla::DeserializeRow)]
+struct MarketRow {
+    slug: Option<String>,
+    question: Option<String>,
+    end_date: Option<CqlTimestamp>,
+    outcomes: Option<String>,
+    closed: Option<bool>,
+    last_price: Option<f64>,
+    updated_at: Option<CqlTimestamp>,
+}
+
+fn market_from_row(r: MarketRow) -> Market {
+    Market {
+        slug: r.slug.unwrap_or_default(),
+        question: r.question.unwrap_or_default(),
+        end_date_ms: r.end_date.map(|t| t.0).unwrap_or(0),
+        outcomes: r.outcomes.unwrap_or_default(),
+        closed: r.closed.unwrap_or(false),
+        last_price: r.last_price.unwrap_or(0.0),
+        updated_at_ms: r.updated_at.map(|t| t.0).unwrap_or(0),
     }
 }

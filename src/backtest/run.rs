@@ -21,6 +21,7 @@ use crate::backtest::{baseline::evaluate as baseline_evaluate, llm as llm_mod, B
 use crate::config::{Backend, Config};
 use crate::coredb::btc::BtcTickRepo;
 use crate::coredb::decisions::DecisionRepo;
+use crate::coredb::markets::MarketRepo;
 use crate::coredb::orders::{OrderRepo, PositionRepo};
 use crate::coredb::types::{bucket_day, now_ms, Decision, Market};
 use crate::coredb::CoreDb;
@@ -33,6 +34,11 @@ use crate::risk::RiskLimits;
 /// Binance REST quote so a stale or stopped ingest doesn't poison the
 /// decision. 60 s is generous given the WS ingest writes ~2 rows/s.
 const CACHE_FRESHNESS_MS: i64 = 60_000;
+
+/// Polymarket cache freshness. The ingest path polls Gamma every 30 s
+/// per `crate::data::polymarket`; 90 s gives us a one-cycle miss before
+/// we fall back to a live REST pull.
+const MARKETS_CACHE_FRESHNESS_MS: i64 = 90_000;
 
 #[derive(Debug, Deserialize)]
 struct BinanceTicker {
@@ -115,8 +121,19 @@ pub async fn run(coredb_uri: &str, mode: BacktestMode, execute: bool) -> Result<
     };
     println!("   BTC spot: ${btc_price:.2}");
 
-    println!("📦 backtest: pulling open BTC markets from Polymarket Gamma");
-    let markets = fetch_btc_markets(&http).await?;
+    // Same cache-first pattern as the BTC spot above: prefer the
+    // markets table when the ingest path has populated a recent
+    // snapshot; otherwise pull from Gamma live. Freshness is measured
+    // by the max `updated_at_ms` across the cached set — a fully empty
+    // table is also a cache miss.
+    let market_repo = MarketRepo::new(db.session()).await?;
+    let markets = match load_markets(&market_repo, &http).await {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("  ! market load failed: {e}");
+            Vec::new()
+        }
+    };
     println!("   {} open BTC markets", markets.len());
 
     let ts = now_ms();
@@ -276,6 +293,45 @@ impl LlmCtx {
             label,
         })
     }
+}
+
+/// Load the open BTC markets, preferring the CoreDB cache when it is
+/// fresh and falling back to Polymarket Gamma otherwise. The freshness
+/// check uses the newest `updated_at_ms` in the cached set against
+/// [`MARKETS_CACHE_FRESHNESS_MS`]. An empty cache is treated as a miss.
+async fn load_markets(repo: &MarketRepo, http: &Client) -> Result<Vec<Market>> {
+    match repo.list_open().await {
+        Ok(cached) if !cached.is_empty() => {
+            let newest = cached.iter().map(|m| m.updated_at_ms).max().unwrap_or(0);
+            let age = now_ms() - newest;
+            if age < MARKETS_CACHE_FRESHNESS_MS {
+                let btc_only: Vec<Market> = cached.into_iter().filter(|m| is_btc(&m.slug, &m.question)).collect();
+                println!(
+                    "📦 backtest: markets from CoreDB cache ({} ms old, {} btc rows)",
+                    age,
+                    btc_only.len()
+                );
+                return Ok(btc_only);
+            }
+            println!(
+                "📦 backtest: cached markets stale ({} ms old); falling back to Polymarket Gamma",
+                age
+            );
+        }
+        Ok(_) => {
+            println!("📦 backtest: no cached markets; falling back to Polymarket Gamma");
+        }
+        Err(e) => {
+            eprintln!("  ! markets cache read failed ({e}); falling back to Polymarket Gamma");
+        }
+    }
+    fetch_btc_markets(http).await
+}
+
+fn is_btc(slug: &str, question: &str) -> bool {
+    let s = slug.to_ascii_lowercase();
+    let q = question.to_ascii_lowercase();
+    s.contains("bitcoin") || s.contains("btc") || q.contains("bitcoin") || q.contains("btc")
 }
 
 /// Pull the latest BTCUSDT price from Binance's 24hr ticker REST
