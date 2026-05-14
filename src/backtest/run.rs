@@ -413,6 +413,15 @@ async fn fetch_btc_markets(http: &Client) -> Result<Vec<Market>> {
             .and_then(|v| v.first().cloned())
             .and_then(|p| p.parse::<f64>().ok())
             .unwrap_or(0.0);
+        // Capture clobTokenIds when present so a backtest-only run (no
+        // ingest daemon) still lands tokenIds in Market structs for any
+        // downstream LiveExec usage. Index 0 = YES, index 1 = NO.
+        let clob_token_ids = v.get("clobTokenIds")
+            .and_then(|x| x.as_str())
+            .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok())
+            .unwrap_or_default();
+        let yes_token_id = clob_token_ids.first().cloned().unwrap_or_default();
+        let no_token_id = clob_token_ids.get(1).cloned().unwrap_or_default();
         out.push(Market {
             slug: slug.to_string(),
             question: question.to_string(),
@@ -425,6 +434,8 @@ async fn fetch_btc_markets(http: &Client) -> Result<Vec<Market>> {
             closed: false,
             last_price: yes_price,
             updated_at_ms: now,
+            yes_token_id,
+            no_token_id,
         });
     }
     Ok(out)

@@ -44,15 +44,21 @@ pub const MIGRATIONS: &[&str] = &[
 
     // ---- Polymarket market metadata. ----
     "CREATE TABLE IF NOT EXISTS polymarket_btc.markets ( \
-        slug        TEXT PRIMARY KEY, \
-        question    TEXT, \
-        end_date    TIMESTAMP, \
-        outcomes    TEXT, \
-        closed      BOOLEAN, \
-        last_price  DOUBLE, \
-        updated_at  TIMESTAMP \
+        slug          TEXT PRIMARY KEY, \
+        question      TEXT, \
+        end_date      TIMESTAMP, \
+        outcomes      TEXT, \
+        closed        BOOLEAN, \
+        last_price    DOUBLE, \
+        updated_at    TIMESTAMP, \
+        yes_token_id  TEXT, \
+        no_token_id   TEXT \
      )",
     "CREATE INDEX idx_markets_open ON polymarket_btc.markets (closed)",
+    // For schemas provisioned before clobTokenIds capture. CoreDB swallows
+    // "Column already exists" via the migrate() shim so reruns are safe.
+    "ALTER TABLE polymarket_btc.markets ADD yes_token_id TEXT",
+    "ALTER TABLE polymarket_btc.markets ADD no_token_id TEXT",
 
     // ---- Agent decisions (LLM outputs). partition = bucket_day.
     // entry_price = YES price at decision time, needed by `compare-pnl`

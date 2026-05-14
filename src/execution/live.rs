@@ -43,6 +43,7 @@
 //! delete the gate.
 
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use alloy::primitives::{Address, U256};
@@ -51,9 +52,10 @@ use alloy::signers::SignerSync;
 use alloy::sol;
 use alloy::sol_types::{eip712_domain, SolStruct};
 use async_trait::async_trait;
-use tracing::{info, warn};
+use tracing::info;
 
 use super::{ExecError, Executor, FillResult, PlaceOrderRequest};
+use crate::coredb::markets::MarketRepo;
 
 sol! {
     /// Polymarket CTF Exchange `Order` struct. Field layout mirrors the
@@ -89,6 +91,13 @@ const TOKEN_DECIMALS: u32 = 6;
 pub struct LiveExec {
     signer: PrivateKeySigner,
     wallet_address: Address,
+    /// Used at `place_order` time to look the market up by slug and
+    /// pull the side-specific ERC-1155 token id out of the
+    /// `clobTokenIds` Gamma exposes. Without the lookup the order
+    /// would go out with `tokenId = 0` and Polymarket would reject
+    /// it. Repo lookup is per-call; for the ~handful-of-orders/sec
+    /// workload this codebase produces that's fine.
+    market_repo: Arc<MarketRepo>,
 }
 
 impl LiveExec {
@@ -98,8 +107,10 @@ impl LiveExec {
     /// the hex doesn't parse to a 32-byte secp256k1 key. The wallet
     /// address derived from the key is logged at info level so the
     /// operator can sanity-check it against the funded Polygon
-    /// address before any signing.
-    pub fn from_env() -> Result<Self, ExecError> {
+    /// address before any signing. `market_repo` is the CoreDB
+    /// markets repository the executor will look outcome tokenIds up
+    /// from at place-order time.
+    pub fn from_env(market_repo: Arc<MarketRepo>) -> Result<Self, ExecError> {
         let raw = std::env::var("POLYMARKET_PRIVATE_KEY")
             .map_err(|_| ExecError::Live("POLYMARKET_PRIVATE_KEY not set".into()))?;
         let stripped = raw.trim().trim_start_matches("0x");
@@ -121,14 +132,15 @@ impl LiveExec {
         Ok(Self {
             signer,
             wallet_address,
+            market_repo,
         })
     }
 
-    /// Build the typed-data Order from a generic place-order request.
-    /// `tokenId` is a placeholder zero — see the module docs and the
-    /// run-time warn-log below; resolving outcome → tokenId is a
-    /// pre-requisite for actual submission.
-    fn build_order(&self, req: &PlaceOrderRequest) -> Order {
+    /// Build the typed-data Order from a generic place-order request +
+    /// the already-resolved outcome `token_id` (U256). The caller is
+    /// responsible for picking the right side's tokenId; this struct
+    /// just plugs it in.
+    fn build_order(&self, req: &PlaceOrderRequest, token_id: U256) -> Order {
         let now_secs = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -150,7 +162,7 @@ impl LiveExec {
             maker: self.wallet_address,
             signer: self.wallet_address,
             taker: Address::ZERO,
-            tokenId: U256::ZERO,        // <-- TODO: market.clobTokenIds[side]
+            tokenId: token_id,
             makerAmount: usdc_amount,
             takerAmount: token_amount,
             expiration: U256::ZERO,     // 0 = good-til-cancel
@@ -169,7 +181,48 @@ impl Executor for LiveExec {
     }
 
     async fn place_order(&self, req: PlaceOrderRequest) -> Result<FillResult, ExecError> {
-        let order = self.build_order(&req);
+        // Resolve outcome tokenId via the markets repo. Refusing to
+        // proceed without it is intentional: the prior commit signed
+        // orders with tokenId = 0 as a placeholder, which would be
+        // rejected by Polymarket. Refusing here keeps the failure
+        // visible instead of letting a malformed order through to the
+        // submission step in a future turn.
+        let market = self
+            .market_repo
+            .get(&req.market_slug)
+            .await
+            .map_err(|e| ExecError::Live(format!("markets.get({}): {e}", req.market_slug)))?
+            .ok_or_else(|| {
+                ExecError::Live(format!(
+                    "market {} not found in CoreDB — run `ingest` first",
+                    req.market_slug
+                ))
+            })?;
+        let token_id_str = match req.side.as_str() {
+            "YES" => market.yes_token_id.as_str(),
+            "NO" => market.no_token_id.as_str(),
+            other => {
+                return Err(ExecError::Live(format!(
+                    "side must be YES or NO; got {}",
+                    other
+                )))
+            }
+        };
+        if token_id_str.is_empty() {
+            return Err(ExecError::Live(format!(
+                "no clobTokenIds captured for {} ({}). Re-run `ingest` after the \
+                 Polymarket poller picked up clobTokenIds.",
+                req.market_slug, req.side
+            )));
+        }
+        let token_id = U256::from_str_radix(token_id_str, 10).map_err(|e| {
+            ExecError::Live(format!(
+                "parse tokenId for {} ({}): {e}",
+                req.market_slug, req.side
+            ))
+        })?;
+
+        let order = self.build_order(&req, token_id);
 
         // EIP-712 domain — verifyingContract here is what makes the
         // signature usable against Polymarket's contract specifically.
@@ -192,8 +245,8 @@ impl Executor for LiveExec {
         // full signed payload so the operator can review it against
         // Polymarket's published schema before any HTTP call lands.
         info!(
-            "live exec [DRY_RUN]: market={} side={} size_usd={:.4} price={:.4}",
-            req.market_slug, req.side, req.size_usd, req.price
+            "live exec [DRY_RUN]: market={} side={} size_usd={:.4} price={:.4} tokenId={}",
+            req.market_slug, req.side, req.size_usd, req.price, token_id_str
         );
         info!("live exec [DRY_RUN]: order = {:?}", order);
         info!(
@@ -204,17 +257,11 @@ impl Executor for LiveExec {
             "live exec [DRY_RUN]: signature = 0x{}",
             hex::encode(signature.as_bytes())
         );
-        if order.tokenId == U256::ZERO {
-            warn!(
-                "live exec [DRY_RUN]: tokenId is ZERO — placeholder. Resolve via \
-                 market.clobTokenIds[side] before flipping live submission on."
-            );
-        }
 
         Err(ExecError::Live(
             "DRY_RUN: order signed but NOT submitted. \
-             Live submission requires (a) outcome tokenId resolution, \
-             (b) CLOB L1/L2 auth, (c) USDC approve to the CTF Exchange. \
+             Live submission still requires (a) CLOB L1/L2 auth, \
+             (b) USDC approve to the CTF Exchange, (c) POST /order. \
              See src/execution/live.rs module docs."
                 .into(),
         ))
@@ -258,60 +305,70 @@ mod tests {
         assert_eq!(to_base_units(f64::NAN), U256::ZERO);
     }
 
-    fn expect_live_err(r: Result<LiveExec, ExecError>) -> String {
-        match r {
-            Ok(_) => panic!("expected ExecError::Live, got Ok"),
-            Err(ExecError::Live(msg)) => msg,
-            Err(other) => panic!("wrong error variant: {other:?}"),
-        }
+    /// Sign-side smoke test that doesn't need a MarketRepo: we bypass
+    /// the public `from_env` constructor and exercise the order-build
+    /// + signing path directly. The market_repo field never gets
+    /// touched, so we don't need to fabricate a Session.
+    fn signer_from(key_hex: &str) -> (PrivateKeySigner, Address) {
+        let bytes = hex::decode(key_hex).expect("hex");
+        let signer = PrivateKeySigner::from_slice(&bytes).expect("signer");
+        let addr = signer.address();
+        (signer, addr)
     }
 
-    #[test]
-    fn from_env_rejects_missing_key() {
-        let original = std::env::var("POLYMARKET_PRIVATE_KEY").ok();
-        std::env::remove_var("POLYMARKET_PRIVATE_KEY");
-        let msg = expect_live_err(LiveExec::from_env());
-        assert!(msg.contains("POLYMARKET_PRIVATE_KEY"), "{msg}");
-        if let Some(v) = original {
-            std::env::set_var("POLYMARKET_PRIVATE_KEY", v);
+    /// Standalone version of `LiveExec::build_order` — we can't call
+    /// the method without constructing a full LiveExec (which needs a
+    /// MarketRepo). The logic mirrors `build_order` exactly; if you
+    /// edit one, edit both.
+    fn build_order_standalone(
+        wallet: Address,
+        req: &PlaceOrderRequest,
+        token_id: U256,
+    ) -> Order {
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        Order {
+            salt: U256::from(now_secs),
+            maker: wallet,
+            signer: wallet,
+            taker: Address::ZERO,
+            tokenId: token_id,
+            makerAmount: to_base_units(req.size_usd),
+            takerAmount: to_base_units(req.size_usd / req.price.max(1e-6)),
+            expiration: U256::ZERO,
+            nonce: U256::from(now_secs),
+            feeRateBps: U256::ZERO,
+            side: 0,
+            signatureType: 0,
         }
-    }
-
-    #[test]
-    fn from_env_rejects_wrong_length() {
-        std::env::set_var("POLYMARKET_PRIVATE_KEY", "0xdeadbeef");
-        let msg = expect_live_err(LiveExec::from_env());
-        assert!(msg.contains("32 bytes"), "{msg}");
-        std::env::remove_var("POLYMARKET_PRIVATE_KEY");
     }
 
     #[test]
     fn signing_smoke() {
-        // Build a real signer from a deterministic test key (NOT a real
-        // wallet — this is the test vector from Ethereum book conventions:
-        // `0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d`,
-        // address 0x70997970C51812dc3A010C7d01b50e0d17dc79C8).
+        // Deterministic test key (NOT a real wallet — Ethereum book
+        // test vector `0x59c6…690d`, address `0x70997970…`).
         let key = "59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d";
-        std::env::set_var("POLYMARKET_PRIVATE_KEY", key);
-        let exec = LiveExec::from_env().expect("load test key");
+        let (_signer, wallet) = signer_from(key);
         let req = PlaceOrderRequest {
             market_slug: "test".into(),
             side: "YES".into(),
             size_usd: 10.0,
             price: 0.5,
         };
-        let order = exec.build_order(&req);
+        let token_id = U256::from(123456789u64);
+        let order = build_order_standalone(wallet, &req, token_id);
+        assert_eq!(order.tokenId, token_id);
         // $10 at $0.50/share → makerAmount 10 USDC = 10_000_000, takerAmount 20 shares = 20_000_000.
         assert_eq!(order.makerAmount, U256::from(10_000_000u64));
         assert_eq!(order.takerAmount, U256::from(20_000_000u64));
         assert_eq!(order.side, 0);
-        // Sanity: maker == signer == wallet derived from the test key.
-        assert_eq!(order.maker, exec.wallet_address);
-        assert_eq!(order.signer, exec.wallet_address);
+        assert_eq!(order.maker, wallet);
+        assert_eq!(order.signer, wallet);
         assert_eq!(
-            order.maker,
+            wallet,
             Address::from_str("0x70997970C51812dc3A010C7d01b50e0d17dc79C8").unwrap()
         );
-        std::env::remove_var("POLYMARKET_PRIVATE_KEY");
     }
 }

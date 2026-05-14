@@ -36,6 +36,13 @@ pub struct OrderbookSnapshot {
 }
 
 /// Polymarket market metadata. `outcomes` is JSON like `["Yes","No"]`.
+/// `yes_token_id` / `no_token_id` are decimal-string ERC-1155 token ids
+/// from Polymarket's `clobTokenIds` (Gamma `clobTokenIds` is the
+/// canonical source; positions[0] = YES, positions[1] = NO). They're
+/// strings because the values are 256-bit and don't fit in i64.
+/// Pre-schema rows (or markets where Gamma didn't return the field)
+/// read back as the empty string and should be treated as "not yet
+/// known" by anything depending on them (e.g. LiveExec).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Market {
     pub slug: String,
@@ -45,6 +52,8 @@ pub struct Market {
     pub closed: bool,
     pub last_price: f64,
     pub updated_at_ms: Millis,
+    pub yes_token_id: String,
+    pub no_token_id: String,
 }
 
 /// LLM decision record. `entry_price` is the market's YES price at the

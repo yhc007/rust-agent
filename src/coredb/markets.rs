@@ -21,8 +21,10 @@ impl MarketRepo {
     pub async fn upsert(&self, m: &Market) -> Result<(), CoreDbError> {
         let q = format!(
             "INSERT INTO polymarket_btc.markets \
-             (slug, question, end_date, outcomes, closed, last_price, updated_at) \
-             VALUES ({slug}, {question}, {end_date}, {outcomes}, {closed}, {last_price}, {updated_at})",
+             (slug, question, end_date, outcomes, closed, last_price, updated_at, \
+              yes_token_id, no_token_id) \
+             VALUES ({slug}, {question}, {end_date}, {outcomes}, {closed}, {last_price}, \
+                     {updated_at}, {yes}, {no})",
             slug = esc(&m.slug),
             question = esc(&m.question),
             end_date = m.end_date_ms,
@@ -30,6 +32,8 @@ impl MarketRepo {
             closed = fbool(m.closed),
             last_price = m.last_price,
             updated_at = m.updated_at_ms,
+            yes = esc(&m.yes_token_id),
+            no = esc(&m.no_token_id),
         );
         self.session
             .query_unpaged(q, ())
@@ -39,7 +43,8 @@ impl MarketRepo {
     }
 
     pub async fn list_open(&self) -> Result<Vec<Market>, CoreDbError> {
-        let q = "SELECT slug, question, end_date, outcomes, closed, last_price, updated_at \
+        let q = "SELECT slug, question, end_date, outcomes, closed, last_price, updated_at, \
+                        yes_token_id, no_token_id \
                  FROM polymarket_btc.markets WHERE closed = false ALLOW FILTERING";
         let qr = self
             .session
@@ -63,7 +68,8 @@ impl MarketRepo {
 
     pub async fn get(&self, slug: &str) -> Result<Option<Market>, CoreDbError> {
         let q = format!(
-            "SELECT slug, question, end_date, outcomes, closed, last_price, updated_at \
+            "SELECT slug, question, end_date, outcomes, closed, last_price, updated_at, \
+                    yes_token_id, no_token_id \
              FROM polymarket_btc.markets WHERE slug = {}",
             esc(slug)
         );
@@ -95,6 +101,8 @@ struct MarketRow {
     closed: Option<bool>,
     last_price: Option<f64>,
     updated_at: Option<CqlTimestamp>,
+    yes_token_id: Option<String>,
+    no_token_id: Option<String>,
 }
 
 fn market_from_row(r: MarketRow) -> Market {
@@ -106,5 +114,7 @@ fn market_from_row(r: MarketRow) -> Market {
         closed: r.closed.unwrap_or(false),
         last_price: r.last_price.unwrap_or(0.0),
         updated_at_ms: r.updated_at.map(|t| t.0).unwrap_or(0),
+        yes_token_id: r.yes_token_id.unwrap_or_default(),
+        no_token_id: r.no_token_id.unwrap_or_default(),
     }
 }

@@ -50,6 +50,12 @@ struct GammaMarket {
     outcome_prices: Option<String>,
     #[serde(default)]
     closed: bool,
+    /// Gamma serialises this as a stringified JSON array of decimal
+    /// ERC-1155 token ids, e.g. `["1234…", "9876…"]`. Index 0 = YES,
+    /// index 1 = NO. Required for the live executor; paper code can
+    /// keep working without it.
+    #[serde(default)]
+    clob_token_ids: Option<String>,
 }
 
 pub async fn run(
@@ -112,6 +118,10 @@ async fn poll_once(http: &Client, repo: &MarketRepo) -> Result<usize> {
                 .and_then(|x| x.as_str())
                 .map(str::to_string),
             closed: v.get("closed").and_then(|x| x.as_bool()).unwrap_or(false),
+            clob_token_ids: v
+                .get("clobTokenIds")
+                .and_then(|x| x.as_str())
+                .map(str::to_string),
         };
         if m.slug.is_empty() {
             continue;
@@ -119,6 +129,7 @@ async fn poll_once(http: &Client, repo: &MarketRepo) -> Result<usize> {
         if !is_btc(&m.slug, &m.question) {
             continue;
         }
+        let (yes_token_id, no_token_id) = parse_clob_token_ids(m.clob_token_ids.as_deref());
         let market = Market {
             slug: m.slug,
             question: m.question,
@@ -132,6 +143,8 @@ async fn poll_once(http: &Client, repo: &MarketRepo) -> Result<usize> {
             closed: m.closed,
             last_price: parse_yes_price(m.outcome_prices.as_deref()),
             updated_at_ms: now,
+            yes_token_id,
+            no_token_id,
         };
         if let Err(e) = repo.upsert(&market).await {
             warn!("polymarket upsert {} failed: {e}", market.slug);
@@ -150,4 +163,44 @@ fn parse_yes_price(prices_json: Option<&str>) -> f64 {
         .and_then(|v| v.first().cloned())
         .and_then(|p| p.parse().ok())
         .unwrap_or(0.0)
+}
+
+/// Parse Gamma's `clobTokenIds` (a stringified JSON array of decimal
+/// token-id strings) into `(yes, no)`. Missing / malformed / wrong-
+/// length payloads return `("".into(), "".into())`; LiveExec treats
+/// empty strings as "not yet known" and refuses to sign.
+fn parse_clob_token_ids(s: Option<&str>) -> (String, String) {
+    let Some(s) = s else { return (String::new(), String::new()) };
+    let parsed: Result<Vec<String>, _> = serde_json::from_str(s);
+    match parsed {
+        Ok(v) if v.len() >= 2 => (v[0].clone(), v[1].clone()),
+        _ => (String::new(), String::new()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_clob_token_ids() {
+        let s = r#"["1234567890", "9876543210"]"#;
+        let (yes, no) = parse_clob_token_ids(Some(s));
+        assert_eq!(yes, "1234567890");
+        assert_eq!(no, "9876543210");
+    }
+
+    #[test]
+    fn missing_clob_token_ids_returns_empty() {
+        assert_eq!(parse_clob_token_ids(None), (String::new(), String::new()));
+        assert_eq!(
+            parse_clob_token_ids(Some("not json")),
+            (String::new(), String::new())
+        );
+        // Wrong length (one-element array) → empty.
+        assert_eq!(
+            parse_clob_token_ids(Some(r#"["only-yes"]"#)),
+            (String::new(), String::new())
+        );
+    }
 }
