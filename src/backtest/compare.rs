@@ -17,8 +17,9 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use reqwest::Client;
 
-use crate::backtest::ledger;
+use crate::coredb::decisions::DecisionRepo;
 use crate::coredb::types::{bucket_day, now_ms, Decision};
+use crate::coredb::CoreDb;
 
 /// Strategy bucket for a single decision row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -50,17 +51,21 @@ struct Marked<'a> {
     pnl: Option<f64>,
 }
 
-pub async fn run(_coredb_uri: &str) -> Result<()> {
+pub async fn run(coredb_uri: &str) -> Result<()> {
+    println!("📊 compare-pnl: connecting to CoreDB at {coredb_uri}");
+    let db = CoreDb::connect(coredb_uri).await.context("connect coredb")?;
+    let repo = DecisionRepo::new(db.session()).await?;
+
     let bd = bucket_day(now_ms());
-    let ledger_path = ledger::path();
+    let decisions = repo
+        .list_day(bd)
+        .await
+        .context("list decisions for today")?;
     println!(
-        "📊 compare-pnl: reading ledger {} for bucket_day = {} (UTC ms)",
-        ledger_path.display(),
+        "   {} decisions for bucket_day = {} (UTC ms)",
+        decisions.len(),
         bd
     );
-
-    let decisions = ledger::read_day(bd).context("read ledger")?;
-    println!("   {} decisions in ledger for today", decisions.len());
 
     if decisions.is_empty() {
         println!(

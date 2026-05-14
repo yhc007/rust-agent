@@ -2,7 +2,9 @@
 
 use std::sync::Arc;
 
+use scylla::frame::value::CqlTimestamp;
 use scylla::Session;
+use uuid::Uuid;
 
 use super::error::CoreDbError;
 use super::types::{Decision, Millis};
@@ -42,24 +44,65 @@ impl DecisionRepo {
         Ok(())
     }
 
-    /// Read every decision row for one UTC day.
-    ///
-    /// **Currently unusable against the real CoreDB server**: the protocol
-    /// implementation in `yhc007/coredb` advertises every SELECT column
-    /// as type `Text` in the result metadata while sending raw binary
-    /// payload for non-text columns (TIMESTAMP / DOUBLE / INT / UUID).
-    /// The scylla driver rejects this on both typed and untyped paths
-    /// (typed: type-check fails; untyped String: invalid UTF-8). Until
-    /// the CoreDB side starts emitting correct type codes, callers that
-    /// need to compare or replay decisions should use the on-disk JSONL
-    /// ledger written by `crate::backtest::ledger`.
     pub async fn list_day(&self, bucket_day_ms: Millis) -> Result<Vec<Decision>, CoreDbError> {
-        let _ = (&self.session, bucket_day_ms);
-        Err(CoreDbError::Query(
-            "decisions.list_day is unsupported by the current CoreDB server \
-             (every SELECT column is mis-typed as Text). Read from the \
-             JSONL ledger instead."
-                .to_string(),
-        ))
+        let q = format!(
+            "SELECT bucket_day, ts, decision_id, market_slug, side, size_usd, confidence, \
+                    edge_bps, reasoning, raw_response, entry_price \
+             FROM polymarket_btc.decisions WHERE bucket_day = {bucket_day_ms}"
+        );
+        let qr = self
+            .session
+            .query_unpaged(q, ())
+            .await
+            .map_err(|e| CoreDbError::Query(format!("decisions.list_day: {e}")))?;
+        let rows = qr
+            .into_rows_result()
+            .map_err(|e| CoreDbError::Query(format!("decisions.list_day rows: {e}")))?;
+        // Column order in the response follows CoreDB's HashMap iteration
+        // (Row.columns is HashMap<String, CassandraValue>), which is not the
+        // SELECT-list order. Using a `(Name, Type)` typed-tuple risks a
+        // position mismatch, so we read row-by-row and look up each column
+        // by name from a Decision-shaped accessor instead.
+        let typed = rows
+            .rows::<NamedRow>()
+            .map_err(|e| CoreDbError::Query(format!("decisions.list_day typed: {e}")))?;
+        let mut out = Vec::new();
+        for row in typed {
+            let row = row.map_err(|e| CoreDbError::Query(format!("decisions row: {e}")))?;
+            out.push(Decision {
+                bucket_day_ms: row.bucket_day.map(|t| t.0).unwrap_or(0),
+                ts_ms: row.ts.map(|t| t.0).unwrap_or(0),
+                decision_id: row.decision_id.unwrap_or_else(Uuid::nil),
+                market_slug: row.market_slug.unwrap_or_default(),
+                side: row.side.unwrap_or_default(),
+                size_usd: row.size_usd.unwrap_or(0.0),
+                confidence: row.confidence.unwrap_or(0.0),
+                edge_bps: row.edge_bps.unwrap_or(0),
+                reasoning: row.reasoning.unwrap_or_default(),
+                raw_response: row.raw_response.unwrap_or_default(),
+                entry_price: row.entry_price.unwrap_or(0.0),
+            });
+        }
+        Ok(out)
     }
+}
+
+/// Name-keyed projection of `polymarket_btc.decisions`. Matched to the
+/// response by column name rather than by position so CoreDB's
+/// HashMap-iteration column order doesn't have to match the SELECT
+/// list. Every field is `Option` because the underlying TEXT columns
+/// may be NULL and because pre-schema rows lack `entry_price`.
+#[derive(scylla::DeserializeRow)]
+struct NamedRow {
+    bucket_day: Option<CqlTimestamp>,
+    ts: Option<CqlTimestamp>,
+    decision_id: Option<Uuid>,
+    market_slug: Option<String>,
+    side: Option<String>,
+    size_usd: Option<f64>,
+    confidence: Option<f64>,
+    edge_bps: Option<i32>,
+    reasoning: Option<String>,
+    raw_response: Option<String>,
+    entry_price: Option<f64>,
 }
