@@ -8,6 +8,7 @@
 //! the risk gate + paper executor and persisted as Order + Position
 //! rows.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -26,7 +27,9 @@ use crate::coredb::orders::{OrderRepo, PositionRepo};
 use crate::coredb::types::{bucket_day, now_ms, Decision, Market};
 use crate::coredb::CoreDb;
 use crate::execution::auto::{route_decision, Outcome};
+use crate::execution::live::LiveExec;
 use crate::execution::paper::PaperExec;
+use crate::execution::Executor;
 use crate::risk::RiskLimits;
 
 /// CoreDB tick is considered fresh if its `ts_ms` is within this many
@@ -46,9 +49,9 @@ struct BinanceTicker {
     last_price: String,
 }
 
-pub async fn run(coredb_uri: &str, mode: BacktestMode, execute: bool) -> Result<()> {
+pub async fn run(coredb_uri: &str, mode: BacktestMode, execute: bool, live: bool) -> Result<()> {
     println!(
-        "🔍 backtest: connecting to CoreDB at {coredb_uri} (mode={mode:?}, execute={execute})"
+        "🔍 backtest: connecting to CoreDB at {coredb_uri} (mode={mode:?}, execute={execute}, live={live})"
     );
     let db = CoreDb::connect(coredb_uri).await.context("connect coredb")?;
     let dec_repo = DecisionRepo::new(db.session()).await?;
@@ -56,15 +59,29 @@ pub async fn run(coredb_uri: &str, mode: BacktestMode, execute: bool) -> Result<
     // The auto-execution wiring is only built when --execute is set, so
     // a vanilla backtest run keeps its current zero-write footprint on
     // the orders / positions tables and doesn't pay for the extra repo
-    // construction.
+    // construction. `--live` swaps PaperExec for LiveExec (which is
+    // *itself* DRY_RUN unless LIVE_TRADING_ENABLED=1, so this flag
+    // alone never broadcasts money).
     let exec_ctx = if execute {
+        let exec: Box<dyn Executor> = if live {
+            let market_repo_for_exec = Arc::new(MarketRepo::new(db.session()).await?);
+            let live = LiveExec::from_env(market_repo_for_exec).map_err(|e| {
+                anyhow::anyhow!("--live requested but LiveExec construction failed: {e}")
+            })?;
+            Box::new(live)
+        } else {
+            Box::new(PaperExec)
+        };
         Some(ExecCtx {
             order_repo: OrderRepo::new(db.session()).await?,
             pos_repo: PositionRepo::new(db.session()).await?,
-            exec: PaperExec,
+            exec,
             limits: RiskLimits::default(),
         })
     } else {
+        if live {
+            eprintln!("  ⚠ --live ignored: --execute is off");
+        }
         None
     };
 
@@ -229,7 +246,7 @@ pub async fn run(coredb_uri: &str, mode: BacktestMode, execute: bool) -> Result<
             if let Some(ctx) = exec_ctx.as_ref() {
                 match route_decision(
                     decision,
-                    &ctx.exec,
+                    ctx.exec.as_ref(),
                     &ctx.limits,
                     &ctx.order_repo,
                     &ctx.pos_repo,
@@ -280,11 +297,13 @@ pub async fn run(coredb_uri: &str, mode: BacktestMode, execute: bool) -> Result<
 
 /// Repositories + executor + limits constructed once per `run`
 /// invocation when `--execute` is set. Kept in one place so the per-
-/// market loop body stays readable.
+/// market loop body stays readable. `exec` is a trait object so
+/// `--live` can swap `LiveExec` in for `PaperExec` without changing
+/// the call-site code.
 struct ExecCtx {
     order_repo: OrderRepo,
     pos_repo: PositionRepo,
-    exec: PaperExec,
+    exec: Box<dyn Executor>,
     limits: RiskLimits,
 }
 

@@ -37,8 +37,12 @@ pub struct DaemonConfig {
     pub compare_every_secs: u64,
     pub settle_every_secs: u64,
     /// When false, the periodic backtests stop at decision insert and
-    /// don't paper-execute. Default true.
+    /// don't execute. Default true.
     pub execute: bool,
+    /// When true, the periodic backtests use LiveExec instead of
+    /// PaperExec. LiveExec stays DRY_RUN unless `LIVE_TRADING_ENABLED=1`
+    /// is also exported — two gates by design.
+    pub live: bool,
 }
 
 impl DaemonConfig {
@@ -49,6 +53,7 @@ impl DaemonConfig {
             compare_every_secs: 15 * 60,
             settle_every_secs: 60 * 60,
             execute: true,
+            live: false,
         }
     }
 }
@@ -60,13 +65,22 @@ pub async fn run(cfg: DaemonConfig) -> Result<()> {
         compare_every_secs,
         settle_every_secs,
         execute,
+        live,
     } = cfg;
 
     println!("🛰️  daemon: starting");
-    println!("    coredb_uri       = {coredb_uri}");
-    println!("    backtest every   = {backtest_every_secs}s (mode=both, execute={execute})");
+    println!("    coredb_uri        = {coredb_uri}");
+    println!(
+        "    backtest every    = {backtest_every_secs}s (mode=both, execute={execute}, live={live})"
+    );
     println!("    compare-pnl every = {compare_every_secs}s");
     println!("    settle-pnl every  = {settle_every_secs}s");
+    if live {
+        println!(
+            "    ⚠ --live: backtests route through LiveExec. LIVE_TRADING_ENABLED + \
+             POLYMARKET_CLOB_* + on-chain USDC approve still required for real submission."
+        );
+    }
     println!("    Ctrl+C to stop");
 
     // One CoreDB connection for the long-running ingest pollers. The
@@ -98,7 +112,7 @@ pub async fn run(cfg: DaemonConfig) -> Result<()> {
             move || {
                 let uri = uri.clone();
                 Box::pin(async move {
-                    backtest::run::run(&uri, BacktestMode::Both, execute).await
+                    backtest::run::run(&uri, BacktestMode::Both, execute, live).await
                 })
                     as std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>>
             }

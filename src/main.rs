@@ -112,9 +112,15 @@ enum Commands {
         /// Run BOTH baseline and LLM strategies per market (overrides --llm).
         #[arg(long)]
         both: bool,
-        /// Auto-execute non-PASS decisions via risk gate + PaperExec.
+        /// Auto-execute non-PASS decisions via risk gate + executor.
         #[arg(long)]
         execute: bool,
+        /// Use LiveExec instead of PaperExec. LiveExec is *itself* DRY_RUN
+        /// unless LIVE_TRADING_ENABLED=1 — this flag alone does not
+        /// broadcast orders. Both gates must be set, plus valid
+        /// POLYMARKET_CLOB_* creds, plus a USDC approve on-chain.
+        #[arg(long)]
+        live: bool,
     },
     /// Compare baseline vs LLM strategy PnL on today's decisions, marked
     /// to the current Polymarket YES prices. Reads `polymarket_btc.decisions`
@@ -191,6 +197,11 @@ enum Commands {
         /// only). Off by default — paper trading is the point.
         #[arg(long)]
         no_execute: bool,
+        /// Use LiveExec instead of PaperExec for the periodic
+        /// backtests. Same two-gate posture as `backtest --live`:
+        /// LiveExec stays DRY_RUN unless LIVE_TRADING_ENABLED=1.
+        #[arg(long)]
+        live: bool,
     },
 }
 
@@ -239,7 +250,7 @@ async fn main() -> Result<()> {
         Some(Commands::Stats { coredb_uri }) => {
             run_stats(coredb_uri).await?;
         }
-        Some(Commands::Backtest { coredb_uri, llm, both, execute }) => {
+        Some(Commands::Backtest { coredb_uri, llm, both, execute, live }) => {
             let mode = if both {
                 backtest::BacktestMode::Both
             } else if llm {
@@ -247,7 +258,7 @@ async fn main() -> Result<()> {
             } else {
                 backtest::BacktestMode::Baseline
             };
-            backtest::run::run(&coredb_uri, mode, execute).await?;
+            backtest::run::run(&coredb_uri, mode, execute, live).await?;
         }
         Some(Commands::ComparePnl { coredb_uri }) => {
             backtest::compare::run(&coredb_uri).await?;
@@ -279,12 +290,14 @@ async fn main() -> Result<()> {
             compare_every,
             settle_every,
             no_execute,
+            live,
         }) => {
             let mut cfg = daemon::DaemonConfig::new(coredb_uri);
             cfg.backtest_every_secs = backtest_every;
             cfg.compare_every_secs = compare_every;
             cfg.settle_every_secs = settle_every;
             cfg.execute = !no_execute;
+            cfg.live = live;
             daemon::run(cfg).await?;
         }
         None => {

@@ -16,7 +16,6 @@ use anyhow::Result;
 
 use crate::coredb::orders::{OrderRepo, PositionRepo};
 use crate::coredb::types::{bucket_day, now_ms, Decision, Order, Position};
-use crate::execution::paper::PaperExec;
 use crate::execution::{Executor, PlaceOrderRequest};
 use crate::risk::{evaluate, OrderRequest, RiskLimits, RiskVerdict};
 
@@ -35,15 +34,20 @@ pub enum Outcome {
     ExecError(String),
 }
 
-/// Route one Decision through the paper-exec stack. The price used for
+/// Route one Decision through the executor stack. The price used for
 /// the fill is `decision.entry_price` for YES, `1 - entry_price` for
 /// NO, because Polymarket sells NO shares at `1 - yes_price`. We do
 /// NOT re-query Polymarket here — staying consistent with the price
 /// the decision was made at is what makes paper PnL comparable across
-/// strategies. Live trading will need a fresh quote.
+/// strategies. Live executors may want to re-quote internally before
+/// submitting.
+///
+/// `exec` is a trait object so the same routing pipeline drives both
+/// paper trading (`PaperExec`) and live trading (`LiveExec`) — the
+/// risk gate + kill switch fire identically in both modes.
 pub async fn route_decision(
     decision: &Decision,
-    exec: &PaperExec,
+    exec: &dyn Executor,
     limits: &RiskLimits,
     order_repo: &OrderRepo,
     pos_repo: &PositionRepo,
