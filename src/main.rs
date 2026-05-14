@@ -125,6 +125,13 @@ enum Commands {
         #[arg(long, default_value = "127.0.0.1:9042")]
         coredb_uri: String,
     },
+    /// Settle today's orders against Polymarket's resolved markets.
+    /// Computes realized PnL per order, aggregates per strategy, and
+    /// upserts the day's total into `polymarket_btc.pnl_daily`.
+    SettlePnl {
+        #[arg(long, default_value = "127.0.0.1:9042")]
+        coredb_uri: String,
+    },
 }
 
 #[tokio::main]
@@ -185,6 +192,9 @@ async fn main() -> Result<()> {
         }
         Some(Commands::PnlHistory { coredb_uri }) => {
             backtest::history::run(&coredb_uri).await?;
+        }
+        Some(Commands::SettlePnl { coredb_uri }) => {
+            backtest::settle::run(&coredb_uri).await?;
         }
         None => {
             // Default: interactive chat

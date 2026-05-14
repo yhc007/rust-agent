@@ -48,36 +48,54 @@ impl OrderRepo {
                     status, fill_size, fill_price \
              FROM polymarket_btc.orders WHERE bucket_day = {bucket_day_ms}"
         );
-        let qr = self.session.query_unpaged(q, ()).await
+        let qr = self
+            .session
+            .query_unpaged(q, ())
+            .await
             .map_err(|e| CoreDbError::Query(format!("orders.list_day: {e}")))?;
-        let rows = qr.into_rows_result()
+        let rows = qr
+            .into_rows_result()
             .map_err(|e| CoreDbError::Query(format!("orders.list_day rows: {e}")))?;
-        type Row = (
-            CqlTimestamp, CqlTimestamp, String, Uuid, String, String,
-            f64, f64, String, f64, f64,
-        );
-        let typed = rows.rows::<Row>()
+        // CoreDB returns columns in HashMap-iteration order, not SELECT-list
+        // order — see the equivalent shim in decisions.rs. Name-keyed
+        // DeserializeRow sidesteps the reshuffle.
+        let typed = rows
+            .rows::<OrderRow>()
             .map_err(|e| CoreDbError::Query(format!("orders.list_day typed: {e}")))?;
         let mut out = Vec::new();
         for row in typed {
-            let (bd, ts, oid, did, slug, side, size, price, status, fs, fp) =
-                row.map_err(|e| CoreDbError::Query(format!("orders row: {e}")))?;
+            let r = row.map_err(|e| CoreDbError::Query(format!("orders row: {e}")))?;
             out.push(Order {
-                bucket_day_ms: bd.0,
-                ts_ms: ts.0,
-                order_id: oid,
-                decision_id: did,
-                market_slug: slug,
-                side,
-                size,
-                price,
-                status,
-                fill_size: fs,
-                fill_price: fp,
+                bucket_day_ms: r.bucket_day.map(|t| t.0).unwrap_or(0),
+                ts_ms: r.ts.map(|t| t.0).unwrap_or(0),
+                order_id: r.order_id.unwrap_or_default(),
+                decision_id: r.decision_id.unwrap_or_else(Uuid::nil),
+                market_slug: r.market_slug.unwrap_or_default(),
+                side: r.side.unwrap_or_default(),
+                size: r.size.unwrap_or(0.0),
+                price: r.price.unwrap_or(0.0),
+                status: r.status.unwrap_or_default(),
+                fill_size: r.fill_size.unwrap_or(0.0),
+                fill_price: r.fill_price.unwrap_or(0.0),
             });
         }
         Ok(out)
     }
+}
+
+#[derive(scylla::DeserializeRow)]
+struct OrderRow {
+    bucket_day: Option<CqlTimestamp>,
+    ts: Option<CqlTimestamp>,
+    order_id: Option<String>,
+    decision_id: Option<Uuid>,
+    market_slug: Option<String>,
+    side: Option<String>,
+    size: Option<f64>,
+    price: Option<f64>,
+    status: Option<String>,
+    fill_size: Option<f64>,
+    fill_price: Option<f64>,
 }
 
 pub struct PositionRepo {

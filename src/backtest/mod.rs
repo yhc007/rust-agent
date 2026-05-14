@@ -13,6 +13,7 @@ pub mod compare;
 pub mod history;
 pub mod llm;
 pub mod run;
+pub mod settle;
 
 /// Which decision engine [`run::run`] should use. Selected by the CLI's
 /// `--llm` flag (or `--baseline`).
