@@ -1,46 +1,39 @@
-//! Polymarket CLOB live executor — sign-only skeleton.
+//! Polymarket CLOB live executor.
 //!
-//! What this commit does:
+//! Two behaviour modes, picked by the `LIVE_TRADING_ENABLED` env var:
 //!
-//! - Loads a Polygon wallet private key from `POLYMARKET_PRIVATE_KEY`
-//!   (hex, with or without `0x` prefix).
-//! - Builds the EIP-712 typed-data `Order` Polymarket's CTF Exchange
-//!   contract expects, with `domain.verifyingContract` pinned at the
-//!   mainnet exchange address (`0x4bFb…D982E`) and `chainId = 137`.
-//! - Signs the order hash with the loaded wallet.
-//! - **Returns an `ExecError::Live("DRY_RUN: …")` immediately after
-//!   signing.** No HTTP request to Polymarket is made; no allowance
-//!   is set; no money can move. The logged payload is the exact bytes
-//!   that would go on the wire.
+//! - **DRY_RUN (default).** Loads the wallet, looks the outcome
+//!   `tokenId` up, builds + signs the EIP-712 Order, logs the full
+//!   payload, and returns `ExecError::Live("DRY_RUN: …")`. No HTTP
+//!   request is made; no money can move. This is what you get with
+//!   `LIVE_TRADING_ENABLED` unset (or set to anything other than `1`).
 //!
-//! What this commit deliberately does NOT do (each is its own follow-
-//! up turn so the operator can review what's about to happen):
+//! - **LIVE submission (`LIVE_TRADING_ENABLED=1`).** Builds the same
+//!   signed Order, attaches L2 HMAC headers via
+//!   [`crate::execution::clob_auth::l2_headers`], and `POST`s to
+//!   `https://clob.polymarket.com/order`. Returns the issued
+//!   `orderID` and Polymarket's `status` in a `FillResult`. Requires
+//!   the three `POLYMARKET_CLOB_API_KEY` / `POLYMARKET_CLOB_SECRET` /
+//!   `POLYMARKET_CLOB_PASSPHRASE` env vars from a prior
+//!   `rust-agent clob-auth` run.
 //!
-//! 1. `POST /order` to `https://clob.polymarket.com` — the dry-run
-//!    output is intended to be reviewed first.
-//! 2. L1/L2 CLOB auth handshake (POLY_ADDRESS / POLY_SIGNATURE /
-//!    POLY_TIMESTAMP headers) and the `POST /auth/api-key` step.
-//! 3. USDC `approve` flow for the CTF Exchange spender. Without that
-//!    on-chain step, even a successful POST would be rejected at fill.
-//! 4. Outcome `tokenId` resolution. Polymarket's order references an
-//!    ERC-1155 token id, not the slug + side our agent carries.
-//!    `route_decision` calls `LiveExec` with `(slug, "YES"|"NO", size_usd,
-//!    price)`, but the wire needs `tokenId`. Today we substitute
-//!    `U256::ZERO` and log the gap loudly — fixing it requires the
-//!    Polymarket ingest pipeline to capture `clobTokenIds` and the
-//!    markets table to carry both YES and NO token ids.
+//! What this still does NOT do:
 //!
-//! The whole point of stopping after step "sign + log" is to let the
-//! operator (a) confirm the wallet address derived from the private
-//! key matches the funded address, (b) eyeball the typed-data payload
-//! against Polymarket's published schema before flipping the actual
-//! POST on, and (c) keep the rest of the codebase compiling against a
-//! real `Executor` impl without any chance of money movement.
+//! 1. **USDC `approve`** to the CTF Exchange spender. Even a
+//!    successful `POST /order` will be rejected at on-chain fill time
+//!    without the approval; do it once per wallet via your tooling of
+//!    choice (a follow-up `live-setup --approve` subcommand can wrap
+//!    this).
+//! 2. **Fill polling.** The `POST /order` response carries the
+//!    `orderID` + a `status` ("matched" / "delayed" / "live") but no
+//!    fill detail. `FillResult.fill_size` is therefore best-effort —
+//!    we report the requested taker amount when status is "matched"
+//!    and 0 otherwise. A future user-channel WS subscription closes
+//!    this loop precisely.
 //!
-//! Risk gate + kill switch still run BEFORE `place_order` because the
-//! call path goes through `execution::auto::route_decision` (or the
-//! `place_order` agent tool). That posture stays in live mode — never
-//! delete the gate.
+//! Risk gate + kill switch run BEFORE `place_order` via the call path
+//! through `execution::auto::route_decision`. That posture is exactly
+//! how we keep the LLM from being able to over-spend even in live mode.
 
 use std::str::FromStr;
 use std::sync::Arc;
@@ -56,6 +49,7 @@ use tracing::info;
 
 use super::{ExecError, Executor, FillResult, PlaceOrderRequest};
 use crate::coredb::markets::MarketRepo;
+use crate::execution::clob_auth::{self, ApiCreds, CLOB_BASE_URL};
 
 sol! {
     /// Polymarket CTF Exchange `Order` struct. Field layout mirrors the
@@ -98,6 +92,15 @@ pub struct LiveExec {
     /// it. Repo lookup is per-call; for the ~handful-of-orders/sec
     /// workload this codebase produces that's fine.
     market_repo: Arc<MarketRepo>,
+    /// CLOB API credentials minted via a prior `rust-agent clob-auth`
+    /// run. Only required when `LIVE_TRADING_ENABLED=1`; absent in the
+    /// DRY_RUN path so the operator can review signatures before
+    /// going through the L1 handshake.
+    api_creds: Option<ApiCreds>,
+    /// Reused reqwest client for `POST /order` so we don't pay the
+    /// TLS handshake per invocation. Cheap to clone (Arc-wrapped
+    /// internally).
+    http: reqwest::Client,
 }
 
 impl LiveExec {
@@ -125,14 +128,40 @@ impl LiveExec {
         let signer = PrivateKeySigner::from_slice(&bytes)
             .map_err(|e| ExecError::Live(format!("private-key load: {e}")))?;
         let wallet_address = signer.address();
-        info!(
-            "live exec: wallet {} loaded (chain_id=137, exchange={POLYMARKET_CTF_EXCHANGE})",
-            wallet_address
-        );
+        // Try to load CLOB API credentials. Missing creds are fine in
+        // the default DRY_RUN mode; we error at place_order time if
+        // LIVE_TRADING_ENABLED is on but creds are absent.
+        let api_creds = load_api_creds_from_env();
+        match (&api_creds, std::env::var("LIVE_TRADING_ENABLED").as_deref()) {
+            (Some(_), Ok("1")) => {
+                info!(
+                    "live exec: wallet {wallet_address} loaded (LIVE submission ENABLED, chain_id=137, exchange={POLYMARKET_CTF_EXCHANGE})"
+                );
+            }
+            (_, Ok("1")) => {
+                // LIVE on but no creds — flag now so the operator
+                // doesn't get a surprise error on the first order.
+                info!(
+                    "live exec: wallet {wallet_address} loaded but CLOB API creds missing — \
+                     LIVE_TRADING_ENABLED=1 calls will error. Run `rust-agent clob-auth` and export POLYMARKET_CLOB_*"
+                );
+            }
+            _ => {
+                info!(
+                    "live exec: wallet {wallet_address} loaded (DRY_RUN — set LIVE_TRADING_ENABLED=1 to submit)"
+                );
+            }
+        }
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(15))
+            .build()
+            .map_err(|e| ExecError::Live(format!("reqwest client: {e}")))?;
         Ok(Self {
             signer,
             wallet_address,
             market_repo,
+            api_creds,
+            http,
         })
     }
 
@@ -240,32 +269,174 @@ impl Executor for LiveExec {
             .signer
             .sign_hash_sync(&hash)
             .map_err(|e| ExecError::Live(format!("sign: {e}")))?;
+        let signature_hex = format!("0x{}", hex::encode(signature.as_bytes()));
 
-        // We intentionally do NOT submit yet — see module docs. Log the
-        // full signed payload so the operator can review it against
-        // Polymarket's published schema before any HTTP call lands.
-        info!(
-            "live exec [DRY_RUN]: market={} side={} size_usd={:.4} price={:.4} tokenId={}",
-            req.market_slug, req.side, req.size_usd, req.price, token_id_str
-        );
-        info!("live exec [DRY_RUN]: order = {:?}", order);
-        info!(
-            "live exec [DRY_RUN]: eip712_hash = 0x{}",
-            hex::encode(hash.as_slice())
-        );
-        info!(
-            "live exec [DRY_RUN]: signature = 0x{}",
-            hex::encode(signature.as_bytes())
+        let live_enabled = matches!(
+            std::env::var("LIVE_TRADING_ENABLED").as_deref(),
+            Ok("1")
         );
 
-        Err(ExecError::Live(
-            "DRY_RUN: order signed but NOT submitted. \
-             Live submission still requires (a) CLOB L1/L2 auth, \
-             (b) USDC approve to the CTF Exchange, (c) POST /order. \
-             See src/execution/live.rs module docs."
-                .into(),
-        ))
+        if !live_enabled {
+            info!(
+                "live exec [DRY_RUN]: market={} side={} size_usd={:.4} price={:.4} tokenId={}",
+                req.market_slug, req.side, req.size_usd, req.price, token_id_str
+            );
+            info!("live exec [DRY_RUN]: order = {:?}", order);
+            info!(
+                "live exec [DRY_RUN]: eip712_hash = 0x{}",
+                hex::encode(hash.as_slice())
+            );
+            info!("live exec [DRY_RUN]: signature = {signature_hex}");
+            return Err(ExecError::Live(
+                "DRY_RUN: order signed but NOT submitted. \
+                 Set LIVE_TRADING_ENABLED=1 to enable POST /order."
+                    .into(),
+            ));
+        }
+
+        // --- LIVE submission path ---
+
+        let creds = self.api_creds.as_ref().ok_or_else(|| {
+            ExecError::Live(
+                "LIVE_TRADING_ENABLED=1 but CLOB API creds missing — \
+                 run `rust-agent clob-auth` and export \
+                 POLYMARKET_CLOB_API_KEY / POLYMARKET_CLOB_SECRET / POLYMARKET_CLOB_PASSPHRASE"
+                    .into(),
+            )
+        })?;
+
+        let body_value = build_post_order_body(&order, &signature_hex, &req.side, &creds.api_key);
+        let body_str = body_value.to_string();
+        let headers = clob_auth::l2_headers(
+            creds,
+            self.wallet_address,
+            "POST",
+            "/order",
+            &body_str,
+        )
+        .map_err(|e| ExecError::Live(format!("l2_headers: {e}")))?;
+
+        info!(
+            "live exec [LIVE]: POST {CLOB_BASE_URL}/order market={} side={} size_usd={:.4} price={:.4}",
+            req.market_slug, req.side, req.size_usd, req.price
+        );
+
+        let url = format!("{CLOB_BASE_URL}/order");
+        let mut builder = self.http.post(&url).header("Content-Type", "application/json");
+        for (k, v) in &headers {
+            builder = builder.header(*k, v);
+        }
+        let resp = builder
+            .body(body_str)
+            .send()
+            .await
+            .map_err(|e| ExecError::Live(format!("POST {url}: {e}")))?;
+
+        let status_code = resp.status();
+        let resp_text = resp.text().await.unwrap_or_default();
+        if !status_code.is_success() {
+            return Err(ExecError::Live(format!(
+                "POST {url} returned {status_code}: {resp_text}"
+            )));
+        }
+        let parsed: OrderResponse = serde_json::from_str(&resp_text).map_err(|e| {
+            ExecError::Live(format!("parse /order response: {e}: {resp_text}"))
+        })?;
+        if !parsed.success {
+            return Err(ExecError::Live(format!(
+                "Polymarket rejected order: errorMsg={:?}, body={resp_text}",
+                parsed.error_msg
+            )));
+        }
+        info!(
+            "live exec [LIVE]: order placed id={} status={}",
+            parsed.order_id, parsed.status
+        );
+        // Best-effort fill reporting. "matched" → assume the full
+        // taker side filled at the requested price. Anything else
+        // means the order is resting / pending; the caller should
+        // poll trades or subscribe to the user channel for confirmed
+        // fill detail.
+        let (fill_size, normalized_status) = match parsed.status.as_str() {
+            "matched" => (req.size_usd / req.price.max(1e-6), "filled".to_string()),
+            other => (0.0, other.to_string()),
+        };
+        Ok(FillResult {
+            order_id: parsed.order_id,
+            fill_size,
+            fill_price: req.price,
+            status: normalized_status,
+        })
     }
+}
+
+/// Build the JSON body Polymarket's `POST /order` expects. All numeric
+/// `Order` fields go on the wire as decimal strings (CLOB convention);
+/// `side` is the human-string "BUY"/"SELL", not the on-chain uint8.
+/// `signatureType` stays numeric. `owner` carries the API key minted
+/// by `clob-auth`; `orderType` is GTC ("good till cancel") by default
+/// for the agent's resting-limit-order model.
+fn build_post_order_body(
+    order: &Order,
+    signature_hex: &str,
+    agent_side: &str,
+    api_key: &str,
+) -> serde_json::Value {
+    let side_wire = match agent_side {
+        "YES" | "NO" => "BUY", // every order our agent emits is a BUY into the side's outcome token.
+        other => other,        // pass-through so callers can experiment.
+    };
+    serde_json::json!({
+        "order": {
+            "salt": order.salt.to_string(),
+            "maker": format!("{}", order.maker),
+            "signer": format!("{}", order.signer),
+            "taker": format!("{}", order.taker),
+            "tokenId": order.tokenId.to_string(),
+            "makerAmount": order.makerAmount.to_string(),
+            "takerAmount": order.takerAmount.to_string(),
+            "expiration": order.expiration.to_string(),
+            "nonce": order.nonce.to_string(),
+            "feeRateBps": order.feeRateBps.to_string(),
+            "side": side_wire,
+            "signatureType": order.signatureType,
+            "signature": signature_hex,
+        },
+        "owner": api_key,
+        "orderType": "GTC",
+    })
+}
+
+/// Polymarket `POST /order` response. Field names match what the
+/// gateway sends; `errorMsg` is empty on success.
+#[derive(Debug, serde::Deserialize)]
+struct OrderResponse {
+    #[serde(default)]
+    success: bool,
+    #[serde(rename = "errorMsg", default)]
+    error_msg: String,
+    #[serde(rename = "orderID", default)]
+    order_id: String,
+    #[serde(default)]
+    status: String,
+}
+
+/// Read CLOB API credentials from the env vars `rust-agent clob-auth`
+/// suggests exporting. Returns `None` if any are missing — the
+/// DRY_RUN path doesn't need them, and `place_order` re-checks before
+/// the live branch fires.
+fn load_api_creds_from_env() -> Option<ApiCreds> {
+    let api_key = std::env::var("POLYMARKET_CLOB_API_KEY").ok()?;
+    let secret = std::env::var("POLYMARKET_CLOB_SECRET").ok()?;
+    let passphrase = std::env::var("POLYMARKET_CLOB_PASSPHRASE").ok()?;
+    if api_key.is_empty() || secret.is_empty() || passphrase.is_empty() {
+        return None;
+    }
+    Some(ApiCreds {
+        api_key,
+        secret,
+        passphrase,
+    })
 }
 
 /// Convert a USD/share float into 6-decimal base units (USDC's
@@ -343,6 +514,61 @@ mod tests {
             side: 0,
             signatureType: 0,
         }
+    }
+
+    #[test]
+    fn post_order_body_shape() {
+        // Pin the exact JSON shape Polymarket's gateway accepts: all
+        // Order numeric fields as decimal strings, side as "BUY",
+        // signatureType numeric, signature as a 0x-hex string,
+        // wrapped in {order, owner, orderType: "GTC"}.
+        let order = Order {
+            salt: U256::from(1700000000u64),
+            maker: Address::from_str("0x70997970C51812dc3A010C7d01b50e0d17dc79C8").unwrap(),
+            signer: Address::from_str("0x70997970C51812dc3A010C7d01b50e0d17dc79C8").unwrap(),
+            taker: Address::ZERO,
+            tokenId: U256::from(12345u64),
+            makerAmount: U256::from(10_000_000u64),
+            takerAmount: U256::from(20_000_000u64),
+            expiration: U256::ZERO,
+            nonce: U256::from(1700000000u64),
+            feeRateBps: U256::ZERO,
+            side: 0,
+            signatureType: 0,
+        };
+        let body = build_post_order_body(&order, "0xdeadbeef", "YES", "test-api-key");
+        let inner = body.get("order").unwrap();
+        assert_eq!(inner.get("salt").unwrap(), "1700000000");
+        assert_eq!(inner.get("tokenId").unwrap(), "12345");
+        assert_eq!(inner.get("makerAmount").unwrap(), "10000000");
+        assert_eq!(inner.get("takerAmount").unwrap(), "20000000");
+        assert_eq!(inner.get("side").unwrap(), "BUY");
+        assert_eq!(inner.get("signatureType").unwrap(), 0);
+        assert_eq!(inner.get("signature").unwrap(), "0xdeadbeef");
+        assert_eq!(body.get("owner").unwrap(), "test-api-key");
+        assert_eq!(body.get("orderType").unwrap(), "GTC");
+    }
+
+    #[test]
+    fn no_side_also_maps_to_buy() {
+        // Our agent never SELLs — both YES and NO are BUYs into the
+        // respective outcome token. The side mapping should reflect that.
+        let order = Order {
+            salt: U256::ZERO,
+            maker: Address::ZERO,
+            signer: Address::ZERO,
+            taker: Address::ZERO,
+            tokenId: U256::ZERO,
+            makerAmount: U256::ZERO,
+            takerAmount: U256::ZERO,
+            expiration: U256::ZERO,
+            nonce: U256::ZERO,
+            feeRateBps: U256::ZERO,
+            side: 0,
+            signatureType: 0,
+        };
+        let body = build_post_order_body(&order, "0x00", "NO", "k");
+        assert_eq!(body["order"]["side"], "BUY");
     }
 
     #[test]
