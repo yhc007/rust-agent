@@ -143,12 +143,19 @@ enum Commands {
         coredb_uri: String,
         /// Restrict the comparison to a comma-separated subset of
         /// strategy labels (e.g. `--strategies baseline,deepseek`).
-        /// Empty = include every strategy that appears in today's
-        /// decisions. Matches `Decision::effective_strategy()`, so
-        /// the same labels you see in the dashboard / consensus
+        /// Empty = include every strategy that appears in the
+        /// chosen window. Matches `Decision::effective_strategy()`,
+        /// so the same labels you see in the dashboard / consensus
         /// panel work here.
         #[arg(long, value_delimiter = ',')]
         strategies: Vec<String>,
+        /// Number of UTC days back from "today" to include in the
+        /// comparison (1 = today only, the historical default).
+        /// Multi-day runs are analysis-only — they skip the
+        /// strategy_pnl_snapshots persistence to avoid corrupting
+        /// the daily-resolution time series.
+        #[arg(long, default_value_t = 1)]
+        days: u32,
     },
     /// Dump strategy PnL snapshots from CoreDB as a time series.
     /// Default scans today only; use `--days N` to widen the window
@@ -338,9 +345,9 @@ async fn main() -> Result<()> {
             };
             backtest::run::run(&coredb_uri, plan, execute, live).await?;
         }
-        Some(Commands::ComparePnl { coredb_uri, strategies }) => {
+        Some(Commands::ComparePnl { coredb_uri, strategies, days }) => {
             let filter = if strategies.is_empty() { None } else { Some(strategies) };
-            backtest::compare::run(&coredb_uri, filter.as_deref()).await?;
+            backtest::compare::run(&coredb_uri, filter.as_deref(), days).await?;
         }
         Some(Commands::PnlHistory { coredb_uri, strategies, days }) => {
             let filter = if strategies.is_empty() { None } else { Some(strategies) };

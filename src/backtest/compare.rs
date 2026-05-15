@@ -20,8 +20,10 @@ use reqwest::Client;
 
 use crate::coredb::decisions::DecisionRepo;
 use crate::coredb::strategy_pnl::StrategyPnlRepo;
-use crate::coredb::types::{bucket_day, now_ms, Decision, StrategyPnlSnapshot};
+use crate::coredb::types::{bucket_day, now_ms, Decision, Millis, StrategyPnlSnapshot};
 use crate::coredb::CoreDb;
+
+const DAY_MS: Millis = 86_400_000;
 
 /// One marked-to-market decision row.
 struct Marked<'a> {
@@ -31,7 +33,12 @@ struct Marked<'a> {
     pnl: Option<f64>,
 }
 
-pub async fn run(coredb_uri: &str, strategies_filter: Option<&[String]>) -> Result<()> {
+pub async fn run(
+    coredb_uri: &str,
+    strategies_filter: Option<&[String]>,
+    days: u32,
+) -> Result<()> {
+    let days = days.max(1);
     println!("📊 compare-pnl: connecting to CoreDB at {coredb_uri}");
     let db = CoreDb::connect(coredb_uri).await.context("connect coredb")?;
     let repo = DecisionRepo::new(db.session()).await?;
@@ -39,10 +46,42 @@ pub async fn run(coredb_uri: &str, strategies_filter: Option<&[String]>) -> Resu
 
     let snapshot_ts = now_ms();
     let bd = bucket_day(snapshot_ts);
-    let mut decisions = repo
-        .list_day(bd)
-        .await
-        .context("list decisions for today")?;
+
+    // Read N day-partitions of decisions. The aggregates / matrix /
+    // disagreement output spans the whole window, but the snapshot
+    // persistence below stays bucketed to "today" — writing
+    // strategy_pnl_snapshots rows that conflate multiple days
+    // would corrupt the time series that pnl-history feeds on.
+    let mut decisions: Vec<Decision> = Vec::new();
+    let mut empty_days = 0u32;
+    for i in 0..days as i64 {
+        let day_bd = bd - (days as i64 - 1 - i) * DAY_MS;
+        match repo.list_day(day_bd).await {
+            Ok(rows) => {
+                if rows.is_empty() {
+                    empty_days += 1;
+                } else {
+                    decisions.extend(rows);
+                }
+            }
+            Err(e) => {
+                eprintln!("  ! list_day({day_bd}) failed: {e}");
+                empty_days += 1;
+            }
+        }
+    }
+    if days > 1 {
+        println!(
+            "   spanning {} UTC days: {} → {} (today)",
+            days,
+            bd - (days as i64 - 1) * DAY_MS,
+            bd,
+        );
+        if empty_days > 0 {
+            println!("   {empty_days} of {days} days had no decisions");
+        }
+    }
+
     let pre_filter_count = decisions.len();
 
     // Strategy filter is applied immediately after the read so every
@@ -62,11 +101,15 @@ pub async fn run(coredb_uri: &str, strategies_filter: Option<&[String]>) -> Resu
         );
     }
 
-    println!(
-        "   {} decisions for bucket_day = {} (UTC ms)",
-        decisions.len(),
-        bd
-    );
+    if days == 1 {
+        println!(
+            "   {} decisions for bucket_day = {} (UTC ms)",
+            decisions.len(),
+            bd
+        );
+    } else {
+        println!("   {} decisions across the window", decisions.len());
+    }
 
     if decisions.is_empty() {
         let hint = if strategies_filter.is_some() {
@@ -133,6 +176,19 @@ pub async fn run(coredb_uri: &str, strategies_filter: Option<&[String]>) -> Resu
     // pnl-history readout). One row per strategy per invocation; failures
     // are logged but don't bail the run since the human-readable output
     // already landed.
+    //
+    // Skip persistence when `days > 1`: those rows would conflate
+    // multi-day decisions into a single "today" snapshot and break
+    // the daily-resolution time series pnl-history reads. Multi-day
+    // mode is an ad-hoc analysis tool, not a heartbeat call — the
+    // daemon's periodic compare always passes days=1.
+    if days > 1 {
+        println!(
+            "\n💾 snapshot persistence skipped (--days {days} is analysis-only; \
+             would conflate multi-day data into a single 'today' bucket)"
+        );
+        return Ok(());
+    }
     for (strategy, rows) in &by_strategy {
         let mut n_yes = 0i32;
         let mut n_no = 0i32;
