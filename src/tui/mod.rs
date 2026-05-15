@@ -34,6 +34,14 @@ use crate::coredb::CoreDb;
 const REFRESH_EVERY: Duration = Duration::from_secs(5);
 const RECENT_DECISIONS: usize = 15;
 
+/// Maximum number of points rendered in the strategy-pnl trend
+/// sparkline. Older snapshots still inform the min/max of the column
+/// shape via the slice we take, but only the last `SPARK_WIDTH` chars
+/// are drawn so the table layout stays predictable across days of
+/// accumulation. One unicode block per snapshot — column width is the
+/// same number of cells.
+const SPARK_WIDTH: usize = 24;
+
 pub async fn run(coredb_uri: &str) -> Result<()> {
     let db = CoreDb::connect(coredb_uri)
         .await
@@ -215,47 +223,66 @@ fn draw_header(
 }
 
 fn draw_strategy_pnl(f: &mut ratatui::Frame, area: Rect, s: &Snapshot) {
-    let mut latest_per_strategy: std::collections::HashMap<String, &StrategyPnlSnapshot> =
+    // Group snapshots per strategy so we can both:
+    //   (a) pick the latest row for the headline columns, and
+    //   (b) reconstruct the time-ordered sum_pnl series to feed the
+    //       trend sparkline. Day-bucketed `list_day` already filters
+    //       to today, so the series fits the dashboard's intended
+    //       "what happened today" framing.
+    let mut by_strategy: std::collections::HashMap<String, Vec<&StrategyPnlSnapshot>> =
         std::collections::HashMap::new();
     for snap in &s.snapshots {
-        let cur = latest_per_strategy.get(&snap.strategy);
-        if cur.map(|c| snap.ts_ms > c.ts_ms).unwrap_or(true) {
-            latest_per_strategy.insert(snap.strategy.clone(), snap);
-        }
+        by_strategy.entry(snap.strategy.clone()).or_default().push(snap);
     }
-    let mut keys: Vec<_> = latest_per_strategy.keys().cloned().collect();
+    for v in by_strategy.values_mut() {
+        v.sort_by_key(|x| x.ts_ms);
+    }
+    let mut keys: Vec<_> = by_strategy.keys().cloned().collect();
     keys.sort();
 
     let header = Row::new([
-        "strategy", "ts (UTC)", "decisions", "YES", "NO", "PASS", "Σ size", "Σ pnl",
+        "strategy", "ts (UTC)", "decisions", "YES", "NO", "PASS", "Σ size", "Σ pnl", "trend",
     ])
     .style(Style::default().add_modifier(Modifier::BOLD));
     let mut rows: Vec<Row> = Vec::new();
     for k in &keys {
-        let snap = latest_per_strategy[k];
-        let pnl_style = if snap.sum_pnl >= 0.0 {
+        let series = &by_strategy[k];
+        // Safe: keys only contains strategies that pushed at least one
+        // snapshot into `by_strategy`, so the Vec is non-empty.
+        let latest = *series.last().unwrap();
+        let pnl_style = if latest.sum_pnl >= 0.0 {
             Style::default().fg(Color::Green)
         } else {
             Style::default().fg(Color::Red)
         };
-        let ts = DateTime::<Utc>::from_timestamp_millis(snap.ts_ms)
+        let ts = DateTime::<Utc>::from_timestamp_millis(latest.ts_ms)
             .map(|d| d.format("%H:%M:%S").to_string())
-            .unwrap_or_else(|| snap.ts_ms.to_string());
+            .unwrap_or_else(|| latest.ts_ms.to_string());
+        let pnls: Vec<f64> = series
+            .iter()
+            .rev()
+            .take(SPARK_WIDTH)
+            .map(|snap| snap.sum_pnl)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
         rows.push(Row::new(vec![
-            Cell::from(snap.strategy.clone()),
+            Cell::from(latest.strategy.clone()),
             Cell::from(ts),
-            Cell::from(snap.n_decisions.to_string()),
-            Cell::from(snap.n_yes.to_string()),
-            Cell::from(snap.n_no.to_string()),
-            Cell::from(snap.n_pass.to_string()),
-            Cell::from(format!("${:.2}", snap.sum_size_usd)),
-            Cell::from(Span::styled(format!("${:+.2}", snap.sum_pnl), pnl_style)),
+            Cell::from(latest.n_decisions.to_string()),
+            Cell::from(latest.n_yes.to_string()),
+            Cell::from(latest.n_no.to_string()),
+            Cell::from(latest.n_pass.to_string()),
+            Cell::from(format!("${:.2}", latest.sum_size_usd)),
+            Cell::from(Span::styled(format!("${:+.2}", latest.sum_pnl), pnl_style)),
+            Cell::from(Span::styled(sparkline(&pnls), pnl_style)),
         ]));
     }
     let title = if rows.is_empty() {
         " strategy pnl (no snapshots yet — run `compare-pnl` or daemon) "
     } else {
-        " strategy pnl (latest snapshot per strategy) "
+        " strategy pnl (latest snapshot per strategy, trend = today's series) "
     };
     let widths = [
         Constraint::Length(10),
@@ -266,11 +293,55 @@ fn draw_strategy_pnl(f: &mut ratatui::Frame, area: Rect, s: &Snapshot) {
         Constraint::Length(5),
         Constraint::Length(12),
         Constraint::Length(12),
+        Constraint::Length(SPARK_WIDTH as u16),
     ];
     let table = Table::new(rows, widths)
         .header(header)
         .block(Block::default().borders(Borders::ALL).title(title));
     f.render_widget(table, area);
+}
+
+/// Render `values` as a unicode block sparkline. The output is exactly
+/// `values.len()` characters wide so callers can size the table column
+/// to match by slicing the input first. A constant series collapses
+/// to all "▄" (mid-block) rather than producing a misleading rising
+/// or falling ramp, and `NaN` values are folded to the current min so
+/// they never spike the column.
+fn sparkline(values: &[f64]) -> String {
+    if values.is_empty() {
+        return String::new();
+    }
+    const BARS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    let mut min = f64::INFINITY;
+    let mut max = f64::NEG_INFINITY;
+    for &v in values {
+        if v.is_nan() {
+            continue;
+        }
+        if v < min {
+            min = v;
+        }
+        if v > max {
+            max = v;
+        }
+    }
+    if !min.is_finite() || !max.is_finite() {
+        // Entirely NaN — degenerate but render *something* so the
+        // column still occupies its fixed width.
+        return BARS[3].to_string().repeat(values.len());
+    }
+    let span = max - min;
+    let mut out = String::with_capacity(values.len() * 3);
+    for &v in values {
+        let normalized = if span <= f64::EPSILON || !v.is_finite() {
+            0.5_f64
+        } else {
+            ((v - min) / span).clamp(0.0, 1.0)
+        };
+        let idx = ((normalized * (BARS.len() as f64 - 1.0)).round() as usize).min(BARS.len() - 1);
+        out.push(BARS[idx]);
+    }
+    out
 }
 
 fn draw_positions(f: &mut ratatui::Frame, area: Rect, s: &Snapshot) {
@@ -389,5 +460,76 @@ fn fmt_dur(d: Duration) -> String {
         format!("{m}m{s:02}s")
     } else {
         format!("{s}s")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sparkline;
+
+    #[test]
+    fn sparkline_empty() {
+        assert_eq!(sparkline(&[]), "");
+    }
+
+    #[test]
+    fn sparkline_width_matches_input() {
+        for n in 1..=10 {
+            let v: Vec<f64> = (0..n).map(|i| i as f64).collect();
+            assert_eq!(sparkline(&v).chars().count(), n);
+        }
+    }
+
+    #[test]
+    fn sparkline_constant_series_is_uniform() {
+        let s = sparkline(&[5.0, 5.0, 5.0, 5.0]);
+        let chars: Vec<char> = s.chars().collect();
+        assert_eq!(chars.len(), 4);
+        assert!(chars.iter().all(|c| *c == chars[0]));
+    }
+
+    #[test]
+    fn sparkline_ramp_is_monotonic() {
+        let s = sparkline(&[0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]);
+        let chars: Vec<char> = s.chars().collect();
+        // First char should be the smallest block, last the largest;
+        // a strictly increasing input maps to a non-decreasing string
+        // of unicode block heights.
+        assert_eq!(chars.first(), Some(&'▁'));
+        assert_eq!(chars.last(), Some(&'█'));
+        for w in chars.windows(2) {
+            assert!(w[0] <= w[1], "expected non-decreasing, got {chars:?}");
+        }
+    }
+
+    #[test]
+    fn sparkline_descending_is_reverse_monotonic() {
+        let s = sparkline(&[7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0, 0.0]);
+        let chars: Vec<char> = s.chars().collect();
+        for w in chars.windows(2) {
+            assert!(w[0] >= w[1], "expected non-increasing, got {chars:?}");
+        }
+    }
+
+    #[test]
+    fn sparkline_handles_negatives() {
+        // Mix of negative and positive PnL values — the column should
+        // still anchor min→'▁' and max→'█'.
+        let s = sparkline(&[-10.0, -5.0, 0.0, 5.0, 10.0]);
+        let chars: Vec<char> = s.chars().collect();
+        assert_eq!(chars.first(), Some(&'▁'));
+        assert_eq!(chars.last(), Some(&'█'));
+    }
+
+    #[test]
+    fn sparkline_nan_does_not_panic() {
+        let s = sparkline(&[1.0, f64::NAN, 2.0, 3.0]);
+        assert_eq!(s.chars().count(), 4);
+    }
+
+    #[test]
+    fn sparkline_all_nan_renders_filler() {
+        let s = sparkline(&[f64::NAN, f64::NAN, f64::NAN]);
+        assert_eq!(s.chars().count(), 3);
     }
 }
