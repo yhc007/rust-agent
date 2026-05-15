@@ -21,6 +21,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use axum::extract::State;
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::{Json, Router};
 use serde::Serialize;
@@ -355,6 +357,7 @@ pub async fn run(cfg: DaemonConfig) -> Result<()> {
         };
         let app = Router::new()
             .route("/health", get(health_handler))
+            .route("/metrics", get(metrics_handler))
             .with_state(app_state);
         let listener = tokio::net::TcpListener::bind(addr)
             .await
@@ -501,6 +504,131 @@ async fn health_handler(State(s): State<HealthAppState>) -> Json<HealthResponse>
         ingest_btc_age_ms: btc_age,
         ingest_polymarket_age_ms: polymarket_age,
     })
+}
+
+/// Prometheus text-exposition handler. Surfaces the same HealthState
+/// `/health` does, but in line-oriented gauges keyed by the standard
+/// `agent_*` namespace so an existing Prometheus scrape config can
+/// pick it up without a JSON-to-metrics translator. No external
+/// prometheus crate dependency — the exposition format is plain
+/// text and we render it directly.
+///
+/// Returns `text/plain; version=0.0.4; charset=utf-8` per the
+/// Prometheus convention so scrapers content-negotiate correctly.
+async fn metrics_handler(State(s): State<HealthAppState>) -> impl IntoResponse {
+    let now = now_ms();
+    let snap = s.health.read().await;
+
+    // Same ingest probes as the health handler — keeps the two
+    // endpoints from diverging.
+    let btc_age = match s.btc_repo.latest("BTCUSDT").await {
+        Ok(Some(t)) => Some(now.saturating_sub(t.ts_ms)),
+        _ => None,
+    };
+    let polymarket_age = match s.market_repo.list_open().await {
+        Ok(rows) if !rows.is_empty() => {
+            let newest = rows.iter().map(|m| m.updated_at_ms).max().unwrap_or(0);
+            Some(now.saturating_sub(newest))
+        }
+        _ => None,
+    };
+
+    let mut out = String::with_capacity(2048);
+    let uptime_secs = (now - snap.started_at_ms).max(0) / 1000;
+
+    // Helper: emit one HELP/TYPE/sample triplet. Prometheus
+    // discourages duplicate HELP/TYPE lines, so families with
+    // multiple labeled samples emit the header once via push_help.
+    out.push_str("# HELP agent_uptime_seconds Process uptime in seconds.\n");
+    out.push_str("# TYPE agent_uptime_seconds gauge\n");
+    out.push_str(&format!("agent_uptime_seconds {uptime_secs}\n"));
+
+    out.push_str(
+        "# HELP agent_subtask_consecutive_errors Consecutive failed iterations per periodic subtask.\n",
+    );
+    out.push_str("# TYPE agent_subtask_consecutive_errors gauge\n");
+    for (label, sub) in [
+        ("backtest", &snap.backtest),
+        ("compare", &snap.compare),
+        ("settle", &snap.settle),
+    ] {
+        out.push_str(&format!(
+            "agent_subtask_consecutive_errors{{task=\"{label}\"}} {}\n",
+            sub.consecutive_errors,
+        ));
+    }
+
+    // Age-since-last-tick / age-since-last-success in seconds. NaN
+    // when the subtask hasn't ticked yet — Prometheus accepts NaN as
+    // a valid sample value but emits a warning in some scrapers, so
+    // skip the sample entirely instead. A missing series is the
+    // clearer signal here.
+    out.push_str(
+        "# HELP agent_subtask_last_tick_age_seconds Seconds since the subtask's last tick.\n",
+    );
+    out.push_str("# TYPE agent_subtask_last_tick_age_seconds gauge\n");
+    for (label, sub) in [
+        ("backtest", &snap.backtest),
+        ("compare", &snap.compare),
+        ("settle", &snap.settle),
+    ] {
+        if let Some(t) = sub.last_tick_ms {
+            let age = (now - t).max(0) / 1000;
+            out.push_str(&format!(
+                "agent_subtask_last_tick_age_seconds{{task=\"{label}\"}} {age}\n",
+            ));
+        }
+    }
+
+    out.push_str(
+        "# HELP agent_subtask_last_success_age_seconds Seconds since the subtask's last successful iteration.\n",
+    );
+    out.push_str("# TYPE agent_subtask_last_success_age_seconds gauge\n");
+    for (label, sub) in [
+        ("backtest", &snap.backtest),
+        ("compare", &snap.compare),
+        ("settle", &snap.settle),
+    ] {
+        if let Some(t) = sub.last_success_ms {
+            let age = (now - t).max(0) / 1000;
+            out.push_str(&format!(
+                "agent_subtask_last_success_age_seconds{{task=\"{label}\"}} {age}\n",
+            ));
+        }
+    }
+
+    out.push_str(
+        "# HELP agent_ingest_age_seconds Seconds since the newest ingest row for each source.\n",
+    );
+    out.push_str("# TYPE agent_ingest_age_seconds gauge\n");
+    if let Some(age_ms) = btc_age {
+        out.push_str(&format!(
+            "agent_ingest_age_seconds{{source=\"btc\"}} {}\n",
+            age_ms.max(0) / 1000,
+        ));
+    }
+    if let Some(age_ms) = polymarket_age {
+        out.push_str(&format!(
+            "agent_ingest_age_seconds{{source=\"polymarket\"}} {}\n",
+            age_ms.max(0) / 1000,
+        ));
+    }
+
+    out.push_str(
+        "# HELP agent_user_channel_present 1 when the Polymarket user-channel WS listener was spawned at startup.\n",
+    );
+    out.push_str("# TYPE agent_user_channel_present gauge\n");
+    out.push_str(&format!(
+        "agent_user_channel_present {}\n",
+        if snap.user_channel_present { 1 } else { 0 },
+    ));
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; version=0.0.4; charset=utf-8"),
+    );
+    (StatusCode::OK, headers, out)
 }
 
 /// Load the CLOB credential triple from env. Returns `None` if any of
