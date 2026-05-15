@@ -33,9 +33,10 @@ use tracing::{info, warn};
 
 use crate::backtest::{self, BacktestPlan};
 use crate::coredb::btc::BtcTickRepo;
+use crate::coredb::decisions::DecisionRepo;
 use crate::coredb::markets::MarketRepo;
 use crate::coredb::orders::{OrderRepo, PositionRepo};
-use crate::coredb::types::now_ms;
+use crate::coredb::types::{bucket_day, now_ms};
 use crate::coredb::CoreDb;
 use crate::data::{binance, polymarket, user_channel};
 use crate::execution::clob_auth::ApiCreds;
@@ -350,10 +351,15 @@ pub async fn run(cfg: DaemonConfig) -> Result<()> {
     // proxy can scrape it without extra config.
     let h_health = if let Some(port) = health_port {
         let addr = SocketAddr::from(([0, 0, 0, 0], port));
+        // DecisionRepo for the per-scrape decisions-today count. Built
+        // once at startup so each /metrics hit just runs the query.
+        // Wrapped in Arc so HealthAppState's Clone stays cheap.
+        let decision_repo = DecisionRepo::new(db.session()).await.ok().map(Arc::new);
         let app_state = HealthAppState {
             health: health.clone(),
             btc_repo: btc_repo_for_health,
             market_repo: market_repo_for_health,
+            decision_repo,
         };
         let app = Router::new()
             .route("/health", get(health_handler))
@@ -462,6 +468,11 @@ struct HealthAppState {
     health: Arc<RwLock<HealthState>>,
     btc_repo: Arc<BtcTickRepo>,
     market_repo: Arc<MarketRepo>,
+    /// Used by `/metrics` to count today's decisions per (strategy,
+    /// side). Optional so a future deployment that wants to disable
+    /// the per-scrape decisions read (e.g. for cost) can leave this
+    /// `None` without breaking the rest of the metrics output.
+    decision_repo: Option<Arc<DecisionRepo>>,
 }
 
 async fn health_handler(State(s): State<HealthAppState>) -> Json<HealthResponse> {
@@ -623,12 +634,71 @@ async fn metrics_handler(State(s): State<HealthAppState>) -> impl IntoResponse {
         if snap.user_channel_present { 1 } else { 0 },
     ));
 
+    // Today's decision count per (strategy, side). Gauge, not counter,
+    // because the value resets at UTC midnight when the bucket_day
+    // partition rolls — Prometheus `increase()` over a sub-day window
+    // works perfectly on a gauge, and tagging this `_total` would
+    // mislead `rate()`-using dashboards. Skipped silently when the
+    // repo failed to construct at startup.
+    if let Some(dec_repo) = &s.decision_repo {
+        out.push_str(
+            "# HELP agent_decisions_today Count of polymarket_btc.decisions rows written for today's UTC bucket, by strategy/side.\n",
+        );
+        out.push_str("# TYPE agent_decisions_today gauge\n");
+        match dec_repo.list_day(bucket_day(now)).await {
+            Ok(rows) => {
+                // (strategy, side) → count. effective_strategy() resolves
+                // the legacy `raw_response == "baseline-rule"` inference
+                // so pre-schema rows still surface under the right label.
+                use std::collections::BTreeMap;
+                let mut counts: BTreeMap<(String, String), u32> = BTreeMap::new();
+                for d in &rows {
+                    *counts
+                        .entry((d.effective_strategy().to_string(), d.side.clone()))
+                        .or_insert(0) += 1;
+                }
+                for ((strategy, side), n) in counts {
+                    out.push_str(&format!(
+                        "agent_decisions_today{{strategy=\"{}\",side=\"{}\"}} {}\n",
+                        escape_label(&strategy),
+                        escape_label(&side),
+                        n,
+                    ));
+                }
+            }
+            Err(e) => {
+                // Surface the failure as a comment so a Grafana operator
+                // can spot ingest-side problems without re-checking
+                // /health. Comments are ignored by parsers.
+                out.push_str(&format!("# decisions_today read failed: {e}\n"));
+            }
+        }
+    }
+
     let mut headers = HeaderMap::new();
     headers.insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static("text/plain; version=0.0.4; charset=utf-8"),
     );
     (StatusCode::OK, headers, out)
+}
+
+/// Escape a Prometheus label-value: backslash, double-quote, and
+/// newline get a leading backslash per the exposition spec. Our
+/// label values come from strategy / side labels which are nearly
+/// always alphanumeric, but defending against future operator-
+/// supplied strategy names is cheap.
+fn escape_label(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 /// Load the CLOB credential triple from env. Returns `None` if any of
@@ -756,6 +826,19 @@ mod tests {
     /// Watchdog must be a no-op when running outside systemd (no
     /// WATCHDOG_USEC env). The function returns `None` so the daemon
     /// doesn't spawn a pinger task that would just churn errors.
+    #[test]
+    fn escape_label_passes_alphanumeric_through() {
+        assert_eq!(escape_label("baseline"), "baseline");
+        assert_eq!(escape_label("deepseek-chat"), "deepseek-chat");
+    }
+
+    #[test]
+    fn escape_label_escapes_special_chars() {
+        assert_eq!(escape_label("a\\b"), "a\\\\b");
+        assert_eq!(escape_label("a\"b"), "a\\\"b");
+        assert_eq!(escape_label("a\nb"), "a\\nb");
+    }
+
     #[tokio::test]
     async fn watchdog_disabled_returns_none_without_env() {
         // Some test runners propagate systemd vars from the parent;
