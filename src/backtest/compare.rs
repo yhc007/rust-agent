@@ -103,6 +103,7 @@ pub async fn run(coredb_uri: &str) -> Result<()> {
     }
 
     print_summary(&by_strategy);
+    print_agreement_matrix(&usable);
     print_disagreements(&usable);
 
     // Persist per-strategy aggregates as time-series snapshots so the
@@ -220,6 +221,134 @@ fn print_summary(by_strategy: &HashMap<String, Vec<Marked>>) {
             format!("${:+.2}", sum_pnl),
             format!("${:+.2}", avg),
         );
+    }
+}
+
+/// Compute and print an N×N agreement matrix: for every ordered
+/// pair of strategies (A, B), what fraction of markets where both
+/// emitted a decision did they pick the same side?
+///
+/// PASS counts as a side, so two strategies that both PASS the same
+/// market agree on it. That matches the intuition for the consensus
+/// dashboard ("did both look at this and reach the same conclusion?")
+/// even though PASS isn't really an "opinion".
+fn print_agreement_matrix(all: &[&Decision]) {
+    let matrix = compute_agreement_matrix(all);
+    if matrix.strategies.len() < 2 {
+        // 0 or 1 strategies → matrix is degenerate; the summary table
+        // already covers the single-strategy case.
+        return;
+    }
+    println!("\n🧩 Pairwise agreement (% of shared markets both strategies picked the same side):");
+    // Header row.
+    print!("   {:<12}", "");
+    for s in &matrix.strategies {
+        print!(" {:>10}", truncate_label(s, 10));
+    }
+    println!();
+    // Body.
+    for (i, row_name) in matrix.strategies.iter().enumerate() {
+        print!("   {:<12}", truncate_label(row_name, 12));
+        for j in 0..matrix.strategies.len() {
+            if i == j {
+                print!(" {:>10}", "-");
+            } else {
+                let cell = &matrix.cells[i][j];
+                if cell.shared == 0 {
+                    print!(" {:>10}", "n/a");
+                } else {
+                    let pct = (cell.matches as f64 / cell.shared as f64) * 100.0;
+                    print!(" {:>9.1}%", pct);
+                }
+            }
+        }
+        println!();
+    }
+    // Footnote with sample size — important when one pair only has a
+    // handful of shared markets and an apparently-high % is noise.
+    println!("   shared-market counts:");
+    for (i, a) in matrix.strategies.iter().enumerate() {
+        for (j, b) in matrix.strategies.iter().enumerate() {
+            if j <= i {
+                continue;
+            }
+            let cell = &matrix.cells[i][j];
+            println!(
+                "     {:<12} ↔ {:<12} {:>4} shared, {:>4} matches",
+                a, b, cell.shared, cell.matches,
+            );
+        }
+    }
+}
+
+/// One pair's agreement count. `shared` = number of markets where both
+/// strategies emitted a decision; `matches` = subset where they picked
+/// the same side (incl. both PASS).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AgreementCell {
+    pub shared: u32,
+    pub matches: u32,
+}
+
+/// Full agreement matrix. `strategies` is the sorted list of strategy
+/// names; `cells[i][j]` is the i↔j agreement (symmetric, diagonal
+/// untouched/default).
+#[derive(Debug, Clone, Default)]
+pub struct AgreementMatrix {
+    pub strategies: Vec<String>,
+    pub cells: Vec<Vec<AgreementCell>>,
+}
+
+/// Build the matrix from a flat list of decisions. Pure function —
+/// extracted from the printer so it can be unit-tested without
+/// stdout capture.
+fn compute_agreement_matrix(all: &[&Decision]) -> AgreementMatrix {
+    use std::collections::{BTreeMap, BTreeSet, HashMap};
+
+    // market_slug → strategy → latest side. Later rows for the same
+    // (market, strategy) overwrite earlier — matches the dashboard's
+    // latest-wins semantics so a periodic daemon doesn't double-count.
+    let mut by_market: HashMap<&str, BTreeMap<&str, &str>> = HashMap::new();
+    let mut latest_ts: HashMap<(&str, &str), i64> = HashMap::new();
+    for d in all {
+        let key = (d.market_slug.as_str(), d.effective_strategy());
+        let keep = latest_ts.get(&key).map(|t| d.ts_ms >= *t).unwrap_or(true);
+        if keep {
+            latest_ts.insert(key, d.ts_ms);
+            by_market
+                .entry(d.market_slug.as_str())
+                .or_default()
+                .insert(d.effective_strategy(), d.side.as_str());
+        }
+    }
+
+    let strategies: BTreeSet<String> = all.iter().map(|d| d.effective_strategy().to_string()).collect();
+    let strategies: Vec<String> = strategies.into_iter().collect();
+    let n = strategies.len();
+    let mut cells = vec![vec![AgreementCell::default(); n]; n];
+    for picks in by_market.values() {
+        for (i, a) in strategies.iter().enumerate() {
+            let Some(side_a) = picks.get(a.as_str()) else { continue };
+            for (j, b) in strategies.iter().enumerate() {
+                if i == j {
+                    continue;
+                }
+                let Some(side_b) = picks.get(b.as_str()) else { continue };
+                cells[i][j].shared += 1;
+                if side_a == side_b {
+                    cells[i][j].matches += 1;
+                }
+            }
+        }
+    }
+    AgreementMatrix { strategies, cells }
+}
+
+fn truncate_label(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        s.chars().take(max.saturating_sub(1)).collect::<String>() + "…"
     }
 }
 
@@ -350,6 +479,101 @@ mod tests {
     #[test]
     fn zero_size_is_zero_pnl() {
         assert_eq!(pnl_for("YES", 0.0, 0.5, 0.7), 0.0);
+    }
+
+    fn dec(slug: &str, strategy: &str, side: &str, ts: i64) -> crate::coredb::types::Decision {
+        crate::coredb::types::Decision {
+            bucket_day_ms: 0,
+            ts_ms: ts,
+            decision_id: uuid::Uuid::nil(),
+            market_slug: slug.into(),
+            side: side.into(),
+            size_usd: 1.0,
+            confidence: 0.0,
+            edge_bps: 0,
+            reasoning: String::new(),
+            raw_response: String::new(),
+            entry_price: 0.5,
+            strategy: strategy.into(),
+        }
+    }
+
+    fn refs<'a>(v: &'a [crate::coredb::types::Decision]) -> Vec<&'a crate::coredb::types::Decision> {
+        v.iter().collect()
+    }
+
+    #[test]
+    fn agreement_matrix_two_strategies_perfect_match() {
+        let rows = vec![
+            dec("m1", "a", "YES", 1),
+            dec("m1", "b", "YES", 1),
+            dec("m2", "a", "NO", 2),
+            dec("m2", "b", "NO", 2),
+        ];
+        let m = compute_agreement_matrix(&refs(&rows));
+        assert_eq!(m.strategies, vec!["a", "b"]);
+        assert_eq!(m.cells[0][1].shared, 2);
+        assert_eq!(m.cells[0][1].matches, 2);
+        // Symmetric.
+        assert_eq!(m.cells[1][0], m.cells[0][1]);
+    }
+
+    #[test]
+    fn agreement_matrix_partial_match() {
+        let rows = vec![
+            dec("m1", "a", "YES", 1),
+            dec("m1", "b", "NO", 1),
+            dec("m2", "a", "PASS", 2),
+            dec("m2", "b", "PASS", 2),
+            dec("m3", "a", "YES", 3),
+            dec("m3", "b", "YES", 3),
+        ];
+        let m = compute_agreement_matrix(&refs(&rows));
+        assert_eq!(m.cells[0][1].shared, 3);
+        assert_eq!(m.cells[0][1].matches, 2);
+    }
+
+    #[test]
+    fn agreement_matrix_only_shared_markets_count() {
+        // b never weighed in on m2, so it shouldn't dilute the pair.
+        let rows = vec![
+            dec("m1", "a", "YES", 1),
+            dec("m1", "b", "YES", 1),
+            dec("m2", "a", "NO", 2),
+            // no b on m2
+        ];
+        let m = compute_agreement_matrix(&refs(&rows));
+        assert_eq!(m.cells[0][1].shared, 1);
+        assert_eq!(m.cells[0][1].matches, 1);
+    }
+
+    #[test]
+    fn agreement_matrix_three_strategies_off_diagonal() {
+        let rows = vec![
+            dec("m1", "a", "YES", 1),
+            dec("m1", "b", "YES", 1),
+            dec("m1", "c", "NO", 1),
+        ];
+        let m = compute_agreement_matrix(&refs(&rows));
+        assert_eq!(m.strategies, vec!["a", "b", "c"]);
+        // a-b matches, a-c and b-c don't.
+        assert_eq!(m.cells[0][1].matches, 1);
+        assert_eq!(m.cells[0][2].matches, 0);
+        assert_eq!(m.cells[1][2].matches, 0);
+    }
+
+    #[test]
+    fn agreement_matrix_latest_decision_wins() {
+        // a flips YES → NO at ts=5; the matrix should use NO and
+        // therefore disagree with b's YES.
+        let rows = vec![
+            dec("m1", "a", "YES", 1),
+            dec("m1", "a", "NO", 5),
+            dec("m1", "b", "YES", 3),
+        ];
+        let m = compute_agreement_matrix(&refs(&rows));
+        assert_eq!(m.cells[0][1].shared, 1);
+        assert_eq!(m.cells[0][1].matches, 0);
     }
 
     #[test]
