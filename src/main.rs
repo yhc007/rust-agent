@@ -150,8 +150,10 @@ enum Commands {
         #[arg(long, value_delimiter = ',')]
         strategies: Vec<String>,
     },
-    /// Dump today's strategy PnL snapshots from CoreDB as a time series.
-    /// Intended consumer of the cron-driven `compare-pnl` writes.
+    /// Dump strategy PnL snapshots from CoreDB as a time series.
+    /// Default scans today only; use `--days N` to widen the window
+    /// to the last N UTC days. Intended consumer of the cron-driven
+    /// `compare-pnl` writes.
     PnlHistory {
         #[arg(long, default_value = "127.0.0.1:9042")]
         coredb_uri: String,
@@ -161,6 +163,12 @@ enum Commands {
         /// Mirrors the `compare-pnl --strategies` flag for symmetry.
         #[arg(long, value_delimiter = ',')]
         strategies: Vec<String>,
+        /// Number of UTC days back from "today" to include (1 = today
+        /// only, the historical default). Each day is a separate
+        /// `strategy_pnl_snapshots` partition read; failures on one
+        /// day don't abort the rest.
+        #[arg(long, default_value_t = 1)]
+        days: u32,
     },
     /// Settle today's orders against Polymarket's resolved markets.
     /// Computes realized PnL per order, aggregates per strategy, and
@@ -328,9 +336,9 @@ async fn main() -> Result<()> {
             let filter = if strategies.is_empty() { None } else { Some(strategies) };
             backtest::compare::run(&coredb_uri, filter.as_deref()).await?;
         }
-        Some(Commands::PnlHistory { coredb_uri, strategies }) => {
+        Some(Commands::PnlHistory { coredb_uri, strategies, days }) => {
             let filter = if strategies.is_empty() { None } else { Some(strategies) };
-            backtest::history::run(&coredb_uri, filter.as_deref()).await?;
+            backtest::history::run(&coredb_uri, filter.as_deref(), days).await?;
         }
         Some(Commands::SettlePnl { coredb_uri }) => {
             backtest::settle::run(&coredb_uri).await?;
