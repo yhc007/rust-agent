@@ -63,26 +63,82 @@ impl CoreDb {
         "agreement_snapshots",
     ];
 
-    /// Approximate row count for each known table. CoreDB's CQL parser
-    /// does not accept WHERE-less COUNT plus ALLOW FILTERING in some
-    /// versions, so we fall back to streaming rows and tallying client
-    /// side. Fine for the few-thousand-row daily volumes the agent
-    /// produces; do not call this in a hot path.
-    pub async fn count_rows(&self) -> Result<Vec<(String, i64)>, CoreDbError> {
+    /// Approximate row count for each known table.
+    ///
+    /// Strategy per table: try server-side `SELECT COUNT(*) FROM ks.t`
+    /// first with a generous 5-minute per-query timeout; fall back to
+    /// the historical streaming-tally on parser failure for older
+    /// CoreDB. On the daemon's continuously-ingesting `btc_ticks`
+    /// table both paths can still exceed even a 5-minute window, so
+    /// per-table failures return `None` rather than aborting the
+    /// whole report — operators can still see the other tables'
+    /// counts when `stats` runs against a busy DB.
+    pub async fn count_rows(&self) -> Result<Vec<(String, Option<i64>)>, CoreDbError> {
         let mut out = Vec::with_capacity(Self::TABLES.len());
         for t in Self::TABLES {
-            let q = format!("SELECT * FROM {}.{}", schema::KEYSPACE, t);
-            let qr = self
-                .session
-                .query_unpaged(q, &[])
-                .await
-                .map_err(|e| CoreDbError::Query(format!("count `{}`: {}", t, e)))?;
-            let rows = qr
-                .into_rows_result()
-                .map_err(|e| CoreDbError::Query(format!("count rows `{}`: {}", t, e)))?;
-            out.push(((*t).to_string(), rows.rows_num() as i64));
+            out.push(((*t).to_string(), self.count_one(t).await));
         }
         Ok(out)
+    }
+
+    /// Best-effort row count for one table. `None` when every path
+    /// (server-side aggregate + streaming tally) fails. The error is
+    /// logged once at warn-level so an operator inspecting the
+    /// daemon's journalctl can see *why* the count is missing
+    /// without parsing a hidden CLI flag.
+    async fn count_one(&self, table: &str) -> Option<i64> {
+        use scylla::statement::query::Query;
+        use std::time::Duration;
+        use tracing::warn;
+
+        // Path A: server-side COUNT(*). Bounded by however CoreDB
+        // implements the aggregate (it currently materializes rows
+        // server-side, so on huge tables this is still slow — but a
+        // 5-min timeout gives it a real chance instead of the 30s
+        // default).
+        let agg_text = format!("SELECT COUNT(*) FROM {}.{}", schema::KEYSPACE, table);
+        let mut agg_q = Query::new(agg_text);
+        agg_q.set_request_timeout(Some(Duration::from_secs(300)));
+        match self.session.query_unpaged(agg_q, &[]).await {
+            Ok(qr) => {
+                if let Ok(rows) = qr.into_rows_result() {
+                    if rows.rows_num() >= 1 {
+                        // Untyped row iteration so we don't care
+                        // which name the column ended up with.
+                        if let Ok(typed) = rows.rows::<(i64,)>() {
+                            for row in typed.flatten() {
+                                let (n,) = row;
+                                return Some(n);
+                            }
+                        }
+                    }
+                }
+                // Query succeeded but result shape was unexpected —
+                // fall through.
+            }
+            Err(e) => {
+                warn!("count_rows[{table}]: COUNT(*) failed ({e}); trying streaming");
+            }
+        }
+
+        // Path B: streaming tally. Same 5-min timeout — gives huge
+        // tables a fighting chance even without a working COUNT(*).
+        let scan_text = format!("SELECT * FROM {}.{}", schema::KEYSPACE, table);
+        let mut scan_q = Query::new(scan_text);
+        scan_q.set_request_timeout(Some(Duration::from_secs(300)));
+        match self.session.query_unpaged(scan_q, &[]).await {
+            Ok(qr) => match qr.into_rows_result() {
+                Ok(rows) => Some(rows.rows_num() as i64),
+                Err(e) => {
+                    warn!("count_rows[{table}]: rows_result failed: {e}");
+                    None
+                }
+            },
+            Err(e) => {
+                warn!("count_rows[{table}]: streaming SELECT failed: {e}");
+                None
+            }
+        }
     }
 
     /// Probe each expected table with a `SELECT ... LIMIT 1`. Returns the

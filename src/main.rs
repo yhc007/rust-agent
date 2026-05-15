@@ -808,13 +808,16 @@ async fn run_task(config: Config, model: String, task: String) -> Result<()> {
 async fn run_stats(coredb_uri: String, json: bool) -> Result<()> {
     let db = coredb::CoreDb::connect(&coredb_uri).await?;
     let counts = db.count_rows().await?;
-    let total: i64 = counts.iter().map(|(_, n)| n).sum();
+    // Sum across successful counts only; tables that timed out
+    // contribute nothing and surface in the output as `null` (JSON)
+    // or `?` (text) so the operator can spot them.
+    let total: i64 = counts.iter().filter_map(|(_, n)| *n).sum();
+    let n_unknown = counts.iter().filter(|(_, n)| n.is_none()).count();
 
     if json {
-        // Stable shape: { tables: [{ name, n }, ...], total }.
-        // Sorted by name so multi-run diffs are clean — CoreDB
-        // already returns rows in TABLES-list order but a Vec is
-        // less fragile to depend on than CoreDB internals.
+        // Stable shape: { tables: [{ name, n }, ...], total,
+        // n_unknown }. `n` is null when count_one failed for that
+        // table — same signal as the text mode's `?` rendering.
         let mut rows: Vec<_> = counts.iter().cloned().collect();
         rows.sort_by(|a, b| a.0.cmp(&b.0));
         let payload = serde_json::json!({
@@ -823,6 +826,7 @@ async fn run_stats(coredb_uri: String, json: bool) -> Result<()> {
                 .map(|(name, n)| serde_json::json!({"name": name, "n": n}))
                 .collect::<Vec<_>>(),
             "total": total,
+            "n_unknown": n_unknown,
         });
         match serde_json::to_string_pretty(&payload) {
             Ok(s) => println!("{s}"),
@@ -833,9 +837,17 @@ async fn run_stats(coredb_uri: String, json: bool) -> Result<()> {
 
     println!("📊 CoreDB polymarket_btc row counts:");
     for (t, n) in &counts {
-        println!("   {t:<20} {n}");
+        match n {
+            Some(c) => println!("   {t:<22} {c}"),
+            None => println!("   {t:<22} ? (count_rows timeout — see journalctl)"),
+        }
     }
-    println!("   {:<20} {}", "Σ", total);
+    let total_label = if n_unknown == 0 {
+        format!("{total}")
+    } else {
+        format!("{total} (+{n_unknown} unknown)")
+    };
+    println!("   {:<22} {}", "Σ", total_label);
     Ok(())
 }
 
