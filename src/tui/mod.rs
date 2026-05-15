@@ -129,7 +129,61 @@ struct Snapshot {
     positions: Vec<Position>,
     decisions: Vec<Decision>,
     snapshots: Vec<StrategyPnlSnapshot>,
+    consensus: Vec<MarketConsensus>,
     errors: Vec<String>,
+}
+
+/// Per-market view of how the active strategies voted today. The
+/// sparkline / decisions panels surface single rows; this view answers
+/// "do my N strategies agree on this market right now?" which only
+/// makes sense when ≥2 strategies have evaluated the same market.
+#[derive(Debug, Clone)]
+struct MarketConsensus {
+    market_slug: String,
+    /// strategy → latest non-PASS side on this market today. PASS
+    /// entries are not stored here; absence = either no vote or only
+    /// a PASS vote so far.
+    active_picks: std::collections::BTreeMap<String, String>,
+    /// Number of strategies that emitted a PASS row on this market.
+    /// Together with `active_picks.len()` this tells the operator how
+    /// many strategies have looked at the market at all.
+    pass_strategies: u32,
+    /// Sum of size_usd across `active_picks`. Sort key for the panel.
+    sum_size_usd: f64,
+    /// Newest ts_ms across all rows seen for this market.
+    last_ts_ms: i64,
+    agreement: AgreementKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgreementKind {
+    /// ≥2 active strategies and every active pick is the same side.
+    AllAgree,
+    /// ≥2 active strategies and they don't all match.
+    Split,
+    /// Exactly 1 active strategy; the rest passed or haven't voted.
+    Solo,
+    /// No active strategy — every vote was PASS.
+    AllPass,
+}
+
+impl AgreementKind {
+    fn short_label(self) -> &'static str {
+        match self {
+            AgreementKind::AllAgree => "✓ all",
+            AgreementKind::Split => "✗ split",
+            AgreementKind::Solo => "solo",
+            AgreementKind::AllPass => "all pass",
+        }
+    }
+    fn color(self) -> Color {
+        match self {
+            AgreementKind::AllAgree => Color::Green,
+            AgreementKind::Split => Color::Yellow,
+            AgreementKind::Solo => Color::Cyan,
+            AgreementKind::AllPass => Color::DarkGray,
+        }
+    }
 }
 
 async fn fetch_snapshot(
@@ -165,7 +219,104 @@ async fn fetch_snapshot(
         Ok(v) => s.snapshots = v,
         Err(e) => s.errors.push(format!("strategy_pnl.list_day: {e}")),
     }
+    s.consensus = build_consensus(&s.decisions);
     s
+}
+
+/// Group today's decisions per market and classify cross-strategy
+/// agreement. Latest decision per (market, strategy) wins so a
+/// periodic daemon that emitted multiple rows doesn't double-vote.
+fn build_consensus(decisions: &[Decision]) -> Vec<MarketConsensus> {
+    use std::collections::BTreeMap;
+    // market_slug → (strategy → latest decision)
+    let mut by_market: std::collections::HashMap<&str, BTreeMap<String, &Decision>> =
+        std::collections::HashMap::new();
+    for d in decisions {
+        let strat = d.effective_strategy().to_string();
+        let entry = by_market.entry(d.market_slug.as_str()).or_default();
+        let keep = match entry.get(&strat) {
+            Some(prev) => d.ts_ms >= prev.ts_ms,
+            None => true,
+        };
+        if keep {
+            entry.insert(strat, d);
+        }
+    }
+
+    let mut out: Vec<MarketConsensus> = by_market
+        .into_iter()
+        .map(|(slug, picks)| {
+            let mut active = BTreeMap::new();
+            let mut pass = 0u32;
+            let mut sum = 0.0;
+            let mut last_ts = 0i64;
+            for (strat, d) in &picks {
+                if d.ts_ms > last_ts {
+                    last_ts = d.ts_ms;
+                }
+                match d.side.as_str() {
+                    "PASS" => pass += 1,
+                    _ => {
+                        active.insert(strat.clone(), d.side.clone());
+                        sum += d.size_usd;
+                    }
+                }
+            }
+            let agreement = classify_agreement(&active, pass);
+            MarketConsensus {
+                market_slug: slug.to_string(),
+                active_picks: active,
+                pass_strategies: pass,
+                sum_size_usd: sum,
+                last_ts_ms: last_ts,
+                agreement,
+            }
+        })
+        .collect();
+
+    // Sort: splits first (they're the actionable disagreements),
+    // then by total active size descending, then newest first as a
+    // tiebreak.
+    out.sort_by(|a, b| {
+        let key = |c: &MarketConsensus| match c.agreement {
+            AgreementKind::Split => 0,
+            AgreementKind::AllAgree => 1,
+            AgreementKind::Solo => 2,
+            AgreementKind::AllPass => 3,
+        };
+        key(a)
+            .cmp(&key(b))
+            .then_with(|| b.sum_size_usd.partial_cmp(&a.sum_size_usd).unwrap_or(std::cmp::Ordering::Equal))
+            .then_with(|| b.last_ts_ms.cmp(&a.last_ts_ms))
+    });
+    out
+}
+
+fn classify_agreement(
+    active: &std::collections::BTreeMap<String, String>,
+    pass_count: u32,
+) -> AgreementKind {
+    use std::collections::HashSet;
+    match active.len() {
+        0 => {
+            if pass_count == 0 {
+                // No data — shouldn't happen because by_market wouldn't have
+                // an entry, but defend against the empty case anyway.
+                AgreementKind::AllPass
+            } else {
+                AgreementKind::AllPass
+            }
+        }
+        1 => AgreementKind::Solo,
+        _ => {
+            let distinct: HashSet<&str> = active.values().map(|s| s.as_str()).collect();
+            if distinct.len() == 1 {
+                AgreementKind::AllAgree
+            } else {
+                AgreementKind::Split
+            }
+        }
+    }
 }
 
 fn draw(
@@ -179,17 +330,90 @@ fn draw(
         .constraints([
             Constraint::Length(3),   // header
             Constraint::Length(6),   // strategy pnl
-            Constraint::Min(6),      // positions
-            Constraint::Min(8),      // recent decisions
+            Constraint::Min(5),      // market consensus
+            Constraint::Min(5),      // positions
+            Constraint::Min(7),      // recent decisions
             Constraint::Length(3),   // footer
         ])
         .split(f.area());
 
     draw_header(f, chunks[0], s, snap_age, uptime);
     draw_strategy_pnl(f, chunks[1], s);
-    draw_positions(f, chunks[2], s);
-    draw_decisions(f, chunks[3], s);
-    draw_footer(f, chunks[4], s);
+    draw_consensus(f, chunks[2], s);
+    draw_positions(f, chunks[3], s);
+    draw_decisions(f, chunks[4], s);
+    draw_footer(f, chunks[5], s);
+}
+
+fn draw_consensus(f: &mut ratatui::Frame, area: Rect, s: &Snapshot) {
+    let header = Row::new(["market_slug", "agree", "picks", "Σ size"])
+        .style(Style::default().add_modifier(Modifier::BOLD));
+    let rows: Vec<Row> = s
+        .consensus
+        .iter()
+        .take(usize::from(area.height.saturating_sub(3)))
+        .map(|c| {
+            // "baseline=YES  llm=NO  anthropic=YES (+1 pass)" — short
+            // enough to fit a wide terminal, truncates naturally when
+            // the cell renders. PASS counts surface even though they
+            // aren't in active_picks because that's the difference
+            // between "solo opinion vs. nobody else looked" and
+            // "solo opinion vs. everyone else explicitly stayed out".
+            let mut picks: Vec<String> = c
+                .active_picks
+                .iter()
+                .map(|(strat, side)| format!("{strat}={side}"))
+                .collect();
+            if c.pass_strategies > 0 {
+                picks.push(format!("(+{} PASS)", c.pass_strategies));
+            }
+            let agree_cell = Span::styled(
+                c.agreement.short_label(),
+                Style::default().fg(c.agreement.color()).add_modifier(Modifier::BOLD),
+            );
+            Row::new(vec![
+                Cell::from(c.market_slug.clone()),
+                Cell::from(agree_cell),
+                Cell::from(picks.join("  ")),
+                Cell::from(format!("${:.2}", c.sum_size_usd)),
+            ])
+        })
+        .collect();
+    let widths = [
+        Constraint::Min(25),
+        Constraint::Length(8),
+        Constraint::Min(40),
+        Constraint::Length(10),
+    ];
+    let title = if s.consensus.is_empty() {
+        " market consensus (no decisions today yet) ".to_string()
+    } else {
+        // Quick at-a-glance roll-up alongside the panel title.
+        let mut all_agree = 0u32;
+        let mut split = 0u32;
+        let mut solo = 0u32;
+        let mut pass = 0u32;
+        for c in &s.consensus {
+            match c.agreement {
+                AgreementKind::AllAgree => all_agree += 1,
+                AgreementKind::Split => split += 1,
+                AgreementKind::Solo => solo += 1,
+                AgreementKind::AllPass => pass += 1,
+            }
+        }
+        format!(
+            " market consensus ({} markets — ✓{} all, ✗{} split, {} solo, {} pass) ",
+            s.consensus.len(),
+            all_agree,
+            split,
+            solo,
+            pass,
+        )
+    };
+    let table = Table::new(rows, widths)
+        .header(header)
+        .block(Block::default().borders(Borders::ALL).title(title));
+    f.render_widget(table, area);
 }
 
 fn draw_header(
@@ -461,7 +685,26 @@ fn fmt_dur(d: Duration) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::sparkline;
+    use super::{build_consensus, sparkline, AgreementKind};
+    use crate::coredb::types::Decision;
+    use uuid::Uuid;
+
+    fn dec(slug: &str, strategy: &str, side: &str, size: f64, ts: i64) -> Decision {
+        Decision {
+            bucket_day_ms: 0,
+            ts_ms: ts,
+            decision_id: Uuid::nil(),
+            market_slug: slug.into(),
+            side: side.into(),
+            size_usd: size,
+            confidence: 0.0,
+            edge_bps: 0,
+            reasoning: String::new(),
+            raw_response: String::new(),
+            entry_price: 0.5,
+            strategy: strategy.into(),
+        }
+    }
 
     #[test]
     fn sparkline_empty() {
@@ -527,5 +770,88 @@ mod tests {
     fn sparkline_all_nan_renders_filler() {
         let s = sparkline(&[f64::NAN, f64::NAN, f64::NAN]);
         assert_eq!(s.chars().count(), 3);
+    }
+
+    #[test]
+    fn consensus_all_agree_two_strategies() {
+        let rows = vec![
+            dec("btc-100k", "baseline", "YES", 10.0, 1),
+            dec("btc-100k", "deepseek", "YES", 5.0, 2),
+        ];
+        let c = build_consensus(&rows);
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0].agreement, AgreementKind::AllAgree);
+        assert_eq!(c[0].active_picks.len(), 2);
+        assert!((c[0].sum_size_usd - 15.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn consensus_split_when_sides_differ() {
+        let rows = vec![
+            dec("btc-100k", "baseline", "YES", 10.0, 1),
+            dec("btc-100k", "deepseek", "NO", 5.0, 2),
+        ];
+        let c = build_consensus(&rows);
+        assert_eq!(c[0].agreement, AgreementKind::Split);
+    }
+
+    #[test]
+    fn consensus_solo_when_one_active_one_pass() {
+        let rows = vec![
+            dec("btc-100k", "baseline", "YES", 10.0, 1),
+            dec("btc-100k", "deepseek", "PASS", 0.0, 2),
+        ];
+        let c = build_consensus(&rows);
+        assert_eq!(c[0].agreement, AgreementKind::Solo);
+        assert_eq!(c[0].active_picks.len(), 1);
+        assert_eq!(c[0].pass_strategies, 1);
+    }
+
+    #[test]
+    fn consensus_all_pass_when_no_strategy_takes_a_side() {
+        let rows = vec![
+            dec("btc-100k", "baseline", "PASS", 0.0, 1),
+            dec("btc-100k", "deepseek", "PASS", 0.0, 2),
+        ];
+        let c = build_consensus(&rows);
+        assert_eq!(c[0].agreement, AgreementKind::AllPass);
+        assert!(c[0].active_picks.is_empty());
+        assert_eq!(c[0].pass_strategies, 2);
+    }
+
+    #[test]
+    fn consensus_latest_per_strategy_wins() {
+        // baseline emits YES then NO; latest (NO) should win and the
+        // market should be flagged as a split vs deepseek=YES.
+        let rows = vec![
+            dec("btc-100k", "baseline", "YES", 10.0, 1),
+            dec("btc-100k", "baseline", "NO", 12.0, 5),
+            dec("btc-100k", "deepseek", "YES", 5.0, 3),
+        ];
+        let c = build_consensus(&rows);
+        assert_eq!(c[0].agreement, AgreementKind::Split);
+        assert_eq!(c[0].active_picks.get("baseline").map(String::as_str), Some("NO"));
+        // size should reflect the latest baseline row, not the first.
+        assert!((c[0].sum_size_usd - 17.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn consensus_sort_puts_splits_first() {
+        let rows = vec![
+            // Market A: all agree (sum size $20)
+            dec("market-a", "baseline", "YES", 10.0, 1),
+            dec("market-a", "deepseek", "YES", 10.0, 2),
+            // Market B: split (sum size $5)
+            dec("market-b", "baseline", "YES", 3.0, 3),
+            dec("market-b", "deepseek", "NO", 2.0, 4),
+            // Market C: solo
+            dec("market-c", "baseline", "YES", 4.0, 5),
+        ];
+        let c = build_consensus(&rows);
+        // Splits sort first regardless of size; then all-agree by size
+        // desc; then solo.
+        assert_eq!(c[0].market_slug, "market-b");
+        assert_eq!(c[1].market_slug, "market-a");
+        assert_eq!(c[2].market_slug, "market-c");
     }
 }
