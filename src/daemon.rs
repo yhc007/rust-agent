@@ -360,6 +360,7 @@ pub async fn run(cfg: DaemonConfig) -> Result<()> {
             btc_repo: btc_repo_for_health,
             market_repo: market_repo_for_health,
             decision_repo,
+            decisions_cache: Arc::new(RwLock::new(None)),
         };
         let app = Router::new()
             .route("/health", get(health_handler))
@@ -463,6 +464,21 @@ fn spawn_watchdog(
     }))
 }
 
+/// TTL on the cached decisions-per-(strategy,side) tally that
+/// `/metrics` emits. Prometheus default scrape is every 15s, so
+/// 10s keeps the daemon's CoreDB hit rate at most ~1/10s under
+/// whatever scrape concurrency. Tuning higher trades freshness for
+/// load; tuning lower hits CoreDB more aggressively for marginal
+/// benefit since the underlying data only ticks on backtest runs
+/// (every 30 min in the default daemon config).
+const METRICS_DECISIONS_CACHE_TTL_MS: i64 = 10_000;
+
+#[derive(Debug, Clone)]
+struct DecisionsCacheEntry {
+    fetched_at_ms: i64,
+    counts: std::collections::BTreeMap<(String, String), u32>,
+}
+
 #[derive(Clone)]
 struct HealthAppState {
     health: Arc<RwLock<HealthState>>,
@@ -473,6 +489,11 @@ struct HealthAppState {
     /// the per-scrape decisions read (e.g. for cost) can leave this
     /// `None` without breaking the rest of the metrics output.
     decision_repo: Option<Arc<DecisionRepo>>,
+    /// Stale-while-revalidate cache for the decisions tally. Saves
+    /// CoreDB a `list_day` per scrape under high-frequency
+    /// scraping. Refresh failures keep the previous entry around
+    /// so transient CoreDB blips don't blank the Grafana panel.
+    decisions_cache: Arc<RwLock<Option<DecisionsCacheEntry>>>,
 }
 
 async fn health_handler(State(s): State<HealthAppState>) -> Json<HealthResponse> {
@@ -640,37 +661,69 @@ async fn metrics_handler(State(s): State<HealthAppState>) -> impl IntoResponse {
     // works perfectly on a gauge, and tagging this `_total` would
     // mislead `rate()`-using dashboards. Skipped silently when the
     // repo failed to construct at startup.
+    //
+    // Stale-while-revalidate: we hold the write lock through the
+    // optional refresh, then either emit the freshly fetched data or
+    // fall back to the previous cached entry on transient failures.
+    // The cache age itself is exposed as `agent_decisions_today_cache_age_seconds`
+    // so operators can verify the TTL is doing what they expect.
     if let Some(dec_repo) = &s.decision_repo {
-        out.push_str(
-            "# HELP agent_decisions_today Count of polymarket_btc.decisions rows written for today's UTC bucket, by strategy/side.\n",
-        );
-        out.push_str("# TYPE agent_decisions_today gauge\n");
-        match dec_repo.list_day(bucket_day(now)).await {
-            Ok(rows) => {
-                // (strategy, side) → count. effective_strategy() resolves
-                // the legacy `raw_response == "baseline-rule"` inference
-                // so pre-schema rows still surface under the right label.
-                use std::collections::BTreeMap;
-                let mut counts: BTreeMap<(String, String), u32> = BTreeMap::new();
-                for d in &rows {
-                    *counts
-                        .entry((d.effective_strategy().to_string(), d.side.clone()))
-                        .or_insert(0) += 1;
+        let mut cache_guard = s.decisions_cache.write().await;
+        let need_refresh = cache_guard
+            .as_ref()
+            .map(|c| now - c.fetched_at_ms > METRICS_DECISIONS_CACHE_TTL_MS)
+            .unwrap_or(true);
+
+        if need_refresh {
+            match dec_repo.list_day(bucket_day(now)).await {
+                Ok(rows) => {
+                    use std::collections::BTreeMap;
+                    let mut counts: BTreeMap<(String, String), u32> = BTreeMap::new();
+                    for d in &rows {
+                        *counts
+                            .entry((d.effective_strategy().to_string(), d.side.clone()))
+                            .or_insert(0) += 1;
+                    }
+                    *cache_guard = Some(DecisionsCacheEntry {
+                        fetched_at_ms: now,
+                        counts,
+                    });
                 }
-                for ((strategy, side), n) in counts {
-                    out.push_str(&format!(
-                        "agent_decisions_today{{strategy=\"{}\",side=\"{}\"}} {}\n",
-                        escape_label(&strategy),
-                        escape_label(&side),
-                        n,
-                    ));
+                Err(e) => {
+                    if cache_guard.is_none() {
+                        out.push_str(&format!(
+                            "# decisions_today read failed (no cached fallback): {e}\n"
+                        ));
+                    } else {
+                        out.push_str(&format!(
+                            "# decisions_today refresh failed; serving cached data: {e}\n"
+                        ));
+                    }
                 }
             }
-            Err(e) => {
-                // Surface the failure as a comment so a Grafana operator
-                // can spot ingest-side problems without re-checking
-                // /health. Comments are ignored by parsers.
-                out.push_str(&format!("# decisions_today read failed: {e}\n"));
+        }
+
+        if let Some(cache) = cache_guard.as_ref() {
+            let cache_age_secs = (now - cache.fetched_at_ms).max(0) / 1000;
+            out.push_str(
+                "# HELP agent_decisions_today_cache_age_seconds Age of the cached decisions tally in seconds. Bounded by METRICS_DECISIONS_CACHE_TTL_MS.\n",
+            );
+            out.push_str("# TYPE agent_decisions_today_cache_age_seconds gauge\n");
+            out.push_str(&format!(
+                "agent_decisions_today_cache_age_seconds {cache_age_secs}\n"
+            ));
+
+            out.push_str(
+                "# HELP agent_decisions_today Count of polymarket_btc.decisions rows written for today's UTC bucket, by strategy/side.\n",
+            );
+            out.push_str("# TYPE agent_decisions_today gauge\n");
+            for ((strategy, side), n) in &cache.counts {
+                out.push_str(&format!(
+                    "agent_decisions_today{{strategy=\"{}\",side=\"{}\"}} {}\n",
+                    escape_label(strategy),
+                    escape_label(side),
+                    n,
+                ));
             }
         }
     }
