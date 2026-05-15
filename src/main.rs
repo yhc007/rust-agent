@@ -203,6 +203,12 @@ enum Commands {
         /// value: `http://127.0.0.1:9099/health`.
         #[arg(long)]
         health_url: Option<String>,
+        /// Number of UTC days back from "today" to feed the strategy-
+        /// PnL trend sparkline (1 = today only, the historical default).
+        /// Wider windows surface multi-day trends — useful once the
+        /// daemon has been running through several UTC days.
+        #[arg(long, default_value_t = 1)]
+        pnl_days: u32,
     },
     /// Run the Polymarket CLOB L1 handshake against
     /// `POST https://clob.polymarket.com/auth/api-key` using
@@ -349,8 +355,8 @@ async fn main() -> Result<()> {
         Some(Commands::UserChannel { coredb_uri }) => {
             run_user_channel(coredb_uri).await?;
         }
-        Some(Commands::Dashboard { coredb_uri, health_url }) => {
-            tui::run(&coredb_uri, health_url).await?;
+        Some(Commands::Dashboard { coredb_uri, health_url, pnl_days }) => {
+            tui::run(&coredb_uri, health_url, pnl_days).await?;
         }
         Some(Commands::ClobAuth {}) => {
             run_clob_auth().await?;

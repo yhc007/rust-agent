@@ -28,7 +28,7 @@ use crate::coredb::btc::BtcTickRepo;
 use crate::coredb::decisions::DecisionRepo;
 use crate::coredb::orders::PositionRepo;
 use crate::coredb::strategy_pnl::StrategyPnlRepo;
-use crate::coredb::types::{bucket_day, now_ms, BtcTick, Decision, Position, StrategyPnlSnapshot};
+use crate::coredb::types::{bucket_day, now_ms, BtcTick, Decision, Millis, Position, StrategyPnlSnapshot};
 use crate::coredb::CoreDb;
 
 const REFRESH_EVERY: Duration = Duration::from_secs(5);
@@ -42,7 +42,12 @@ const RECENT_DECISIONS: usize = 15;
 /// same number of cells.
 const SPARK_WIDTH: usize = 24;
 
-pub async fn run(coredb_uri: &str, health_url: Option<String>) -> Result<()> {
+pub async fn run(
+    coredb_uri: &str,
+    health_url: Option<String>,
+    pnl_days: u32,
+) -> Result<()> {
+    let pnl_days = pnl_days.max(1);
     let db = CoreDb::connect(coredb_uri)
         .await
         .with_context(|| format!("connect coredb at {coredb_uri}"))?;
@@ -80,6 +85,7 @@ pub async fn run(coredb_uri: &str, health_url: Option<String>) -> Result<()> {
         &pnl_repo,
         health_url.as_deref(),
         health_client.as_ref(),
+        pnl_days,
     )
     .await;
 
@@ -99,9 +105,10 @@ async fn main_loop(
     pnl_repo: &StrategyPnlRepo,
     health_url: Option<&str>,
     health_client: Option<&reqwest::Client>,
+    pnl_days: u32,
 ) -> Result<()> {
     let mut snapshot = fetch_snapshot(
-        btc_repo, dec_repo, pos_repo, pnl_repo, health_url, health_client,
+        btc_repo, dec_repo, pos_repo, pnl_repo, health_url, health_client, pnl_days,
     )
     .await;
     let mut last_refresh = Instant::now();
@@ -123,6 +130,7 @@ async fn main_loop(
                     KeyCode::Char('r') => {
                         snapshot = fetch_snapshot(
                             btc_repo, dec_repo, pos_repo, pnl_repo, health_url, health_client,
+                            pnl_days,
                         )
                         .await;
                         last_refresh = Instant::now();
@@ -136,7 +144,7 @@ async fn main_loop(
         // Auto-refresh on the cadence.
         if last_refresh.elapsed() >= REFRESH_EVERY {
             snapshot = fetch_snapshot(
-                btc_repo, dec_repo, pos_repo, pnl_repo, health_url, health_client,
+                btc_repo, dec_repo, pos_repo, pnl_repo, health_url, health_client, pnl_days,
             )
             .await;
             last_refresh = Instant::now();
@@ -289,6 +297,7 @@ async fn fetch_snapshot(
     pnl: &StrategyPnlRepo,
     health_url: Option<&str>,
     health_client: Option<&reqwest::Client>,
+    pnl_days: u32,
 ) -> Snapshot {
     let mut s = Snapshot::default();
     match btc.latest("BTCUSDT").await {
@@ -313,9 +322,19 @@ async fn fetch_snapshot(
         }
         Err(e) => s.errors.push(format!("positions.list_all: {e}")),
     }
-    match pnl.list_day(bd).await {
-        Ok(v) => s.snapshots = v,
-        Err(e) => s.errors.push(format!("strategy_pnl.list_day: {e}")),
+    // Read N day-partitions for the strategy-pnl sparkline. Default
+    // 1 keeps the historical "today only" behavior; a higher value
+    // surfaces real multi-day trends in the trend column. A failure
+    // on one day is logged into `errors` but doesn't bail the rest
+    // of the window.
+    const DAY_MS: Millis = 86_400_000;
+    let days = pnl_days.max(1);
+    for i in 0..days as i64 {
+        let day_bd = bd - (days as i64 - 1 - i) * DAY_MS;
+        match pnl.list_day(day_bd).await {
+            Ok(v) => s.snapshots.extend(v),
+            Err(e) => s.errors.push(format!("strategy_pnl.list_day({day_bd}): {e}")),
+        }
     }
     s.consensus = build_consensus(&s.decisions);
     if let (Some(url), Some(client)) = (health_url, health_client) {
@@ -414,6 +433,46 @@ fn short_err(s: &str) -> String {
         s.to_string()
     } else {
         s.chars().take(MAX).collect::<String>() + "…"
+    }
+}
+
+/// Human-readable description of the time span covered by a snapshot
+/// rowset. Used in the strategy-pnl panel title so the operator
+/// knows whether the sparkline reflects today only or a wider
+/// historical window without checking which flag they passed.
+///
+/// Returns "today's series" for sub-day spans (the typical case
+/// with default `--pnl-days 1`), "Nd Nh series" for hour-resolution
+/// spans, and "Nd series" for whole-day spans. Empty input falls
+/// through to "today's series" — the title is then paired with the
+/// "no snapshots yet" body anyway.
+fn ts_span_label(snapshots: &[StrategyPnlSnapshot]) -> String {
+    let mut min = i64::MAX;
+    let mut max = i64::MIN;
+    for s in snapshots {
+        if s.ts_ms < min {
+            min = s.ts_ms;
+        }
+        if s.ts_ms > max {
+            max = s.ts_ms;
+        }
+    }
+    if min == i64::MAX || max == i64::MIN {
+        return "today's series".to_string();
+    }
+    let span_ms = (max - min).max(0);
+    let day_ms = 86_400_000_i64;
+    let hour_ms = 3_600_000_i64;
+    if span_ms < day_ms {
+        "today's series".to_string()
+    } else {
+        let days = span_ms / day_ms;
+        let hours = (span_ms % day_ms) / hour_ms;
+        if hours == 0 {
+            format!("{days}d series")
+        } else {
+            format!("{days}d {hours}h series")
+        }
     }
 }
 
@@ -726,10 +785,16 @@ fn draw_strategy_pnl(f: &mut ratatui::Frame, area: Rect, s: &Snapshot) {
             Cell::from(Span::styled(sparkline(&pnls), pnl_style)),
         ]));
     }
-    let title = if rows.is_empty() {
-        " strategy pnl (no snapshots yet — run `compare-pnl` or daemon) "
+    // Compute the actual ts span of the snapshots we have so the
+    // title reflects the real window — operators running with
+    // --pnl-days 7 see "trend ~ 7 days" rather than a stale
+    // "today's series" label, and an empty window still gets the
+    // unambiguous "no snapshots yet" hint.
+    let title: String = if rows.is_empty() {
+        " strategy pnl (no snapshots yet — run `compare-pnl` or daemon) ".to_string()
     } else {
-        " strategy pnl (latest snapshot per strategy, trend = today's series) "
+        let span_label = ts_span_label(&s.snapshots);
+        format!(" strategy pnl (latest snapshot per strategy, trend ~ {span_label}) ")
     };
     let widths = [
         Constraint::Length(10),
@@ -1101,6 +1166,47 @@ mod tests {
     #[test]
     fn short_err_keeps_short_strings_intact() {
         assert_eq!(super::short_err("hello"), "hello");
+    }
+
+    fn snap(ts_ms: i64) -> crate::coredb::types::StrategyPnlSnapshot {
+        crate::coredb::types::StrategyPnlSnapshot {
+            bucket_day_ms: 0,
+            ts_ms,
+            strategy: "x".into(),
+            n_decisions: 0,
+            sum_size_usd: 0.0,
+            sum_pnl: 0.0,
+            n_yes: 0,
+            n_no: 0,
+            n_pass: 0,
+        }
+    }
+
+    #[test]
+    fn span_label_empty_input() {
+        assert_eq!(super::ts_span_label(&[]), "today's series");
+    }
+
+    #[test]
+    fn span_label_subday_collapses_to_today() {
+        // 1 hour span — still treated as today's series.
+        let rows = vec![snap(0), snap(3_600_000)];
+        assert_eq!(super::ts_span_label(&rows), "today's series");
+    }
+
+    #[test]
+    fn span_label_whole_days_only() {
+        let day_ms = 86_400_000_i64;
+        let rows = vec![snap(0), snap(3 * day_ms)];
+        assert_eq!(super::ts_span_label(&rows), "3d series");
+    }
+
+    #[test]
+    fn span_label_days_and_hours() {
+        let day_ms = 86_400_000_i64;
+        let hour_ms = 3_600_000_i64;
+        let rows = vec![snap(0), snap(2 * day_ms + 5 * hour_ms)];
+        assert_eq!(super::ts_span_label(&rows), "2d 5h series");
     }
 
     #[test]
