@@ -1,0 +1,58 @@
+# rust-agent daemon — ingest + periodic backtest/compare/settle in one
+# process. Pairs with coredb.service so this comes up *after* CoreDB is
+# listening on :9042. The daemon survives transient CoreDB hiccups
+# internally (each periodic job catches its own errors and continues),
+# so a CoreDB restart does not require restarting the agent.
+#
+# Install + enable:
+#   mkdir -p ~/.config/systemd/user
+#   cp rust-agent/deploy/systemd/rust-agent-daemon.service ~/.config/systemd/user/
+#   cp rust-agent/deploy/agent.env.example ~/.config/polymarket-btc/agent.env
+#   chmod 600 ~/.config/polymarket-btc/agent.env       # secrets live here
+#   edit the file: set DEEPSEEK_API_KEY / ANTHROPIC_API_KEY / etc.
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now rust-agent-daemon.service
+#
+# Operate:
+#   systemctl --user status  rust-agent-daemon
+#   journalctl --user -u rust-agent-daemon -f
+#   systemctl --user restart rust-agent-daemon         # re-read env file
+#
+# Live trading: set LIVE_TRADING_ENABLED=1 in the env file *and* swap
+# the --live flag on in ExecStart below. Both gates are still required
+# end-to-end (CLOB creds, USDC approve on-chain, RISK_MAX_ORDER_USD).
+
+[Unit]
+Description=rust-agent polymarket BTC daemon (ingest + backtest + compare + settle)
+After=network-online.target coredb.service
+Wants=network-online.target
+Requires=coredb.service
+
+[Service]
+Type=simple
+WorkingDirectory=%h/workHard/rust-agent
+# Secrets in this env file: DEEPSEEK_API_KEY, ANTHROPIC_API_KEY,
+# POLYMARKET_CLOB_API_KEY / _SECRET / _PASSPHRASE,
+# POLYMARKET_PRIVATE_KEY, LIVE_TRADING_ENABLED, RISK_MAX_ORDER_USD, ...
+# `-` prefix = don't fail to start if the file is missing (useful when
+# bringing up a paper-only deployment with credentials still in shells).
+EnvironmentFile=-%h/.config/polymarket-btc/agent.env
+
+# Default: paper trading. Add `--live` after `daemon` to flip to
+# LiveExec (still DRY_RUN unless LIVE_TRADING_ENABLED=1 in the env
+# file — two gates by design). Add `--llms anthropic,deepseek` etc.
+# for N-way comparison.
+ExecStart=%h/workHard/rust-agent/target/release/rust-agent daemon --coredb-uri 127.0.0.1:9042
+
+Restart=on-failure
+RestartSec=10s
+# Ctrl+C-equivalent — daemon's shared watch::channel tears down ingest,
+# WS listeners, and periodic jobs cleanly. Don't escalate too fast.
+KillSignal=SIGTERM
+TimeoutStopSec=30s
+StandardOutput=journal
+StandardError=journal
+MemoryMax=2G
+
+[Install]
+WantedBy=default.target

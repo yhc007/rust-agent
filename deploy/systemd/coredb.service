@@ -1,0 +1,42 @@
+# CoreDB Cassandra-compatible NoSQL server (native_server example).
+#
+# user-mode unit. Install + enable:
+#   mkdir -p ~/.config/systemd/user
+#   cp rust-agent/deploy/systemd/coredb.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now coredb.service
+#
+# Logs land in journald — view live with `journalctl --user -u coredb -f`.
+# Rotation is global to journald; cap user-journal size by editing
+# /etc/systemd/journald.conf (SystemMaxUse=/SystemMaxFileSize=) or per-
+# invocation with `journalctl --user --vacuum-size=500M`.
+#
+# Requires the operator to have built the example binary once:
+#   cd ~/workHard/coredb && cargo build --release --example native_server
+#
+# Replace ABSOLUTE_WORKSPACE_PATH below with the real path to the
+# workspace root before installing.
+
+[Unit]
+Description=CoreDB Cassandra-compatible single-node server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/workHard/coredb
+ExecStart=%h/workHard/coredb/target/release/examples/native_server
+Restart=on-failure
+RestartSec=5s
+# 30 s flush + Ctrl+C-equivalent SIGTERM lets the example's shutdown
+# hook drain its memtable to SSTable before exit. Don't kill harder.
+KillSignal=SIGTERM
+TimeoutStopSec=60s
+StandardOutput=journal
+StandardError=journal
+# Defensive: cap memory usage and let oom-killer hit this unit before
+# anything else. native_server is single-process; tune for your box.
+MemoryMax=4G
+
+[Install]
+WantedBy=default.target
