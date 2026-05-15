@@ -24,11 +24,15 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
 use ratatui::Terminal;
 
+use crate::coredb::agreement::AgreementRepo;
 use crate::coredb::btc::BtcTickRepo;
 use crate::coredb::decisions::DecisionRepo;
 use crate::coredb::orders::PositionRepo;
 use crate::coredb::strategy_pnl::StrategyPnlRepo;
-use crate::coredb::types::{bucket_day, now_ms, BtcTick, Decision, Millis, Position, StrategyPnlSnapshot};
+use crate::coredb::types::{
+    bucket_day, now_ms, AgreementSnapshot, BtcTick, Decision, Millis, Position,
+    StrategyPnlSnapshot,
+};
 use crate::coredb::CoreDb;
 
 const REFRESH_EVERY: Duration = Duration::from_secs(5);
@@ -41,6 +45,13 @@ const RECENT_DECISIONS: usize = 15;
 /// accumulation. One unicode block per snapshot — column width is the
 /// same number of cells.
 const SPARK_WIDTH: usize = 24;
+
+/// Width of the narrower agreement-rate sparkline that lives in the
+/// strategy-pnl panel. Smaller than SPARK_WIDTH because the panel is
+/// already wide and the agreement series is bounded [0,1] — the value
+/// is more about smoothness than amplitude, so fewer samples still
+/// convey the trend.
+const AGREE_SPARK_WIDTH: usize = 14;
 
 pub async fn run(
     coredb_uri: &str,
@@ -55,6 +66,7 @@ pub async fn run(
     let dec_repo = DecisionRepo::new(db.session()).await?;
     let pos_repo = PositionRepo::new(db.session()).await?;
     let pnl_repo = StrategyPnlRepo::new(db.session()).await?;
+    let agree_repo = AgreementRepo::new(db.session()).await?;
 
     // Short-timeout HTTP client for the daemon's /health endpoint.
     // Built once and reused across refreshes — keep-alive matters
@@ -83,6 +95,7 @@ pub async fn run(
         &dec_repo,
         &pos_repo,
         &pnl_repo,
+        &agree_repo,
         health_url.as_deref(),
         health_client.as_ref(),
         pnl_days,
@@ -103,12 +116,13 @@ async fn main_loop(
     dec_repo: &DecisionRepo,
     pos_repo: &PositionRepo,
     pnl_repo: &StrategyPnlRepo,
+    agree_repo: &AgreementRepo,
     health_url: Option<&str>,
     health_client: Option<&reqwest::Client>,
     pnl_days: u32,
 ) -> Result<()> {
     let mut snapshot = fetch_snapshot(
-        btc_repo, dec_repo, pos_repo, pnl_repo, health_url, health_client, pnl_days,
+        btc_repo, dec_repo, pos_repo, pnl_repo, agree_repo, health_url, health_client, pnl_days,
     )
     .await;
     let mut last_refresh = Instant::now();
@@ -138,7 +152,7 @@ async fn main_loop(
                     KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
                     KeyCode::Char('r') => {
                         snapshot = fetch_snapshot(
-                            btc_repo, dec_repo, pos_repo, pnl_repo, health_url, health_client,
+                            btc_repo, dec_repo, pos_repo, pnl_repo, agree_repo, health_url, health_client,
                             pnl_days,
                         )
                         .await;
@@ -164,7 +178,7 @@ async fn main_loop(
         // Auto-refresh on the cadence.
         if last_refresh.elapsed() >= REFRESH_EVERY {
             snapshot = fetch_snapshot(
-                btc_repo, dec_repo, pos_repo, pnl_repo, health_url, health_client, pnl_days,
+                btc_repo, dec_repo, pos_repo, pnl_repo, agree_repo, health_url, health_client, pnl_days,
             )
             .await;
             last_refresh = Instant::now();
@@ -182,6 +196,7 @@ struct Snapshot {
     positions: Vec<Position>,
     decisions: Vec<Decision>,
     snapshots: Vec<StrategyPnlSnapshot>,
+    agreements: Vec<AgreementSnapshot>,
     consensus: Vec<MarketConsensus>,
     /// Result of the most recent /health probe. `None` when the
     /// dashboard wasn't started with --health-url. Otherwise carries
@@ -315,6 +330,7 @@ async fn fetch_snapshot(
     dec: &DecisionRepo,
     pos: &PositionRepo,
     pnl: &StrategyPnlRepo,
+    agree: &AgreementRepo,
     health_url: Option<&str>,
     health_client: Option<&reqwest::Client>,
     pnl_days: u32,
@@ -354,6 +370,14 @@ async fn fetch_snapshot(
         match pnl.list_day(day_bd).await {
             Ok(v) => s.snapshots.extend(v),
             Err(e) => s.errors.push(format!("strategy_pnl.list_day({day_bd}): {e}")),
+        }
+        // Agreement snapshots share the same window — same partition
+        // shape (`bucket_day`), populated by the same compare-pnl
+        // run, so reading them together keeps the panel's per-row
+        // trend self-consistent with its pnl trend.
+        match agree.list_day(day_bd).await {
+            Ok(v) => s.agreements.extend(v),
+            Err(e) => s.errors.push(format!("agreement.list_day({day_bd}): {e}")),
         }
     }
     s.consensus = build_consensus(&s.decisions);
@@ -482,6 +506,54 @@ fn strategies_in_view(snapshot: &Snapshot) -> Vec<String> {
         seen.insert(d.effective_strategy().to_string());
     }
     seen.into_iter().collect()
+}
+
+/// For each strategy, build a ts-sorted series of mean pairwise
+/// agreement rates against every other strategy at that ts.
+///
+/// Why mean: agreement is a per-pair quantity, but the strategy-pnl
+/// panel renders one row per strategy. The natural per-strategy
+/// aggregation is "average of every pair I participate in" — it
+/// answers "how aligned is this strategy with the room?" in a single
+/// scalar without losing the pair-wise data (which still lives in
+/// `agreement_snapshots` for the `agreement-history` command).
+///
+/// Output is `strategy → Vec<rate>`, ts-sorted. Empty input → empty
+/// output. Skipped pairs (`shared == 0`) contribute 0.0 via
+/// `AgreementSnapshot::rate` — these are degenerate-but-existing
+/// snapshot rows and including them keeps the timestamp denominator
+/// consistent across strategies.
+fn per_strategy_agree_series(
+    agreements: &[AgreementSnapshot],
+) -> std::collections::HashMap<String, Vec<f64>> {
+    use std::collections::HashMap;
+    // (strategy, ts) → Vec<rate>. Each entry captures every
+    // pair-rate this strategy participated in at this ts.
+    let mut per_strat_ts: HashMap<(String, i64), Vec<f64>> = HashMap::new();
+    for a in agreements {
+        per_strat_ts
+            .entry((a.strategy_a.clone(), a.ts_ms))
+            .or_default()
+            .push(a.rate());
+    }
+    // Collapse the inner Vec to a mean, then re-key by strategy.
+    let mut per_strat: HashMap<String, Vec<(i64, f64)>> = HashMap::new();
+    for ((strat, ts), rates) in per_strat_ts {
+        let mean = if rates.is_empty() {
+            0.0
+        } else {
+            rates.iter().sum::<f64>() / rates.len() as f64
+        };
+        per_strat.entry(strat).or_default().push((ts, mean));
+    }
+    // Sort each series by ts ascending, then drop the timestamp —
+    // the sparkline renderer doesn't need it.
+    let mut out: HashMap<String, Vec<f64>> = HashMap::new();
+    for (strat, mut series) in per_strat {
+        series.sort_by_key(|(ts, _)| *ts);
+        out.insert(strat, series.into_iter().map(|(_, r)| r).collect());
+    }
+    out
 }
 
 fn ts_span_label(snapshots: &[StrategyPnlSnapshot]) -> String {
@@ -789,8 +861,13 @@ fn draw_strategy_pnl(f: &mut ratatui::Frame, area: Rect, s: &Snapshot) {
     let mut keys: Vec<_> = by_strategy.keys().cloned().collect();
     keys.sort();
 
+    // Per-strategy mean pairwise agreement series — sourced from the
+    // same time window as the pnl snapshots above. Computed once
+    // outside the row loop so each strategy's lookup is O(1).
+    let agree_series = per_strategy_agree_series(&s.agreements);
+
     let header = Row::new([
-        "strategy", "ts (UTC)", "decisions", "YES", "NO", "PASS", "Σ size", "Σ pnl", "trend",
+        "strategy", "ts (UTC)", "decisions", "YES", "NO", "PASS", "Σ size", "Σ pnl", "pnl trend", "agree",
     ])
     .style(Style::default().add_modifier(Modifier::BOLD));
     let mut rows: Vec<Row> = Vec::new();
@@ -816,6 +893,26 @@ fn draw_strategy_pnl(f: &mut ratatui::Frame, area: Rect, s: &Snapshot) {
             .into_iter()
             .rev()
             .collect();
+        // Agreement sparkline: take last AGREE_SPARK_WIDTH samples
+        // (ts-ascending) from this strategy's series. Empty Vec for
+        // single-strategy runs (nothing to compare against) renders
+        // as a blank cell — sparkline() returns "" for empty input.
+        let agrees: Vec<f64> = agree_series
+            .get(k)
+            .map(|v| {
+                v.iter()
+                    .rev()
+                    .take(AGREE_SPARK_WIDTH)
+                    .copied()
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect()
+            })
+            .unwrap_or_default();
+        // Color the agreement sparkline cyan to visually separate it
+        // from the green/red pnl sparkline next to it.
+        let agree_style = Style::default().fg(Color::Cyan);
         rows.push(Row::new(vec![
             Cell::from(latest.strategy.clone()),
             Cell::from(ts),
@@ -826,6 +923,7 @@ fn draw_strategy_pnl(f: &mut ratatui::Frame, area: Rect, s: &Snapshot) {
             Cell::from(format!("${:.2}", latest.sum_size_usd)),
             Cell::from(Span::styled(format!("${:+.2}", latest.sum_pnl), pnl_style)),
             Cell::from(Span::styled(sparkline(&pnls), pnl_style)),
+            Cell::from(Span::styled(sparkline(&agrees), agree_style)),
         ]));
     }
     // Compute the actual ts span of the snapshots we have so the
@@ -849,6 +947,7 @@ fn draw_strategy_pnl(f: &mut ratatui::Frame, area: Rect, s: &Snapshot) {
         Constraint::Length(12),
         Constraint::Length(12),
         Constraint::Length(SPARK_WIDTH as u16),
+        Constraint::Length(AGREE_SPARK_WIDTH as u16),
     ];
     let table = Table::new(rows, widths)
         .header(header)
@@ -1333,6 +1432,61 @@ mod tests {
     fn strategies_in_view_empty_when_no_data() {
         let s = super::Snapshot::default();
         assert!(super::strategies_in_view(&s).is_empty());
+    }
+
+    fn ag(a: &str, b: &str, ts: i64, shared: i32, matches: i32) -> crate::coredb::types::AgreementSnapshot {
+        crate::coredb::types::AgreementSnapshot {
+            bucket_day_ms: 0,
+            ts_ms: ts,
+            strategy_a: a.into(),
+            strategy_b: b.into(),
+            shared,
+            matches,
+        }
+    }
+
+    #[test]
+    fn per_strategy_agree_series_empty_input() {
+        let out = super::per_strategy_agree_series(&[]);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn per_strategy_agree_series_means_pair_rates_at_each_ts() {
+        // 3-strategy snapshot at ts=10: baseline vs deepseek 50%,
+        // baseline vs llm 100%, deepseek vs llm 0%.
+        // baseline's mean = (0.5 + 1.0) / 2 = 0.75
+        // deepseek's mean = (0.5 + 0.0) / 2 = 0.25
+        // llm's mean      = (1.0 + 0.0) / 2 = 0.5
+        let rows = vec![
+            ag("baseline", "deepseek", 10, 10, 5),
+            ag("deepseek", "baseline", 10, 10, 5),
+            ag("baseline", "llm", 10, 10, 10),
+            ag("llm", "baseline", 10, 10, 10),
+            ag("deepseek", "llm", 10, 10, 0),
+            ag("llm", "deepseek", 10, 10, 0),
+        ];
+        let out = super::per_strategy_agree_series(&rows);
+        assert!((out["baseline"][0] - 0.75).abs() < 1e-9);
+        assert!((out["deepseek"][0] - 0.25).abs() < 1e-9);
+        assert!((out["llm"][0] - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn per_strategy_agree_series_ts_sorted_ascending() {
+        // Insert ts out of order; the output series must be ascending.
+        let rows = vec![
+            ag("baseline", "deepseek", 30, 10, 6),
+            ag("baseline", "deepseek", 10, 10, 2),
+            ag("baseline", "deepseek", 20, 10, 4),
+        ];
+        let out = super::per_strategy_agree_series(&rows);
+        let series = &out["baseline"];
+        assert_eq!(series.len(), 3);
+        // Rates: 0.2 → 0.4 → 0.6 strictly increasing iff ts-sorted.
+        for w in series.windows(2) {
+            assert!(w[0] < w[1], "expected ascending, got {series:?}");
+        }
     }
 
     #[test]
