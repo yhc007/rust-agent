@@ -94,6 +94,12 @@ enum Commands {
     Stats {
         #[arg(long, default_value = "127.0.0.1:9042")]
         coredb_uri: String,
+        /// Emit one JSON object to stdout instead of the human-
+        /// readable list. Same data, jq-friendly — round out the
+        /// polymarket_btc suite so cron-driven row-count monitors
+        /// can scrape without text parsing.
+        #[arg(long)]
+        json: bool,
     },
     /// Run a decision pass over every open BTC market in CoreDB,
     /// recording one decision per market. Default uses the deterministic
@@ -381,8 +387,8 @@ async fn main() -> Result<()> {
         Some(Commands::Ingest { coredb_uri }) => {
             data::ingest::run(&coredb_uri).await?;
         }
-        Some(Commands::Stats { coredb_uri }) => {
-            run_stats(coredb_uri).await?;
+        Some(Commands::Stats { coredb_uri, json }) => {
+            run_stats(coredb_uri, json).await?;
         }
         Some(Commands::Backtest { coredb_uri, llm, both, llms, execute, live }) => {
             let plan = if !llms.is_empty() {
@@ -799,14 +805,36 @@ async fn run_task(config: Config, model: String, task: String) -> Result<()> {
     Ok(())
 }
 
-async fn run_stats(coredb_uri: String) -> Result<()> {
+async fn run_stats(coredb_uri: String, json: bool) -> Result<()> {
     let db = coredb::CoreDb::connect(&coredb_uri).await?;
     let counts = db.count_rows().await?;
+    let total: i64 = counts.iter().map(|(_, n)| n).sum();
+
+    if json {
+        // Stable shape: { tables: [{ name, n }, ...], total }.
+        // Sorted by name so multi-run diffs are clean — CoreDB
+        // already returns rows in TABLES-list order but a Vec is
+        // less fragile to depend on than CoreDB internals.
+        let mut rows: Vec<_> = counts.iter().cloned().collect();
+        rows.sort_by(|a, b| a.0.cmp(&b.0));
+        let payload = serde_json::json!({
+            "tables": rows
+                .iter()
+                .map(|(name, n)| serde_json::json!({"name": name, "n": n}))
+                .collect::<Vec<_>>(),
+            "total": total,
+        });
+        match serde_json::to_string_pretty(&payload) {
+            Ok(s) => println!("{s}"),
+            Err(e) => eprintln!("stats: serialize JSON failed: {e}"),
+        }
+        return Ok(());
+    }
+
     println!("📊 CoreDB polymarket_btc row counts:");
     for (t, n) in &counts {
         println!("   {t:<20} {n}");
     }
-    let total: i64 = counts.iter().map(|(_, n)| n).sum();
     println!("   {:<20} {}", "Σ", total);
     Ok(())
 }
