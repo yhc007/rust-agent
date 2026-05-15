@@ -1775,36 +1775,28 @@ mod tests {
         super::cycle_strategy(&s, current, step)
     }
 
-    /// Snapshot test: render a synthetic Snapshot into a
-    /// TestBackend buffer and assert key layout invariants are
-    /// present. Catches accidental column-width drift, panel
-    /// reordering, or header label changes via `cargo test`
-    /// instead of leaving them for the operator to spot.
-    ///
-    /// What's tested:
-    ///   - Each panel's title text appears (header / strategy pnl /
-    ///     consensus / positions / decisions / footer).
-    ///   - Strategy-pnl column headers are all present in the
-    ///     expected dashboard width.
-    ///   - When a filter is active, the agree column header
-    ///     switches to "vs <focused>" and the focused strategy's
-    ///     row gets the ▶ marker.
-    ///
-    /// What's NOT tested:
-    ///   - Exact column widths / character positions (too brittle).
-    ///   - Sparkline glyphs (depend on input values).
-    ///   - Colors / styles (TestBackend ignores style for symbol
-    ///     extraction).
-    #[test]
-    fn dashboard_layout_snapshot() {
+    // ---- Snapshot tests ---------------------------------------------------
+    //
+    // Each test calls `render_test_dashboard(filter)` to get a string dump
+    // of the full dashboard rendered with a deterministic synthetic
+    // Snapshot, then asserts the narrow slice of invariants relevant to
+    // one panel. Splitting by panel means a regression's failing test
+    // name points at the broken panel — `panel_consensus_renders_picks`
+    // failing is unambiguously a consensus issue, not a footer-line drift
+    // that got rolled into one all-in-one assertion.
+
+    /// Render the full dashboard with a fixed synthetic Snapshot and
+    /// return the visible character buffer as a newline-separated
+    /// string. Sized 140×35 so every column fits without truncation.
+    /// PnL values are picked so one strategy is positive and one
+    /// negative — exercises both coloring branches without making
+    /// the test brittle to amplitude.
+    fn render_test_dashboard(filter: Option<&str>) -> String {
         use crate::coredb::types::{BtcTick, StrategyPnlSnapshot};
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
         use std::time::Duration;
 
-        // Build a deterministic Snapshot. Numbers are picked so the
-        // PnL coloring branches don't matter (one positive, one
-        // negative) and the agree column has something to render.
         let mut s = super::Snapshot::default();
         s.btc = Some(BtcTick {
             bucket_hour_ms: 0,
@@ -1841,7 +1833,6 @@ mod tests {
         ];
 
         let strategies = super::strategies_in_view(&s);
-        // Big enough to fit every column without truncation.
         let backend = TestBackend::new(140, 35);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
@@ -1852,46 +1843,105 @@ mod tests {
                     Duration::from_millis(0),
                     Duration::from_secs(42),
                     &strategies,
-                    Some("deepseek"),
+                    filter,
                 )
             })
             .unwrap();
+        render_buffer(terminal.backend().buffer())
+    }
 
-        let dump = render_buffer(terminal.backend().buffer());
-
-        // Panel titles
+    #[test]
+    fn panel_header_renders_dashboard_title() {
+        let dump = render_test_dashboard(None);
         assert!(dump.contains("rust-agent dashboard"), "header title missing");
-        assert!(dump.contains("strategy pnl"), "strategy-pnl panel missing");
-        assert!(dump.contains("market consensus"), "consensus panel missing");
-        assert!(dump.contains("positions"), "positions panel missing");
-        assert!(dump.contains("decisions"), "decisions panel missing");
+        // BTC price formatting — pinned at .2 precision per draw_header.
+        assert!(
+            dump.contains("$  79123.45"),
+            "BTC price missing or mis-formatted; got dump:\n{dump}"
+        );
+    }
 
-        // Strategy-pnl column headers
+    #[test]
+    fn panel_strategy_pnl_has_all_column_headers() {
+        let dump = render_test_dashboard(None);
+        assert!(dump.contains("strategy pnl"), "strategy-pnl title missing");
         for label in [
             "strategy", "ts (UTC)", "decisions", "YES", "NO", "PASS",
-            "Σ size", "Σ pnl", "pnl trend",
+            "Σ size", "Σ pnl", "pnl trend", "agree",
         ] {
             assert!(
                 dump.contains(label),
-                "strategy-pnl header `{label}` missing from dump:\n{dump}"
+                "strategy-pnl column header `{label}` missing"
             );
         }
+    }
 
-        // Filter is "deepseek" — agree column header must be the
-        // narrowed form, and the deepseek row must carry the ▶ marker.
+    #[test]
+    fn panel_strategy_pnl_filter_changes_header_and_marker() {
+        let dump = render_test_dashboard(Some("deepseek"));
+        // Agree column header switches when filter is active.
         assert!(
             dump.contains("vs deepseek"),
             "expected `vs deepseek` header under active filter"
         );
+        // Focused row gets the ▶ marker.
         assert!(
             dump.contains("▶deepseek"),
             "expected ▶deepseek row marker under active filter"
         );
+        // The unfiltered case must NOT have "vs " in it (sanity-
+        // check on the dynamic-header logic in the opposite
+        // direction). The consensus panel uses plain "agree" as a
+        // column name in both cases, so we don't try to assert
+        // its absence — only check that the filtered prefix
+        // doesn't leak into the no-filter render.
+        let plain_dump = render_test_dashboard(None);
+        assert!(
+            !plain_dump.contains("vs "),
+            "`vs ` leaked into no-filter render"
+        );
+    }
 
-        // Footer hotkey hints
-        assert!(dump.contains("[q]/Esc quit"));
-        assert!(dump.contains("[+/-] cycle"));
-        assert!(dump.contains("filter:"));
+    #[test]
+    fn panel_consensus_title_present() {
+        let dump = render_test_dashboard(None);
+        assert!(
+            dump.contains("market consensus"),
+            "consensus panel title missing"
+        );
+    }
+
+    #[test]
+    fn panel_positions_title_present() {
+        let dump = render_test_dashboard(None);
+        assert!(
+            dump.contains("positions"),
+            "positions panel title missing"
+        );
+    }
+
+    #[test]
+    fn panel_decisions_title_present() {
+        let dump = render_test_dashboard(None);
+        assert!(
+            dump.contains("decisions today"),
+            "decisions panel title missing"
+        );
+    }
+
+    #[test]
+    fn panel_footer_renders_hotkey_chips() {
+        let dump = render_test_dashboard(None);
+        // Hardcoded hint line — survives any reorder of subsequent
+        // rendered lines because we only check substrings.
+        assert!(dump.contains("[q]/Esc quit"), "quit chip missing");
+        assert!(dump.contains("[r] refresh"), "refresh chip missing");
+        assert!(dump.contains("filter:"), "filter prefix missing");
+        assert!(dump.contains("[+/-] cycle"), "cycle hint missing");
+        // Digit chips for the two strategies present in the snapshot.
+        assert!(dump.contains("[1] baseline"));
+        assert!(dump.contains("[2] deepseek"));
+        assert!(dump.contains("[0/c] all"));
     }
 
     /// Render a ratatui [`Buffer`] to a newline-separated string by
