@@ -169,6 +169,17 @@ async fn main_loop(
                             strategy_filter = Some(name.clone());
                         }
                     }
+                    // +/- cycle through the filter states as a single
+                    // cycle:  None → strategies[0] → strategies[1] → …
+                    //  → strategies[N-1] → None → …
+                    // Useful when N exceeds the 9-digit hotkey range.
+                    // No-op when the strategy list is empty.
+                    KeyCode::Char('+') | KeyCode::Char('=') => {
+                        strategy_filter = cycle_strategy(&strategies, strategy_filter.as_deref(), 1);
+                    }
+                    KeyCode::Char('-') | KeyCode::Char('_') => {
+                        strategy_filter = cycle_strategy(&strategies, strategy_filter.as_deref(), -1);
+                    }
                     _ => {}
                 },
                 _ => {}
@@ -506,6 +517,48 @@ fn strategies_in_view(snapshot: &Snapshot) -> Vec<String> {
         seen.insert(d.effective_strategy().to_string());
     }
     seen.into_iter().collect()
+}
+
+/// Cycle the strategy filter forward (`step = 1`) or backward
+/// (`step = -1`) through the cached strategy list. `None` is part
+/// of the cycle (meaning "show all"), so the order is:
+///   None → strategies[0] → strategies[1] → … → strategies[N-1] → None
+///
+/// Returns `None` when `strategies` is empty so the operator's
+/// keystroke is a no-op against a freshly-launched DB with no data.
+/// Returning early in that case also avoids modulus-by-zero math.
+///
+/// A current filter that's no longer in the list (the strategy
+/// dropped out between refreshes) is treated as if `None` was
+/// selected — keeps the UI predictable when the underlying data
+/// shifts.
+fn cycle_strategy(
+    strategies: &[String],
+    current: Option<&str>,
+    step: i32,
+) -> Option<String> {
+    if strategies.is_empty() {
+        return None;
+    }
+    // Map None to position N (one past the end); the cycle has
+    // length N+1 with None as the "wrap" slot.
+    let len = strategies.len();
+    let cur_pos: usize = match current {
+        Some(name) => strategies
+            .iter()
+            .position(|s| s == name)
+            .unwrap_or(len),
+        None => len,
+    };
+    // Modulo arithmetic in the (N+1)-cycle. Cast to i64 first to
+    // avoid usize underflow on `step = -1` when `cur_pos = 0`.
+    let n_plus_1 = (len + 1) as i64;
+    let next = (cur_pos as i64 + step as i64).rem_euclid(n_plus_1);
+    if next as usize == len {
+        None
+    } else {
+        Some(strategies[next as usize].clone())
+    }
 }
 
 /// For each strategy, build a ts-sorted series of mean pairwise
@@ -1148,6 +1201,10 @@ fn draw_footer(
         } else {
             Span::raw(clear_label)
         });
+        // Compact cycle-key hint at the line end — useful when N
+        // strategies > 9 and the digit hotkeys can't reach all of
+        // them. No highlighting since these are stateless keys.
+        spans.push(Span::raw("  [+/-] cycle"));
         lines.push(Line::from(spans));
     }
 
@@ -1498,6 +1555,54 @@ mod tests {
         s.decisions.push(d);
         let v = super::strategies_in_view(&s);
         assert_eq!(v, vec!["baseline"]);
+    }
+
+    fn cycle(strategies: &[&str], current: Option<&str>, step: i32) -> Option<String> {
+        let s: Vec<String> = strategies.iter().map(|x| (*x).to_string()).collect();
+        super::cycle_strategy(&s, current, step)
+    }
+
+    #[test]
+    fn cycle_strategy_empty_list_is_no_op() {
+        assert_eq!(cycle(&[], None, 1), None);
+        assert_eq!(cycle(&[], Some("baseline"), 1), None);
+        assert_eq!(cycle(&[], None, -1), None);
+    }
+
+    #[test]
+    fn cycle_strategy_forward_from_none_picks_first() {
+        assert_eq!(cycle(&["a", "b", "c"], None, 1).as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn cycle_strategy_forward_wraps_to_none_after_last() {
+        assert_eq!(cycle(&["a", "b"], Some("a"), 1).as_deref(), Some("b"));
+        // After the last strategy, +1 wraps back to None.
+        assert_eq!(cycle(&["a", "b"], Some("b"), 1), None);
+        // And from None we go to the first again.
+        assert_eq!(cycle(&["a", "b"], None, 1).as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn cycle_strategy_backward_from_none_picks_last() {
+        assert_eq!(cycle(&["a", "b", "c"], None, -1).as_deref(), Some("c"));
+    }
+
+    #[test]
+    fn cycle_strategy_backward_wraps() {
+        // From first → -1 → None.
+        assert_eq!(cycle(&["a", "b"], Some("a"), -1), None);
+        // None → -1 → last.
+        assert_eq!(cycle(&["a", "b"], None, -1).as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn cycle_strategy_stale_filter_treated_as_none() {
+        // Filter selected a strategy that no longer appears in the
+        // list (e.g. snapshot data shifted). +1 should jump to the
+        // first strategy — not panic on missing index lookup.
+        assert_eq!(cycle(&["a", "b"], Some("gone"), 1).as_deref(), Some("a"));
+        assert_eq!(cycle(&["a", "b"], Some("gone"), -1).as_deref(), Some("b"));
     }
 
     #[test]
