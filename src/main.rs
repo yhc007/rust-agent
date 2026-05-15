@@ -218,6 +218,13 @@ enum Commands {
     SettlePnl {
         #[arg(long, default_value = "127.0.0.1:9042")]
         coredb_uri: String,
+        /// Emit one JSON object to stdout instead of the human-
+        /// readable table. Same data, jq-friendly. The
+        /// `pnl_daily_written` field signals whether the
+        /// `pnl_daily` upsert actually fired (false when no orders
+        /// settled yet — re-run after market resolution).
+        #[arg(long)]
+        json: bool,
     },
     /// Dump every row in `polymarket_btc.positions_v2`, newest first.
     /// The headless analogue of the dashboard's positions panel.
@@ -405,8 +412,8 @@ async fn main() -> Result<()> {
             let filter = if strategies.is_empty() { None } else { Some(strategies) };
             backtest::agreement_history::run(&coredb_uri, filter.as_deref(), days, json).await?;
         }
-        Some(Commands::SettlePnl { coredb_uri }) => {
-            backtest::settle::run(&coredb_uri).await?;
+        Some(Commands::SettlePnl { coredb_uri, json }) => {
+            backtest::settle::run(&coredb_uri, json).await?;
         }
         Some(Commands::Positions { coredb_uri }) => {
             run_positions(&coredb_uri).await?;

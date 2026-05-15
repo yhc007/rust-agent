@@ -19,6 +19,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use reqwest::Client;
+use serde::Serialize;
 use uuid::Uuid;
 
 use crate::coredb::decisions::DecisionRepo;
@@ -27,8 +28,11 @@ use crate::coredb::pnl::PnlRepo;
 use crate::coredb::types::{bucket_day, now_ms, PnlDaily};
 use crate::coredb::CoreDb;
 
-pub async fn run(coredb_uri: &str) -> Result<()> {
-    println!("⚖️  settle-pnl: connecting to CoreDB at {coredb_uri}");
+pub async fn run(coredb_uri: &str, json: bool) -> Result<()> {
+    macro_rules! say {
+        ($($t:tt)*) => { if !json { println!($($t)*); } };
+    }
+    say!("⚖️  settle-pnl: connecting to CoreDB at {coredb_uri}");
     let db = CoreDb::connect(coredb_uri).await.context("connect coredb")?;
     let order_repo = OrderRepo::new(db.session()).await?;
     let dec_repo = DecisionRepo::new(db.session()).await?;
@@ -36,8 +40,22 @@ pub async fn run(coredb_uri: &str) -> Result<()> {
 
     let bd = bucket_day(now_ms());
     let orders = order_repo.list_day(bd).await.context("read orders")?;
-    println!("   {} orders for bucket_day = {} (UTC ms)", orders.len(), bd);
+    say!("   {} orders for bucket_day = {} (UTC ms)", orders.len(), bd);
     if orders.is_empty() {
+        if json {
+            // Stable shape even when there's nothing to settle —
+            // mirrors the empty-input behavior of compare-pnl --json.
+            print_json_payload(JsonOut {
+                bucket_day_ms: bd,
+                n_orders: 0,
+                n_settled: 0,
+                n_unresolved: 0,
+                realized_pnl_total: 0.0,
+                strategies: Vec::new(),
+                pnl_daily_written: false,
+            });
+            return Ok(());
+        }
         println!(
             "   (no orders to settle — run `backtest --execute` first to populate.)"
         );
@@ -58,9 +76,9 @@ pub async fn run(coredb_uri: &str) -> Result<()> {
         .timeout(Duration::from_secs(15))
         .build()
         .context("reqwest client")?;
-    println!("🌐 settle-pnl: pulling resolved markets from Polymarket Gamma");
+    say!("🌐 settle-pnl: pulling resolved markets from Polymarket Gamma");
     let resolved = fetch_resolved_markets(&http).await?;
-    println!("   {} resolved markets visible", resolved.len());
+    say!("   {} resolved markets visible", resolved.len());
 
     let mut by_strategy: HashMap<String, StrategyTotal> = HashMap::new();
     let mut realized_total = 0.0;
@@ -94,34 +112,53 @@ pub async fn run(coredb_uri: &str) -> Result<()> {
         }
     }
 
-    println!("\n⚖️  Realized PnL — bucket_day = {bd} (UTC ms)");
-    println!(
-        "   {:<10} {:>10} {:>10} {:>11} {:>12}",
-        "strategy", "n_orders", "settled", "unresolved", "realized $"
-    );
     let mut keys: Vec<_> = by_strategy.keys().cloned().collect();
     keys.sort();
-    for k in &keys {
-        let t = &by_strategy[k];
+    if !json {
+        println!("\n⚖️  Realized PnL — bucket_day = {bd} (UTC ms)");
         println!(
             "   {:<10} {:>10} {:>10} {:>11} {:>12}",
-            k,
-            t.n_orders,
-            t.n_settled,
-            t.n_unresolved,
-            format!("${:+.2}", t.realized_pnl)
+            "strategy", "n_orders", "settled", "unresolved", "realized $"
+        );
+        for k in &keys {
+            let t = &by_strategy[k];
+            println!(
+                "   {:<10} {:>10} {:>10} {:>11} {:>12}",
+                k,
+                t.n_orders,
+                t.n_settled,
+                t.n_unresolved,
+                format!("${:+.2}", t.realized_pnl)
+            );
+        }
+        println!(
+            "   {:<10} {:>10} {:>10} {:>11} {:>12}",
+            "TOTAL",
+            orders.len(),
+            n_settled,
+            n_unresolved,
+            format!("${:+.2}", realized_total)
         );
     }
-    println!(
-        "   {:<10} {:>10} {:>10} {:>11} {:>12}",
-        "TOTAL",
-        orders.len(),
-        n_settled,
-        n_unresolved,
-        format!("${:+.2}", realized_total)
-    );
 
     if n_settled == 0 {
+        if json {
+            // Emit the payload even with zero settled rows so the
+            // operator's `jq` chain doesn't have to special-case
+            // "markets still open" — `pnl_daily_written: false`
+            // is the structural signal.
+            print_json_payload(build_json_payload(
+                bd,
+                &orders,
+                n_settled,
+                n_unresolved,
+                realized_total,
+                &keys,
+                &by_strategy,
+                /* pnl_daily_written = */ false,
+            ));
+            return Ok(());
+        }
         println!(
             "\n   (no orders settled yet — markets are still open. Re-run after resolution.)"
         );
@@ -139,10 +176,23 @@ pub async fn run(coredb_uri: &str) -> Result<()> {
         .upsert(&row)
         .await
         .context("pnl_daily.upsert")?;
-    println!(
+    say!(
         "\n   ✓ upserted polymarket_btc.pnl_daily for day {bd}: realized={:+.2}, n_trades={}",
         realized_total, n_settled
     );
+
+    if json {
+        print_json_payload(build_json_payload(
+            bd,
+            &orders,
+            n_settled,
+            n_unresolved,
+            realized_total,
+            &keys,
+            &by_strategy,
+            /* pnl_daily_written = */ true,
+        ));
+    }
     Ok(())
 }
 
@@ -152,6 +202,79 @@ struct StrategyTotal {
     n_settled: u32,
     n_unresolved: u32,
     realized_pnl: f64,
+}
+
+// ---- JSON output --------------------------------------------------
+
+#[derive(Serialize)]
+struct JsonOut {
+    bucket_day_ms: i64,
+    /// Total orders read from the bucket_day partition.
+    n_orders: usize,
+    /// Subset whose market was resolved at scrape time.
+    n_settled: i32,
+    /// Subset whose market is still open (unresolved). Sum of
+    /// `n_settled + n_unresolved` is `n_orders` minus any orders
+    /// that didn't appear in the resolved feed but also weren't
+    /// counted as unresolved (currently none — every order goes
+    /// into one bucket).
+    n_unresolved: u32,
+    realized_pnl_total: f64,
+    /// Per-strategy roll-up, sorted by strategy name for stable JSON.
+    strategies: Vec<JsonStrategyAggregate>,
+    /// Whether settle-pnl wrote a row to `polymarket_btc.pnl_daily`
+    /// this run. `false` when zero orders settled — the caller is
+    /// expected to retry post-resolution.
+    pnl_daily_written: bool,
+}
+
+#[derive(Serialize)]
+struct JsonStrategyAggregate {
+    strategy: String,
+    n_orders: u32,
+    n_settled: u32,
+    n_unresolved: u32,
+    realized_pnl: f64,
+}
+
+fn build_json_payload(
+    bd: i64,
+    orders: &[crate::coredb::types::Order],
+    n_settled: i32,
+    n_unresolved: u32,
+    realized_total: f64,
+    keys: &[String],
+    by_strategy: &HashMap<String, StrategyTotal>,
+    pnl_daily_written: bool,
+) -> JsonOut {
+    JsonOut {
+        bucket_day_ms: bd,
+        n_orders: orders.len(),
+        n_settled,
+        n_unresolved,
+        realized_pnl_total: realized_total,
+        strategies: keys
+            .iter()
+            .map(|k| {
+                let t = &by_strategy[k];
+                JsonStrategyAggregate {
+                    strategy: k.clone(),
+                    n_orders: t.n_orders,
+                    n_settled: t.n_settled,
+                    n_unresolved: t.n_unresolved,
+                    realized_pnl: t.realized_pnl,
+                }
+            })
+            .collect(),
+        pnl_daily_written,
+    }
+}
+
+fn print_json_payload(payload: JsonOut) {
+    match serde_json::to_string_pretty(&payload) {
+        Ok(s) => println!("{s}"),
+        Err(e) => eprintln!("settle-pnl: serialize JSON failed: {e}"),
+    }
 }
 
 /// Pull every recently-closed market from Polymarket Gamma. Returns a
