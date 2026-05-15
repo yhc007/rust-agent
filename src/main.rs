@@ -181,6 +181,11 @@ enum Commands {
         /// one day are logged but don't abort the rest of the window.
         #[arg(long, default_value_t = 1)]
         days: u32,
+        /// Emit one JSON object to stdout instead of the human-
+        /// readable table. Same data, jq-friendly. Composes with
+        /// --strategies / --days.
+        #[arg(long)]
+        json: bool,
     },
     /// Dump strategy PnL snapshots from CoreDB as a time series.
     /// Default scans today only; use `--days N` to widen the window
@@ -201,6 +206,11 @@ enum Commands {
         /// day don't abort the rest.
         #[arg(long, default_value_t = 1)]
         days: u32,
+        /// Emit one JSON object to stdout instead of the human-
+        /// readable table. Same data, jq-friendly. Composes with
+        /// --strategies / --days.
+        #[arg(long)]
+        json: bool,
     },
     /// Settle today's orders against Polymarket's resolved markets.
     /// Computes realized PnL per order, aggregates per strategy, and
@@ -387,13 +397,13 @@ async fn main() -> Result<()> {
             let filter = if strategies.is_empty() { None } else { Some(strategies) };
             backtest::compare::run(&coredb_uri, filter.as_deref(), days, json).await?;
         }
-        Some(Commands::PnlHistory { coredb_uri, strategies, days }) => {
+        Some(Commands::PnlHistory { coredb_uri, strategies, days, json }) => {
             let filter = if strategies.is_empty() { None } else { Some(strategies) };
-            backtest::history::run(&coredb_uri, filter.as_deref(), days).await?;
+            backtest::history::run(&coredb_uri, filter.as_deref(), days, json).await?;
         }
-        Some(Commands::AgreementHistory { coredb_uri, strategies, days }) => {
+        Some(Commands::AgreementHistory { coredb_uri, strategies, days, json }) => {
             let filter = if strategies.is_empty() { None } else { Some(strategies) };
-            backtest::agreement_history::run(&coredb_uri, filter.as_deref(), days).await?;
+            backtest::agreement_history::run(&coredb_uri, filter.as_deref(), days, json).await?;
         }
         Some(Commands::SettlePnl { coredb_uri }) => {
             backtest::settle::run(&coredb_uri).await?;

@@ -11,6 +11,7 @@
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+use serde::Serialize;
 
 use crate::coredb::agreement::AgreementRepo;
 use crate::coredb::types::{bucket_day, now_ms, AgreementSnapshot, Millis};
@@ -22,9 +23,13 @@ pub async fn run(
     coredb_uri: &str,
     strategies_filter: Option<&[String]>,
     days: u32,
+    json: bool,
 ) -> Result<()> {
     let days = days.max(1);
-    println!("🧩 agreement-history: connecting to CoreDB at {coredb_uri}");
+    macro_rules! say {
+        ($($t:tt)*) => { if !json { println!($($t)*); } };
+    }
+    say!("🧩 agreement-history: connecting to CoreDB at {coredb_uri}");
     let db = CoreDb::connect(coredb_uri).await.context("connect coredb")?;
     let repo = AgreementRepo::new(db.session()).await?;
 
@@ -52,14 +57,14 @@ pub async fn run(
         }
     }
     if days > 1 {
-        println!(
+        say!(
             "   spanning {} UTC days: {} → {} (today)",
             days,
             buckets.first().copied().unwrap_or(0),
             today,
         );
         if empty_days > 0 {
-            println!("   {empty_days} of {days} days had no snapshots");
+            say!("   {empty_days} of {days} days had no snapshots");
         }
     }
 
@@ -68,19 +73,43 @@ pub async fn run(
     // strategies — a row qualifies iff *both* endpoints are in the
     // allow-list so the displayed series is fully self-consistent
     // (no half-truths where one side was filtered out).
-    let pre_filter = rows.len();
+    let pre_filter_pairs = rows.len() / 2.max(1);
     rows.retain(|r| r.strategy_a < r.strategy_b);
+    let after_triangle = rows.len();
     if let Some(allow) = strategies_filter {
         let set: std::collections::HashSet<&str> = allow.iter().map(String::as_str).collect();
         rows.retain(|r| set.contains(r.strategy_a.as_str()) && set.contains(r.strategy_b.as_str()));
-        println!(
+        say!(
             "   filter: {} → {} rows (strategies allowed: {})",
-            pre_filter / 2.max(1),
+            pre_filter_pairs,
             rows.len(),
             allow.join(", "),
         );
     }
-    println!("   {} snapshot rows total", rows.len());
+    say!("   {} snapshot rows total", rows.len());
+
+    // Sort once so JSON + text share ordering.
+    rows.sort_by(|a, b| {
+        a.ts_ms
+            .cmp(&b.ts_ms)
+            .then_with(|| a.strategy_a.cmp(&b.strategy_a))
+            .then_with(|| a.strategy_b.cmp(&b.strategy_b))
+    });
+
+    if json {
+        print_json_payload(JsonOut {
+            days,
+            bucket_days: buckets,
+            filter: JsonFilter {
+                strategies: strategies_filter.map(|s| s.to_vec()),
+            },
+            n_total: pre_filter_pairs,
+            n_after_filter: rows.len(),
+            empty_days,
+            snapshots: rows.iter().map(JsonSnapshot::from).collect(),
+        });
+        return Ok(());
+    }
 
     if rows.is_empty() {
         let hint = if strategies_filter.is_some() {
@@ -91,6 +120,7 @@ pub async fn run(
         println!("{hint}");
         return Ok(());
     }
+    let _ = after_triangle; // surfaced via n_total above; text path doesn't need it
 
     println!();
     let multi_day = days > 1;
@@ -122,4 +152,59 @@ pub async fn run(
         );
     }
     Ok(())
+}
+
+// ---- JSON output --------------------------------------------------
+
+#[derive(Serialize)]
+struct JsonOut {
+    days: u32,
+    bucket_days: Vec<Millis>,
+    filter: JsonFilter,
+    /// Count of distinct (ts, pair) entries in the window *after*
+    /// the upper-triangle filter (so each pair shows up once per ts)
+    /// but *before* the optional `--strategies` allow-list.
+    n_total: usize,
+    /// Same count after the allow-list. Equal to `n_total` when no
+    /// filter is in play.
+    n_after_filter: usize,
+    empty_days: u32,
+    snapshots: Vec<JsonSnapshot>,
+}
+
+#[derive(Serialize)]
+struct JsonFilter {
+    strategies: Option<Vec<String>>,
+}
+
+#[derive(Serialize)]
+struct JsonSnapshot {
+    bucket_day_ms: Millis,
+    ts_ms: Millis,
+    strategy_a: String,
+    strategy_b: String,
+    shared: i32,
+    matches: i32,
+    rate: f64,
+}
+
+impl From<&AgreementSnapshot> for JsonSnapshot {
+    fn from(s: &AgreementSnapshot) -> Self {
+        Self {
+            bucket_day_ms: s.bucket_day_ms,
+            ts_ms: s.ts_ms,
+            strategy_a: s.strategy_a.clone(),
+            strategy_b: s.strategy_b.clone(),
+            shared: s.shared,
+            matches: s.matches,
+            rate: s.rate(),
+        }
+    }
+}
+
+fn print_json_payload(payload: JsonOut) {
+    match serde_json::to_string_pretty(&payload) {
+        Ok(s) => println!("{s}"),
+        Err(e) => eprintln!("agreement-history: serialize JSON failed: {e}"),
+    }
 }

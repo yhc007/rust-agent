@@ -5,6 +5,7 @@
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+use serde::Serialize;
 
 use crate::coredb::strategy_pnl::StrategyPnlRepo;
 use crate::coredb::types::{bucket_day, now_ms, Millis, StrategyPnlSnapshot};
@@ -16,9 +17,13 @@ pub async fn run(
     coredb_uri: &str,
     strategies_filter: Option<&[String]>,
     days: u32,
+    json: bool,
 ) -> Result<()> {
     let days = days.max(1);
-    println!("📈 pnl-history: connecting to CoreDB at {coredb_uri}");
+    macro_rules! say {
+        ($($t:tt)*) => { if !json { println!($($t)*); } };
+    }
+    say!("📈 pnl-history: connecting to CoreDB at {coredb_uri}");
     let db = CoreDb::connect(coredb_uri).await.context("connect coredb")?;
     let repo = StrategyPnlRepo::new(db.session()).await?;
 
@@ -53,7 +58,7 @@ pub async fn run(
         }
     }
     if days > 1 {
-        println!(
+        say!(
             "   spanning {} UTC days ({} ms steps): {} → {} (today)",
             days,
             DAY_MS,
@@ -61,7 +66,7 @@ pub async fn run(
             today,
         );
         if empty_days > 0 {
-            println!("   {empty_days} of {days} days had no snapshots");
+            say!("   {empty_days} of {days} days had no snapshots");
         }
     }
 
@@ -69,7 +74,7 @@ pub async fn run(
     if let Some(allow) = strategies_filter {
         let set: std::collections::HashSet<&str> = allow.iter().map(String::as_str).collect();
         snapshots.retain(|s| set.contains(s.strategy.as_str()));
-        println!(
+        say!(
             "   filter: {} → {} snapshots ({} strategies allowed: {})",
             pre_filter,
             snapshots.len(),
@@ -77,7 +82,27 @@ pub async fn run(
             allow.join(", "),
         );
     }
-    println!("   {} snapshots total", snapshots.len());
+    say!("   {} snapshots total", snapshots.len());
+
+    // Always sort ascending so the JSON path and the text path
+    // share identical ordering — JSON consumers can rely on the
+    // series being chronological without re-sorting.
+    snapshots.sort_by_key(|s| s.ts_ms);
+
+    if json {
+        print_json_payload(JsonOut {
+            days,
+            bucket_days: buckets,
+            filter: JsonFilter {
+                strategies: strategies_filter.map(|s| s.to_vec()),
+            },
+            n_total: pre_filter,
+            n_after_filter: snapshots.len(),
+            empty_days,
+            snapshots: snapshots.iter().map(JsonSnapshot::from).collect(),
+        });
+        return Ok(());
+    }
 
     if snapshots.is_empty() {
         let hint = if strategies_filter.is_some() {
@@ -89,10 +114,8 @@ pub async fn run(
         return Ok(());
     }
 
-    // Sort ascending across the whole window. Within a single day the
-    // CQL response order is already roughly ts-ascending, but spanning
-    // multiple days requires a global sort so the trend is monotonic.
-    snapshots.sort_by_key(|s| s.ts_ms);
+    // (Sort already happened above so the JSON and text paths share
+    // ordering — see the `--json` branch.)
 
     println!();
     // Wider timestamp column when spanning multiple days — fall back
@@ -131,4 +154,69 @@ pub async fn run(
     }
 
     Ok(())
+}
+
+// ---- JSON output --------------------------------------------------
+
+#[derive(Serialize)]
+struct JsonOut {
+    days: u32,
+    /// Each bucket_day_ms in the window, oldest first. `len()` ==
+    /// `days` even when individual partitions came back empty so a
+    /// downstream consumer can spot gaps.
+    bucket_days: Vec<Millis>,
+    filter: JsonFilter,
+    /// Snapshot count across the window before `--strategies` filter.
+    n_total: usize,
+    /// Snapshot count after filter. Equal to `n_total` when no
+    /// filter was passed.
+    n_after_filter: usize,
+    /// Number of `bucket_days` that returned zero rows. Useful for
+    /// "is my cron actually running?" sanity checks.
+    empty_days: u32,
+    /// Time-series rows, ts-ascending. Empty when no data fell into
+    /// the chosen window — the wrapper still emits with all the
+    /// metadata so downstream scripts don't have to special-case.
+    snapshots: Vec<JsonSnapshot>,
+}
+
+#[derive(Serialize)]
+struct JsonFilter {
+    strategies: Option<Vec<String>>,
+}
+
+#[derive(Serialize)]
+struct JsonSnapshot {
+    bucket_day_ms: Millis,
+    ts_ms: Millis,
+    strategy: String,
+    n_decisions: i32,
+    n_yes: i32,
+    n_no: i32,
+    n_pass: i32,
+    sum_size_usd: f64,
+    sum_pnl: f64,
+}
+
+impl From<&StrategyPnlSnapshot> for JsonSnapshot {
+    fn from(s: &StrategyPnlSnapshot) -> Self {
+        Self {
+            bucket_day_ms: s.bucket_day_ms,
+            ts_ms: s.ts_ms,
+            strategy: s.strategy.clone(),
+            n_decisions: s.n_decisions,
+            n_yes: s.n_yes,
+            n_no: s.n_no,
+            n_pass: s.n_pass,
+            sum_size_usd: s.sum_size_usd,
+            sum_pnl: s.sum_pnl,
+        }
+    }
+}
+
+fn print_json_payload(payload: JsonOut) {
+    match serde_json::to_string_pretty(&payload) {
+        Ok(s) => println!("{s}"),
+        Err(e) => eprintln!("pnl-history: serialize JSON failed: {e}"),
+    }
 }
