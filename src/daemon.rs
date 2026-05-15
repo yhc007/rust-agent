@@ -241,6 +241,13 @@ pub async fn run(cfg: DaemonConfig) -> Result<()> {
     // only when APPLY_FILLS=1 is also exported (defense-in-depth:
     // first stand it up observation-only, eyeball the payloads,
     // then opt into mutation).
+    // systemd watchdog: if WATCHDOG_USEC is set in env (which it is
+    // iff the unit declared WatchdogSec=), spawn a task that pings
+    // sd_notify(WATCHDOG=1) at half that interval. If the tokio
+    // runtime ever deadlocks, the pings stop and systemd restarts
+    // the unit. No-op for non-systemd invocations.
+    let h_watchdog = spawn_watchdog(shutdown_rx.clone());
+
     let h_user_channel = match load_clob_creds_from_env() {
         Some(creds) => {
             health.write().await.user_channel_present = true;
@@ -370,6 +377,13 @@ pub async fn run(cfg: DaemonConfig) -> Result<()> {
     };
 
     info!("daemon: all subtasks spawned; awaiting Ctrl+C");
+    // Tell systemd we're ready. No-op when not under systemd
+    // (NOTIFY_SOCKET is unset). Must come *after* listeners are up
+    // so a `systemctl --user start --wait` actually waits for the
+    // service to be operational, not just for `daemon` to fork.
+    if let Err(e) = sd_notify::notify(false, &[sd_notify::NotifyState::Ready]) {
+        warn!("daemon: sd_notify(READY=1) failed: {e}");
+    }
     signal::ctrl_c().await.context("install Ctrl+C handler")?;
     info!("daemon: Ctrl+C received; broadcasting shutdown");
     let _ = shutdown_tx.send(true);
@@ -385,8 +399,59 @@ pub async fn run(cfg: DaemonConfig) -> Result<()> {
     if let Some(h) = h_health {
         let _ = h.await;
     }
+    if let Some(h) = h_watchdog {
+        let _ = h.await;
+    }
+    // STOPPING=1 lets systemd distinguish a clean shutdown from a
+    // crash; helps `systemctl --user status` show the right state.
+    let _ = sd_notify::notify(false, &[sd_notify::NotifyState::Stopping]);
     info!("daemon: clean exit");
     Ok(())
+}
+
+/// Spawn the systemd watchdog pinger if `WATCHDOG_USEC` is in env
+/// (i.e. the unit declared `WatchdogSec=`). Returns `None` when not
+/// running under systemd / watchdog disabled, so the daemon path is
+/// free of any sd-notify dependency outside of unit-managed runs.
+///
+/// Pings at half the configured watchdog interval — the canonical
+/// safety margin from `man sd_watchdog_enabled(3)`. If the tokio
+/// runtime ever deadlocks, this task can't run, pings stop, and
+/// systemd restarts the unit per its `Restart=` policy.
+fn spawn_watchdog(
+    mut shutdown: watch::Receiver<bool>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let mut usec = 0u64;
+    if !sd_notify::watchdog_enabled(false, &mut usec) {
+        return None;
+    }
+    // sd_notify returns microseconds; ping at half that, with a floor
+    // of 1 s so a misconfigured 100ms watchdog doesn't pin a CPU.
+    let interval = Duration::from_micros(usec / 2).max(Duration::from_secs(1));
+    info!(
+        "daemon: systemd watchdog enabled (WatchdogSec={}us, pinging every {:?})",
+        usec, interval
+    );
+    Some(tokio::spawn(async move {
+        let mut tick = tokio::time::interval(interval);
+        tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                biased;
+                _ = shutdown.changed() => {
+                    if *shutdown.borrow() {
+                        info!("daemon[watchdog]: shutdown");
+                        return;
+                    }
+                }
+                _ = tick.tick() => {
+                    if let Err(e) = sd_notify::notify(false, &[sd_notify::NotifyState::Watchdog]) {
+                        warn!("daemon[watchdog]: notify failed: {e}");
+                    }
+                }
+            }
+        }
+    }))
 }
 
 #[derive(Clone)]
@@ -558,5 +623,19 @@ mod tests {
         assert!(h.backtest.last_tick_ms.is_some());
         assert!(h.compare.last_tick_ms.is_some());
         assert!(h.settle.last_tick_ms.is_some());
+    }
+
+    /// Watchdog must be a no-op when running outside systemd (no
+    /// WATCHDOG_USEC env). The function returns `None` so the daemon
+    /// doesn't spawn a pinger task that would just churn errors.
+    #[tokio::test]
+    async fn watchdog_disabled_returns_none_without_env() {
+        // Some test runners propagate systemd vars from the parent;
+        // remove them explicitly so this test is hermetic.
+        std::env::remove_var("WATCHDOG_USEC");
+        std::env::remove_var("WATCHDOG_PID");
+        let (_tx, rx) = watch::channel(false);
+        let h = spawn_watchdog(rx);
+        assert!(h.is_none(), "watchdog should be disabled without WATCHDOG_USEC");
     }
 }

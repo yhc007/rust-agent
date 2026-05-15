@@ -99,6 +99,10 @@ hmac = "0.12"
 sha2 = "0.10"
 base64 = "0.22"
 
+# systemd notification protocol (READY=1 / WATCHDOG=1). No-op when
+# NOTIFY_SOCKET is unset, so non-systemd invocations are unaffected.
+sd-notify = "0.4"
+
 [dev-dependencies]
 tokio-test = "0.4"
 tempfile = "3"

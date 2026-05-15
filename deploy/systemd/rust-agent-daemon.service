@@ -29,7 +29,17 @@ Wants=network-online.target
 Requires=coredb.service
 
 [Service]
-Type=simple
+# `notify` instead of `simple` so systemd waits for the daemon's
+# READY=1 sd_notify call before unblocking dependents and considers
+# the service operational. The matching WatchdogSec below makes
+# systemd kill + restart the unit if the daemon's tokio runtime
+# deadlocks (the watchdog task can't ping in that case).
+Type=notify
+# Half this value is what the daemon's watchdog task pings at, so
+# 60s gives roughly 30s of slack before a missed ping triggers a
+# restart. Tune higher on slow boxes where a periodic backtest
+# could legitimately starve other tasks for >30s.
+WatchdogSec=60s
 WorkingDirectory=%h/workHard/rust-agent
 # Secrets in this env file: DEEPSEEK_API_KEY, ANTHROPIC_API_KEY,
 # POLYMARKET_CLOB_API_KEY / _SECRET / _PASSPHRASE,
