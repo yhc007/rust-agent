@@ -1033,8 +1033,33 @@ fn draw_strategy_pnl(
     // all-pairs signal so it stays interpretable.
     let agree_series = per_strategy_agree_series_filtered(&s.agreements, strategy_filter);
 
-    let header = Row::new([
-        "strategy", "ts (UTC)", "decisions", "YES", "NO", "PASS", "Σ size", "Σ pnl", "pnl trend", "agree",
+    // Last column label tracks the active filter: when no filter is
+    // set, the agree sparkline is mean-across-all-pairs and "agree"
+    // is the right label. With a filter active the series narrows
+    // (see per_strategy_agree_series_filtered) so "vs <name>" tells
+    // the operator what the column actually measures without
+    // re-reading the docstring. Truncates if the strategy name is
+    // too long to fit alongside "vs " in AGREE_SPARK_WIDTH chars.
+    let agree_header: String = match strategy_filter {
+        None => "agree".to_string(),
+        Some(name) => {
+            let prefix = "vs ";
+            let max_name = AGREE_SPARK_WIDTH.saturating_sub(prefix.chars().count());
+            let truncated: String = name.chars().take(max_name).collect();
+            format!("{prefix}{truncated}")
+        }
+    };
+    let header = Row::new(vec![
+        Cell::from("strategy"),
+        Cell::from("ts (UTC)"),
+        Cell::from("decisions"),
+        Cell::from("YES"),
+        Cell::from("NO"),
+        Cell::from("PASS"),
+        Cell::from("Σ size"),
+        Cell::from("Σ pnl"),
+        Cell::from("pnl trend"),
+        Cell::from(agree_header),
     ])
     .style(Style::default().add_modifier(Modifier::BOLD));
     let mut rows: Vec<Row> = Vec::new();
