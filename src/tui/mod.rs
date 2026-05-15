@@ -760,13 +760,18 @@ fn draw(
 
     draw_header(f, chunks[0], s, snap_age, uptime);
     draw_strategy_pnl(f, chunks[1], s, strategy_filter);
-    draw_consensus(f, chunks[2], s);
+    draw_consensus(f, chunks[2], s, strategy_filter);
     draw_positions(f, chunks[3], s);
     draw_decisions(f, chunks[4], s, strategy_filter);
     draw_footer(f, chunks[5], s, strategies, strategy_filter);
 }
 
-fn draw_consensus(f: &mut ratatui::Frame, area: Rect, s: &Snapshot) {
+fn draw_consensus(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    s: &Snapshot,
+    strategy_filter: Option<&str>,
+) {
     let header = Row::new(["market_slug", "agree", "picks", "Σ size"])
         .style(Style::default().add_modifier(Modifier::BOLD));
     let rows: Vec<Row> = s
@@ -774,19 +779,37 @@ fn draw_consensus(f: &mut ratatui::Frame, area: Rect, s: &Snapshot) {
         .iter()
         .take(usize::from(area.height.saturating_sub(3)))
         .map(|c| {
-            // "baseline=YES  llm=NO  anthropic=YES (+1 pass)" — short
-            // enough to fit a wide terminal, truncates naturally when
-            // the cell renders. PASS counts surface even though they
-            // aren't in active_picks because that's the difference
-            // between "solo opinion vs. nobody else looked" and
-            // "solo opinion vs. everyone else explicitly stayed out".
-            let mut picks: Vec<String> = c
-                .active_picks
-                .iter()
-                .map(|(strat, side)| format!("{strat}={side}"))
-                .collect();
+            // "baseline=YES  llm=NO  anthropic=YES (+1 pass)" rendered
+            // as a Vec<Span> instead of a flat String so we can paint
+            // the filtered strategy's chip with the same cyan
+            // background as the strategy-pnl row + footer hotkey
+            // chip. PASS counts surface even though they aren't in
+            // active_picks because that's the difference between
+            // "solo opinion vs. nobody else looked" and "solo
+            // opinion vs. everyone else explicitly stayed out".
+            let mut spans: Vec<Span> = Vec::new();
+            let highlight = Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD);
+            let mut first = true;
+            for (strat, side) in &c.active_picks {
+                if !first {
+                    spans.push(Span::raw("  "));
+                }
+                first = false;
+                let label = format!("{strat}={side}");
+                if strategy_filter == Some(strat.as_str()) {
+                    spans.push(Span::styled(label, highlight));
+                } else {
+                    spans.push(Span::raw(label));
+                }
+            }
             if c.pass_strategies > 0 {
-                picks.push(format!("(+{} PASS)", c.pass_strategies));
+                if !first {
+                    spans.push(Span::raw("  "));
+                }
+                spans.push(Span::raw(format!("(+{} PASS)", c.pass_strategies)));
             }
             let agree_cell = Span::styled(
                 c.agreement.short_label(),
@@ -795,7 +818,7 @@ fn draw_consensus(f: &mut ratatui::Frame, area: Rect, s: &Snapshot) {
             Row::new(vec![
                 Cell::from(c.market_slug.clone()),
                 Cell::from(agree_cell),
-                Cell::from(picks.join("  ")),
+                Cell::from(Line::from(spans)),
                 Cell::from(format!("${:.2}", c.sum_size_usd)),
             ])
         })
