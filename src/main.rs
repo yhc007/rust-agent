@@ -183,6 +183,12 @@ enum Commands {
     Dashboard {
         #[arg(long, default_value = "127.0.0.1:9042")]
         coredb_uri: String,
+        /// Optional daemon /health URL to probe each refresh. When
+        /// set, the header gains a colored chip (ok/degraded/
+        /// unreachable) plus a one-line detail summary. Typical
+        /// value: `http://127.0.0.1:9099/health`.
+        #[arg(long)]
+        health_url: Option<String>,
     },
     /// Run the Polymarket CLOB L1 handshake against
     /// `POST https://clob.polymarket.com/auth/api-key` using
@@ -328,8 +334,8 @@ async fn main() -> Result<()> {
         Some(Commands::UserChannel { coredb_uri }) => {
             run_user_channel(coredb_uri).await?;
         }
-        Some(Commands::Dashboard { coredb_uri }) => {
-            tui::run(&coredb_uri).await?;
+        Some(Commands::Dashboard { coredb_uri, health_url }) => {
+            tui::run(&coredb_uri, health_url).await?;
         }
         Some(Commands::ClobAuth {}) => {
             run_clob_auth().await?;

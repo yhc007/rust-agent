@@ -42,7 +42,7 @@ const RECENT_DECISIONS: usize = 15;
 /// same number of cells.
 const SPARK_WIDTH: usize = 24;
 
-pub async fn run(coredb_uri: &str) -> Result<()> {
+pub async fn run(coredb_uri: &str, health_url: Option<String>) -> Result<()> {
     let db = CoreDb::connect(coredb_uri)
         .await
         .with_context(|| format!("connect coredb at {coredb_uri}"))?;
@@ -50,6 +50,18 @@ pub async fn run(coredb_uri: &str) -> Result<()> {
     let dec_repo = DecisionRepo::new(db.session()).await?;
     let pos_repo = PositionRepo::new(db.session()).await?;
     let pnl_repo = StrategyPnlRepo::new(db.session()).await?;
+
+    // Short-timeout HTTP client for the daemon's /health endpoint.
+    // Built once and reused across refreshes — keep-alive matters
+    // because the dashboard hits the endpoint every REFRESH_EVERY.
+    // Constructed only when --health-url is set so paper-only setups
+    // don't pay the connection cost.
+    let health_client = health_url.as_ref().map(|_| {
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .expect("reqwest client")
+    });
 
     enable_raw_mode().context("enable raw_mode")?;
     let mut stdout = io::stdout();
@@ -66,6 +78,8 @@ pub async fn run(coredb_uri: &str) -> Result<()> {
         &dec_repo,
         &pos_repo,
         &pnl_repo,
+        health_url.as_deref(),
+        health_client.as_ref(),
     )
     .await;
 
@@ -83,8 +97,13 @@ async fn main_loop(
     dec_repo: &DecisionRepo,
     pos_repo: &PositionRepo,
     pnl_repo: &StrategyPnlRepo,
+    health_url: Option<&str>,
+    health_client: Option<&reqwest::Client>,
 ) -> Result<()> {
-    let mut snapshot = fetch_snapshot(btc_repo, dec_repo, pos_repo, pnl_repo).await;
+    let mut snapshot = fetch_snapshot(
+        btc_repo, dec_repo, pos_repo, pnl_repo, health_url, health_client,
+    )
+    .await;
     let mut last_refresh = Instant::now();
 
     loop {
@@ -102,7 +121,10 @@ async fn main_loop(
                 Event::Key(k) if k.kind == KeyEventKind::Press => match k.code {
                     KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
                     KeyCode::Char('r') => {
-                        snapshot = fetch_snapshot(btc_repo, dec_repo, pos_repo, pnl_repo).await;
+                        snapshot = fetch_snapshot(
+                            btc_repo, dec_repo, pos_repo, pnl_repo, health_url, health_client,
+                        )
+                        .await;
                         last_refresh = Instant::now();
                     }
                     _ => {}
@@ -113,7 +135,10 @@ async fn main_loop(
 
         // Auto-refresh on the cadence.
         if last_refresh.elapsed() >= REFRESH_EVERY {
-            snapshot = fetch_snapshot(btc_repo, dec_repo, pos_repo, pnl_repo).await;
+            snapshot = fetch_snapshot(
+                btc_repo, dec_repo, pos_repo, pnl_repo, health_url, health_client,
+            )
+            .await;
             last_refresh = Instant::now();
         }
     }
@@ -130,7 +155,78 @@ struct Snapshot {
     decisions: Vec<Decision>,
     snapshots: Vec<StrategyPnlSnapshot>,
     consensus: Vec<MarketConsensus>,
+    /// Result of the most recent /health probe. `None` when the
+    /// dashboard wasn't started with --health-url. Otherwise carries
+    /// a parsed result *or* an "unreachable" marker so the header
+    /// chip can distinguish "configured but failing" from "off".
+    health: Option<HealthChip>,
     errors: Vec<String>,
+}
+
+/// Reduced view of the daemon /health response — just enough to
+/// render the header chip and (optionally) one tooltip line below it.
+#[derive(Debug, Clone)]
+struct HealthChip {
+    status: HealthStatus,
+    /// `Some(seconds)` when /health replied with a usable status
+    /// payload; `None` when the probe failed (connection refused,
+    /// timeout, bad JSON, ...).
+    daemon_uptime_secs: Option<i64>,
+    /// Free-form one-liner used in the secondary header row. Captures
+    /// either the worst subtask's error or the unreachable reason.
+    detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HealthStatus {
+    Ok,
+    Degraded,
+    Unreachable,
+}
+
+impl HealthStatus {
+    fn label(self) -> &'static str {
+        match self {
+            HealthStatus::Ok => " ok ",
+            HealthStatus::Degraded => " degraded ",
+            HealthStatus::Unreachable => " unreachable ",
+        }
+    }
+    fn color(self) -> Color {
+        match self {
+            HealthStatus::Ok => Color::Green,
+            HealthStatus::Degraded => Color::Yellow,
+            HealthStatus::Unreachable => Color::Red,
+        }
+    }
+}
+
+/// Subset of the daemon's HealthResponse we parse for chip rendering.
+/// Stays decoupled from `daemon::HealthResponse` on purpose: the wire
+/// format is the integration contract; the dashboard binds to that,
+/// not to internal Rust types that might churn.
+#[derive(Debug, serde::Deserialize)]
+struct HealthWire {
+    status: String,
+    uptime_secs: i64,
+    #[serde(default)]
+    backtest: HealthSubtaskWire,
+    #[serde(default)]
+    compare: HealthSubtaskWire,
+    #[serde(default)]
+    settle: HealthSubtaskWire,
+    #[serde(default)]
+    ingest_btc_age_ms: Option<i64>,
+    #[serde(default)]
+    ingest_polymarket_age_ms: Option<i64>,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+struct HealthSubtaskWire {
+    #[serde(default)]
+    consecutive_errors: u32,
+    #[serde(default)]
+    last_error: Option<String>,
 }
 
 /// Per-market view of how the active strategies voted today. The
@@ -191,6 +287,8 @@ async fn fetch_snapshot(
     dec: &DecisionRepo,
     pos: &PositionRepo,
     pnl: &StrategyPnlRepo,
+    health_url: Option<&str>,
+    health_client: Option<&reqwest::Client>,
 ) -> Snapshot {
     let mut s = Snapshot::default();
     match btc.latest("BTCUSDT").await {
@@ -220,7 +318,103 @@ async fn fetch_snapshot(
         Err(e) => s.errors.push(format!("strategy_pnl.list_day: {e}")),
     }
     s.consensus = build_consensus(&s.decisions);
+    if let (Some(url), Some(client)) = (health_url, health_client) {
+        s.health = Some(fetch_health(client, url).await);
+    }
     s
+}
+
+/// Hit the daemon /health endpoint once and reduce the response to a
+/// [`HealthChip`]. Any non-2xx, timeout, connection error, or JSON
+/// parse error collapses into an Unreachable chip with the reason in
+/// `detail` — the operator should be able to tell *why* the dashboard
+/// can't reach the daemon without dropping to a terminal.
+async fn fetch_health(client: &reqwest::Client, url: &str) -> HealthChip {
+    let resp = match client.get(url).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            return HealthChip {
+                status: HealthStatus::Unreachable,
+                daemon_uptime_secs: None,
+                detail: Some(format!("GET failed: {}", short_err(&e.to_string()))),
+            };
+        }
+    };
+    if !resp.status().is_success() {
+        return HealthChip {
+            status: HealthStatus::Unreachable,
+            daemon_uptime_secs: None,
+            detail: Some(format!("HTTP {}", resp.status().as_u16())),
+        };
+    }
+    let body: HealthWire = match resp.json().await {
+        Ok(b) => b,
+        Err(e) => {
+            return HealthChip {
+                status: HealthStatus::Unreachable,
+                daemon_uptime_secs: None,
+                detail: Some(format!("bad JSON: {}", short_err(&e.to_string()))),
+            };
+        }
+    };
+    let status = match body.status.as_str() {
+        "ok" => HealthStatus::Ok,
+        _ => HealthStatus::Degraded,
+    };
+    let detail = if status == HealthStatus::Ok {
+        // Healthy path: include a compact ingest-age summary instead
+        // of the worst-error line so the dashboard surfaces actionable
+        // info even when nothing is broken yet.
+        match (body.ingest_btc_age_ms, body.ingest_polymarket_age_ms) {
+            (Some(b), Some(p)) => Some(format!("btc {}ms / poly {}ms", b, p)),
+            _ => None,
+        }
+    } else {
+        // Degraded path: pick the worst subtask's error message — the
+        // one most likely to explain why status flipped. Falls back to
+        // stale ingest if every subtask is fine.
+        worst_subtask_error(&body).or_else(|| {
+            match (body.ingest_btc_age_ms, body.ingest_polymarket_age_ms) {
+                (None, _) => Some("btc ingest unreachable".into()),
+                (_, None) => Some("polymarket ingest unreachable".into()),
+                (Some(b), Some(p)) => Some(format!("ingest stale: btc {}ms / poly {}ms", b, p)),
+            }
+        })
+    };
+    HealthChip {
+        status,
+        daemon_uptime_secs: Some(body.uptime_secs),
+        detail,
+    }
+}
+
+fn worst_subtask_error(body: &HealthWire) -> Option<String> {
+    let candidates = [
+        ("backtest", &body.backtest),
+        ("compare", &body.compare),
+        ("settle", &body.settle),
+    ];
+    let worst = candidates
+        .iter()
+        .filter(|(_, s)| s.consecutive_errors > 0)
+        .max_by_key(|(_, s)| s.consecutive_errors)?;
+    let (label, sub) = worst;
+    let msg = sub.last_error.as_deref().unwrap_or("(no message)");
+    Some(format!(
+        "{}: {}× — {}",
+        label,
+        sub.consecutive_errors,
+        short_err(msg)
+    ))
+}
+
+fn short_err(s: &str) -> String {
+    const MAX: usize = 80;
+    if s.chars().count() <= MAX {
+        s.to_string()
+    } else {
+        s.chars().take(MAX).collect::<String>() + "…"
+    }
 }
 
 /// Group today's decisions per market and classify cross-strategy
@@ -423,7 +617,7 @@ fn draw_header(
     snap_age: Duration,
     uptime: Duration,
 ) {
-    let btc_line = match &s.btc {
+    let btc_text = match &s.btc {
         Some(t) => {
             let age_ms = now_ms() - t.ts_ms;
             format!(
@@ -433,16 +627,45 @@ fn draw_header(
         }
         None => "BTC: (no cached tick)".to_string(),
     };
-    let meta = format!(
+    // First line: BTC stats + (optional) colored daemon health chip.
+    // The chip lives on the right side of the same line so the
+    // operator's eye lands on it in the same glance as BTC spot.
+    let mut first_line: Vec<Span> = vec![
+        Span::styled(btc_text, Style::default().add_modifier(Modifier::BOLD)),
+    ];
+    if let Some(chip) = &s.health {
+        first_line.push(Span::raw("   "));
+        first_line.push(Span::styled(
+            format!("daemon:{}", chip.status.label()),
+            Style::default()
+                .fg(Color::Black)
+                .bg(chip.status.color())
+                .add_modifier(Modifier::BOLD),
+        ));
+        if let Some(uptime) = chip.daemon_uptime_secs {
+            first_line.push(Span::raw(format!(
+                " up {}",
+                fmt_dur(Duration::from_secs(uptime.max(0) as u64))
+            )));
+        }
+    }
+
+    // Second line: the existing local-snapshot / uptime meta, plus
+    // the health-chip's detail string when present so a "degraded"
+    // chip is actionable without dropping to journalctl.
+    let mut meta = format!(
         "snap {:>4} ms ago   uptime {}",
         snap_age.as_millis(),
         fmt_dur(uptime)
     );
-    let para = Paragraph::new(vec![
-        Line::from(Span::styled(btc_line, Style::default().add_modifier(Modifier::BOLD))),
-        Line::from(meta),
-    ])
-    .block(Block::default().borders(Borders::ALL).title(" rust-agent dashboard "));
+    if let Some(chip) = &s.health {
+        if let Some(detail) = &chip.detail {
+            meta.push_str("   ");
+            meta.push_str(detail);
+        }
+    }
+    let para = Paragraph::new(vec![Line::from(first_line), Line::from(meta)])
+        .block(Block::default().borders(Borders::ALL).title(" rust-agent dashboard "));
     f.render_widget(para, area);
 }
 
@@ -687,6 +910,7 @@ fn fmt_dur(d: Duration) -> String {
 mod tests {
     use super::{build_consensus, sparkline, AgreementKind};
     use crate::coredb::types::Decision;
+    use ratatui::style::Color;
     use uuid::Uuid;
 
     fn dec(slug: &str, strategy: &str, side: &str, size: f64, ts: i64) -> Decision {
@@ -833,6 +1057,59 @@ mod tests {
         assert_eq!(c[0].active_picks.get("baseline").map(String::as_str), Some("NO"));
         // size should reflect the latest baseline row, not the first.
         assert!((c[0].sum_size_usd - 17.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn health_worst_subtask_picks_max_consecutive_errors() {
+        let body = super::HealthWire {
+            status: "degraded".into(),
+            uptime_secs: 100,
+            backtest: super::HealthSubtaskWire { consecutive_errors: 1, last_error: Some("a".into()) },
+            compare: super::HealthSubtaskWire { consecutive_errors: 5, last_error: Some("worst".into()) },
+            settle: super::HealthSubtaskWire { consecutive_errors: 3, last_error: Some("c".into()) },
+            ingest_btc_age_ms: Some(100),
+            ingest_polymarket_age_ms: Some(200),
+        };
+        let msg = super::worst_subtask_error(&body).unwrap();
+        assert!(msg.starts_with("compare: 5×"), "got: {msg}");
+        assert!(msg.contains("worst"), "got: {msg}");
+    }
+
+    #[test]
+    fn health_worst_returns_none_when_all_healthy() {
+        let body = super::HealthWire {
+            status: "ok".into(),
+            uptime_secs: 0,
+            backtest: super::HealthSubtaskWire::default(),
+            compare: super::HealthSubtaskWire::default(),
+            settle: super::HealthSubtaskWire::default(),
+            ingest_btc_age_ms: Some(100),
+            ingest_polymarket_age_ms: Some(200),
+        };
+        assert!(super::worst_subtask_error(&body).is_none());
+    }
+
+    #[test]
+    fn short_err_truncates_long_strings() {
+        let long = "x".repeat(200);
+        let s = super::short_err(&long);
+        // 80-char cap + ellipsis.
+        assert!(s.chars().count() <= 81, "got {} chars", s.chars().count());
+        assert!(s.ends_with('…'));
+    }
+
+    #[test]
+    fn short_err_keeps_short_strings_intact() {
+        assert_eq!(super::short_err("hello"), "hello");
+    }
+
+    #[test]
+    fn health_status_label_and_color() {
+        // Just lock in the mapping — if someone reorders the enum
+        // we want the chip colors to stay consistent.
+        assert_eq!(super::HealthStatus::Ok.color(), Color::Green);
+        assert_eq!(super::HealthStatus::Degraded.color(), Color::Yellow);
+        assert_eq!(super::HealthStatus::Unreachable.color(), Color::Red);
     }
 
     #[test]
