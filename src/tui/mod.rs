@@ -614,11 +614,44 @@ fn cycle_strategy(
 fn per_strategy_agree_series(
     agreements: &[AgreementSnapshot],
 ) -> std::collections::HashMap<String, Vec<f64>> {
+    per_strategy_agree_series_filtered(agreements, None)
+}
+
+/// Filter-aware variant. When `filter == Some(name)`:
+///   - For rows whose `strategy_a == name`: full mean across every
+///     pair the filter participates in (matches the unfiltered
+///     series — this is the filter row's own column).
+///   - For rows whose `strategy_a != name`: include only the pair
+///     where `strategy_b == name`, so the column shows that row's
+///     strategy's pair-rate against the focused strategy specifically.
+///   - For strategies that have no pair with the filter: empty
+///     series (renders as a blank sparkline, signalling "no signal
+///     to show against the focused strategy").
+///
+/// Lets the operator see "how aligned is each strategy *with the
+/// focused one*?" right in the strategy-pnl panel without dropping
+/// into agreement-history.
+fn per_strategy_agree_series_filtered(
+    agreements: &[AgreementSnapshot],
+    filter: Option<&str>,
+) -> std::collections::HashMap<String, Vec<f64>> {
     use std::collections::HashMap;
     // (strategy, ts) → Vec<rate>. Each entry captures every
     // pair-rate this strategy participated in at this ts.
     let mut per_strat_ts: HashMap<(String, i64), Vec<f64>> = HashMap::new();
     for a in agreements {
+        let include = match filter {
+            None => true,
+            Some(f) => {
+                // The filter row keeps its mean-of-all-pairs signal;
+                // every other row sees only its pair *with* the
+                // filter.
+                a.strategy_a == f || a.strategy_b == f
+            }
+        };
+        if !include {
+            continue;
+        }
         per_strat_ts
             .entry((a.strategy_a.clone(), a.ts_ms))
             .or_default()
@@ -990,7 +1023,15 @@ fn draw_strategy_pnl(
     // Per-strategy mean pairwise agreement series — sourced from the
     // same time window as the pnl snapshots above. Computed once
     // outside the row loop so each strategy's lookup is O(1).
-    let agree_series = per_strategy_agree_series(&s.agreements);
+    //
+    // When a strategy filter is active, the series is narrowed to
+    // pair-rates *involving the focused strategy*. That turns the
+    // `agree` column into "how aligned is each strategy with the
+    // focused one over time?" — much more directly readable than
+    // the unfiltered mean once the operator has picked someone to
+    // benchmark against. The filter's own row keeps its mean-of-
+    // all-pairs signal so it stays interpretable.
+    let agree_series = per_strategy_agree_series_filtered(&s.agreements, strategy_filter);
 
     let header = Row::new([
         "strategy", "ts (UTC)", "decisions", "YES", "NO", "PASS", "Σ size", "Σ pnl", "pnl trend", "agree",
@@ -1621,6 +1662,59 @@ mod tests {
         assert!((out["baseline"][0] - 0.75).abs() < 1e-9);
         assert!((out["deepseek"][0] - 0.25).abs() < 1e-9);
         assert!((out["llm"][0] - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn per_strategy_agree_series_filtered_narrows_other_rows_to_filter_pair() {
+        // 3-strategy snapshot at ts=10. Pair rates:
+        //   a↔b = 50%, a↔c = 100%, b↔c = 0%.
+        // Filter = "a":
+        //   - row "a": mean across (a↔b, a↔c) = (0.5 + 1.0) / 2 = 0.75
+        //   - row "b": only (b↔a) = 0.5  (NOT averaged with b↔c)
+        //   - row "c": only (c↔a) = 1.0  (NOT averaged with c↔b)
+        let rows = vec![
+            ag("a", "b", 10, 10, 5),
+            ag("b", "a", 10, 10, 5),
+            ag("a", "c", 10, 10, 10),
+            ag("c", "a", 10, 10, 10),
+            ag("b", "c", 10, 10, 0),
+            ag("c", "b", 10, 10, 0),
+        ];
+        let out = super::per_strategy_agree_series_filtered(&rows, Some("a"));
+        // a's row: 0.75 (mean of all pairs it's in).
+        assert!((out["a"][0] - 0.75).abs() < 1e-9, "a got {:?}", out["a"]);
+        // b's row: 0.5 (only b↔a, the b↔c=0.0 is excluded).
+        assert!((out["b"][0] - 0.5).abs() < 1e-9, "b got {:?}", out["b"]);
+        // c's row: 1.0 (only c↔a, the c↔b=0.0 is excluded).
+        assert!((out["c"][0] - 1.0).abs() < 1e-9, "c got {:?}", out["c"]);
+    }
+
+    #[test]
+    fn per_strategy_agree_series_filtered_no_filter_matches_unfiltered() {
+        let rows = vec![
+            ag("a", "b", 10, 10, 5),
+            ag("b", "a", 10, 10, 5),
+            ag("a", "c", 10, 10, 10),
+        ];
+        let plain = super::per_strategy_agree_series(&rows);
+        let filtered_none = super::per_strategy_agree_series_filtered(&rows, None);
+        assert_eq!(plain, filtered_none);
+    }
+
+    #[test]
+    fn per_strategy_agree_series_filtered_unrelated_strategy_drops_out() {
+        // d never paired with the filter "a" → no entry in output.
+        let rows = vec![
+            ag("a", "b", 10, 10, 5),
+            ag("b", "a", 10, 10, 5),
+            ag("d", "c", 10, 10, 5),
+            ag("c", "d", 10, 10, 5),
+        ];
+        let out = super::per_strategy_agree_series_filtered(&rows, Some("a"));
+        assert!(out.contains_key("a"));
+        assert!(out.contains_key("b"));
+        assert!(!out.contains_key("d"), "d has no pair with a → no series");
+        assert!(!out.contains_key("c"), "c has no pair with a → no series");
     }
 
     #[test]
