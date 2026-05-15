@@ -10,13 +10,25 @@ use crate::coredb::strategy_pnl::StrategyPnlRepo;
 use crate::coredb::types::{bucket_day, now_ms};
 use crate::coredb::CoreDb;
 
-pub async fn run(coredb_uri: &str) -> Result<()> {
+pub async fn run(coredb_uri: &str, strategies_filter: Option<&[String]>) -> Result<()> {
     println!("📈 pnl-history: connecting to CoreDB at {coredb_uri}");
     let db = CoreDb::connect(coredb_uri).await.context("connect coredb")?;
     let repo = StrategyPnlRepo::new(db.session()).await?;
 
     let bd = bucket_day(now_ms());
-    let snapshots = repo.list_day(bd).await.context("list snapshots for today")?;
+    let mut snapshots = repo.list_day(bd).await.context("list snapshots for today")?;
+    let pre_filter = snapshots.len();
+    if let Some(allow) = strategies_filter {
+        let set: std::collections::HashSet<&str> = allow.iter().map(String::as_str).collect();
+        snapshots.retain(|s| set.contains(s.strategy.as_str()));
+        println!(
+            "   filter: {} → {} snapshots ({} strategies allowed: {})",
+            pre_filter,
+            snapshots.len(),
+            allow.len(),
+            allow.join(", "),
+        );
+    }
     println!(
         "   {} snapshots for bucket_day = {} (UTC ms)",
         snapshots.len(),
@@ -24,7 +36,12 @@ pub async fn run(coredb_uri: &str) -> Result<()> {
     );
 
     if snapshots.is_empty() {
-        println!("   (no snapshots yet — run `compare-pnl` first, ideally on a cron.)");
+        let hint = if strategies_filter.is_some() {
+            "   (filter excluded every row — drop --strategies or check the labels match what compare-pnl wrote.)"
+        } else {
+            "   (no snapshots yet — run `compare-pnl` first, ideally on a cron.)"
+        };
+        println!("{hint}");
         return Ok(());
     }
 

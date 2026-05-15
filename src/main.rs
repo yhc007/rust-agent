@@ -155,6 +155,12 @@ enum Commands {
     PnlHistory {
         #[arg(long, default_value = "127.0.0.1:9042")]
         coredb_uri: String,
+        /// Restrict the dump to a comma-separated subset of strategy
+        /// labels (e.g. `--strategies baseline,deepseek`). Empty =
+        /// include every strategy that appears in today's snapshots.
+        /// Mirrors the `compare-pnl --strategies` flag for symmetry.
+        #[arg(long, value_delimiter = ',')]
+        strategies: Vec<String>,
     },
     /// Settle today's orders against Polymarket's resolved markets.
     /// Computes realized PnL per order, aggregates per strategy, and
@@ -322,8 +328,9 @@ async fn main() -> Result<()> {
             let filter = if strategies.is_empty() { None } else { Some(strategies) };
             backtest::compare::run(&coredb_uri, filter.as_deref()).await?;
         }
-        Some(Commands::PnlHistory { coredb_uri }) => {
-            backtest::history::run(&coredb_uri).await?;
+        Some(Commands::PnlHistory { coredb_uri, strategies }) => {
+            let filter = if strategies.is_empty() { None } else { Some(strategies) };
+            backtest::history::run(&coredb_uri, filter.as_deref()).await?;
         }
         Some(Commands::SettlePnl { coredb_uri }) => {
             backtest::settle::run(&coredb_uri).await?;
