@@ -1775,6 +1775,141 @@ mod tests {
         super::cycle_strategy(&s, current, step)
     }
 
+    /// Snapshot test: render a synthetic Snapshot into a
+    /// TestBackend buffer and assert key layout invariants are
+    /// present. Catches accidental column-width drift, panel
+    /// reordering, or header label changes via `cargo test`
+    /// instead of leaving them for the operator to spot.
+    ///
+    /// What's tested:
+    ///   - Each panel's title text appears (header / strategy pnl /
+    ///     consensus / positions / decisions / footer).
+    ///   - Strategy-pnl column headers are all present in the
+    ///     expected dashboard width.
+    ///   - When a filter is active, the agree column header
+    ///     switches to "vs <focused>" and the focused strategy's
+    ///     row gets the ▶ marker.
+    ///
+    /// What's NOT tested:
+    ///   - Exact column widths / character positions (too brittle).
+    ///   - Sparkline glyphs (depend on input values).
+    ///   - Colors / styles (TestBackend ignores style for symbol
+    ///     extraction).
+    #[test]
+    fn dashboard_layout_snapshot() {
+        use crate::coredb::types::{BtcTick, StrategyPnlSnapshot};
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        use std::time::Duration;
+
+        // Build a deterministic Snapshot. Numbers are picked so the
+        // PnL coloring branches don't matter (one positive, one
+        // negative) and the agree column has something to render.
+        let mut s = super::Snapshot::default();
+        s.btc = Some(BtcTick {
+            bucket_hour_ms: 0,
+            symbol: "BTCUSDT".into(),
+            ts_ms: 1700000000000,
+            price: 79123.45,
+            volume: 0.0,
+            bid: 79123.40,
+            ask: 79123.50,
+        });
+        s.snapshots = vec![
+            StrategyPnlSnapshot {
+                bucket_day_ms: 0,
+                ts_ms: 1700000000000,
+                strategy: "baseline".into(),
+                n_decisions: 100,
+                sum_size_usd: 500.0,
+                sum_pnl: 12.34,
+                n_yes: 30,
+                n_no: 30,
+                n_pass: 40,
+            },
+            StrategyPnlSnapshot {
+                bucket_day_ms: 0,
+                ts_ms: 1700000000000,
+                strategy: "deepseek".into(),
+                n_decisions: 50,
+                sum_size_usd: 250.0,
+                sum_pnl: -5.67,
+                n_yes: 10,
+                n_no: 30,
+                n_pass: 10,
+            },
+        ];
+
+        let strategies = super::strategies_in_view(&s);
+        // Big enough to fit every column without truncation.
+        let backend = TestBackend::new(140, 35);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                super::draw(
+                    f,
+                    &s,
+                    Duration::from_millis(0),
+                    Duration::from_secs(42),
+                    &strategies,
+                    Some("deepseek"),
+                )
+            })
+            .unwrap();
+
+        let dump = render_buffer(terminal.backend().buffer());
+
+        // Panel titles
+        assert!(dump.contains("rust-agent dashboard"), "header title missing");
+        assert!(dump.contains("strategy pnl"), "strategy-pnl panel missing");
+        assert!(dump.contains("market consensus"), "consensus panel missing");
+        assert!(dump.contains("positions"), "positions panel missing");
+        assert!(dump.contains("decisions"), "decisions panel missing");
+
+        // Strategy-pnl column headers
+        for label in [
+            "strategy", "ts (UTC)", "decisions", "YES", "NO", "PASS",
+            "Σ size", "Σ pnl", "pnl trend",
+        ] {
+            assert!(
+                dump.contains(label),
+                "strategy-pnl header `{label}` missing from dump:\n{dump}"
+            );
+        }
+
+        // Filter is "deepseek" — agree column header must be the
+        // narrowed form, and the deepseek row must carry the ▶ marker.
+        assert!(
+            dump.contains("vs deepseek"),
+            "expected `vs deepseek` header under active filter"
+        );
+        assert!(
+            dump.contains("▶deepseek"),
+            "expected ▶deepseek row marker under active filter"
+        );
+
+        // Footer hotkey hints
+        assert!(dump.contains("[q]/Esc quit"));
+        assert!(dump.contains("[+/-] cycle"));
+        assert!(dump.contains("filter:"));
+    }
+
+    /// Render a ratatui [`Buffer`] to a newline-separated string by
+    /// concatenating cell symbols row by row. Style information is
+    /// dropped — assertion-level snapshot testing only needs the
+    /// visible character layout.
+    fn render_buffer(buffer: &ratatui::buffer::Buffer) -> String {
+        let width = buffer.area.width as usize;
+        let mut out = String::new();
+        for row in buffer.content.chunks(width) {
+            for cell in row {
+                out.push_str(cell.symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
     #[test]
     fn filter_aware_consensus_passthrough_without_filter() {
         // No filter → identity order.
