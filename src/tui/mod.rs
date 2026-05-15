@@ -112,11 +112,20 @@ async fn main_loop(
     )
     .await;
     let mut last_refresh = Instant::now();
+    // Strategy currently focused in the decisions panel. `None` = show
+    // every strategy. Set by digit-key hotkeys; cleared by `0` or `c`.
+    // Survives refreshes so the operator's selection doesn't reset on
+    // every auto-tick.
+    let mut strategy_filter: Option<String> = None;
 
     loop {
         let uptime = started_at.elapsed();
         let snap_age = last_refresh.elapsed();
-        terminal.draw(|f| draw(f, &snapshot, snap_age, uptime))?;
+        // Cache the sorted strategy list so hotkey-1..9 lookup and the
+        // footer "[1] baseline ..." render are consistent within a
+        // single frame.
+        let strategies = strategies_in_view(&snapshot);
+        terminal.draw(|f| draw(f, &snapshot, snap_age, uptime, &strategies, strategy_filter.as_deref()))?;
 
         // Drain pending input with a small budget so the auto-refresh
         // tick is still responsive. We poll for `min(REFRESH_EVERY -
@@ -134,6 +143,17 @@ async fn main_loop(
                         )
                         .await;
                         last_refresh = Instant::now();
+                    }
+                    // Digit hotkeys: focus the Nth strategy currently
+                    // visible in the cached list. `0` clears the filter.
+                    // Out-of-range digits are ignored so a misclick
+                    // doesn't blank the panel.
+                    KeyCode::Char('0') | KeyCode::Char('c') => strategy_filter = None,
+                    KeyCode::Char(ch @ '1'..='9') => {
+                        let idx = (ch as u8 - b'1') as usize;
+                        if let Some(name) = strategies.get(idx) {
+                            strategy_filter = Some(name.clone());
+                        }
                     }
                     _ => {}
                 },
@@ -446,6 +466,24 @@ fn short_err(s: &str) -> String {
 /// spans, and "Nd series" for whole-day spans. Empty input falls
 /// through to "today's series" — the title is then paired with the
 /// "no snapshots yet" body anyway.
+/// Sorted, deduped list of strategy labels we currently have data
+/// for. Drives the digit-hotkey mapping: position 0 = key `1`,
+/// position 1 = key `2`, ... so the footer's `[1] baseline ...` hint
+/// stays in lockstep with what the keys actually do. Prefers
+/// strategy-pnl snapshots over decisions for stability — a tick that
+/// drops a noisy strategy from decisions shouldn't reshuffle hotkey
+/// indexes mid-session.
+fn strategies_in_view(snapshot: &Snapshot) -> Vec<String> {
+    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for s in &snapshot.snapshots {
+        seen.insert(s.strategy.clone());
+    }
+    for d in &snapshot.decisions {
+        seen.insert(d.effective_strategy().to_string());
+    }
+    seen.into_iter().collect()
+}
+
 fn ts_span_label(snapshots: &[StrategyPnlSnapshot]) -> String {
     let mut min = i64::MAX;
     let mut max = i64::MIN;
@@ -577,16 +615,21 @@ fn draw(
     s: &Snapshot,
     snap_age: Duration,
     uptime: Duration,
+    strategies: &[String],
+    strategy_filter: Option<&str>,
 ) {
+    // Footer needs an extra line to surface the strategy hotkeys, so
+    // grow it to 4 rows when at least one strategy is available.
+    let footer_height = if strategies.is_empty() { 3 } else { 4 };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),   // header
-            Constraint::Length(6),   // strategy pnl
-            Constraint::Min(5),      // market consensus
-            Constraint::Min(5),      // positions
-            Constraint::Min(7),      // recent decisions
-            Constraint::Length(3),   // footer
+            Constraint::Length(3),                  // header
+            Constraint::Length(6),                  // strategy pnl
+            Constraint::Min(5),                     // market consensus
+            Constraint::Min(5),                     // positions
+            Constraint::Min(7),                     // recent decisions
+            Constraint::Length(footer_height),      // footer
         ])
         .split(f.area());
 
@@ -594,8 +637,8 @@ fn draw(
     draw_strategy_pnl(f, chunks[1], s);
     draw_consensus(f, chunks[2], s);
     draw_positions(f, chunks[3], s);
-    draw_decisions(f, chunks[4], s);
-    draw_footer(f, chunks[5], s);
+    draw_decisions(f, chunks[4], s, strategy_filter);
+    draw_footer(f, chunks[5], s, strategies, strategy_filter);
 }
 
 fn draw_consensus(f: &mut ratatui::Frame, area: Rect, s: &Snapshot) {
@@ -895,11 +938,23 @@ fn draw_positions(f: &mut ratatui::Frame, area: Rect, s: &Snapshot) {
     f.render_widget(table, area);
 }
 
-fn draw_decisions(f: &mut ratatui::Frame, area: Rect, s: &Snapshot) {
+fn draw_decisions(f: &mut ratatui::Frame, area: Rect, s: &Snapshot, strategy_filter: Option<&str>) {
     let header = Row::new(["ts (UTC)", "strategy", "market_slug", "side", "size", "conf"])
         .style(Style::default().add_modifier(Modifier::BOLD));
-    let rows: Vec<Row> = s
+    // Filter pre-take so the panel shows the latest N *for the
+    // selected strategy*, not the latest N overall with most rows
+    // hidden — a filter of an unused strategy would otherwise show
+    // an empty table even when newer decisions exist.
+    let filtered: Vec<&Decision> = s
         .decisions
+        .iter()
+        .filter(|d| match strategy_filter {
+            Some(f) => d.effective_strategy() == f,
+            None => true,
+        })
+        .collect();
+    let total_for_strategy = filtered.len();
+    let rows: Vec<Row> = filtered
         .iter()
         .take(RECENT_DECISIONS)
         .map(|d| {
@@ -914,7 +969,7 @@ fn draw_decisions(f: &mut ratatui::Frame, area: Rect, s: &Snapshot) {
             };
             Row::new(vec![
                 Cell::from(ts),
-                Cell::from(strategy),
+                Cell::from(strategy.to_string()),
                 Cell::from(d.market_slug.clone()),
                 Cell::from(Span::styled(d.side.clone(), side_style)),
                 Cell::from(format!("${:.2}", d.size_usd)),
@@ -930,21 +985,73 @@ fn draw_decisions(f: &mut ratatui::Frame, area: Rect, s: &Snapshot) {
         Constraint::Length(8),
         Constraint::Length(6),
     ];
-    let title = format!(
-        " decisions today ({} total, showing latest {}) ",
-        s.decisions.len(),
-        s.decisions.len().min(RECENT_DECISIONS)
-    );
+    let title = match strategy_filter {
+        Some(f) => format!(
+            " decisions today — {} only ({} total, showing latest {}) ",
+            f,
+            total_for_strategy,
+            total_for_strategy.min(RECENT_DECISIONS)
+        ),
+        None => format!(
+            " decisions today ({} total, showing latest {}) ",
+            s.decisions.len(),
+            s.decisions.len().min(RECENT_DECISIONS)
+        ),
+    };
     let table = Table::new(rows, widths)
         .header(header)
         .block(Block::default().borders(Borders::ALL).title(title));
     f.render_widget(table, area);
 }
 
-fn draw_footer(f: &mut ratatui::Frame, area: Rect, s: &Snapshot) {
+fn draw_footer(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    s: &Snapshot,
+    strategies: &[String],
+    strategy_filter: Option<&str>,
+) {
     let mut lines = vec![Line::from(
         " [q]/Esc quit   [r] refresh now   (auto-refresh every 5 s) ",
     )];
+
+    // Strategy hotkeys line. Each visible strategy gets its digit
+    // shortcut so the operator can read "[1] baseline  [2] deepseek"
+    // and press the matching key. The active filter (if any) is
+    // bolded + colored so it's obvious which one is in effect.
+    if !strategies.is_empty() {
+        let mut spans: Vec<Span> = vec![Span::raw(" filter: ")];
+        for (i, name) in strategies.iter().enumerate().take(9) {
+            let key = (b'1' + i as u8) as char;
+            let label = format!(" [{key}] {name} ");
+            let span = if strategy_filter == Some(name.as_str()) {
+                Span::styled(
+                    label,
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else {
+                Span::raw(label)
+            };
+            spans.push(span);
+        }
+        let clear_label = " [0/c] all ";
+        spans.push(if strategy_filter.is_none() {
+            Span::styled(
+                clear_label,
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )
+        } else {
+            Span::raw(clear_label)
+        });
+        lines.push(Line::from(spans));
+    }
+
     for e in s.errors.iter().take(2) {
         lines.push(Line::from(Span::styled(
             format!(" ! {e}"),
@@ -1199,6 +1306,44 @@ mod tests {
         let day_ms = 86_400_000_i64;
         let rows = vec![snap(0), snap(3 * day_ms)];
         assert_eq!(super::ts_span_label(&rows), "3d series");
+    }
+
+    #[test]
+    fn strategies_in_view_merges_decisions_and_snapshots() {
+        let mut s = super::Snapshot::default();
+        s.snapshots.push(crate::coredb::types::StrategyPnlSnapshot {
+            bucket_day_ms: 0,
+            ts_ms: 1,
+            strategy: "baseline".into(),
+            n_decisions: 0,
+            sum_size_usd: 0.0,
+            sum_pnl: 0.0,
+            n_yes: 0,
+            n_no: 0,
+            n_pass: 0,
+        });
+        s.decisions.push(dec("m", "deepseek", "YES", 1.0, 1));
+        s.decisions.push(dec("m", "baseline", "NO", 1.0, 2)); // duplicate of snapshot's
+        let v = super::strategies_in_view(&s);
+        // BTreeSet → sorted, deduped.
+        assert_eq!(v, vec!["baseline", "deepseek"]);
+    }
+
+    #[test]
+    fn strategies_in_view_empty_when_no_data() {
+        let s = super::Snapshot::default();
+        assert!(super::strategies_in_view(&s).is_empty());
+    }
+
+    #[test]
+    fn strategies_in_view_inferred_label_for_legacy_decisions() {
+        // Legacy row: strategy column empty, raw_response says baseline-rule.
+        let mut s = super::Snapshot::default();
+        let mut d = dec("m", "", "PASS", 0.0, 1);
+        d.raw_response = "baseline-rule".to_string();
+        s.decisions.push(d);
+        let v = super::strategies_in_view(&s);
+        assert_eq!(v, vec!["baseline"]);
     }
 
     #[test]
