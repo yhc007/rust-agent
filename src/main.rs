@@ -152,9 +152,13 @@ enum Commands {
     },
     /// Connect to Polymarket's user-channel WebSocket and log
     /// incoming fill/order notifications. Requires
-    /// POLYMARKET_CLOB_API_KEY / _SECRET / _PASSPHRASE. Log-only —
-    /// does not write back to CoreDB yet.
-    UserChannel {},
+    /// POLYMARKET_CLOB_API_KEY / _SECRET / _PASSPHRASE. Set
+    /// APPLY_FILLS=1 to also write trade events back into the
+    /// `orders` table (default off — observation only).
+    UserChannel {
+        #[arg(long, default_value = "127.0.0.1:9042")]
+        coredb_uri: String,
+    },
     /// Live operator dashboard. Polls CoreDB every 5 s and shows
     /// strategy PnL, open positions, and recent decisions. `q` to quit.
     Dashboard {
@@ -283,8 +287,8 @@ async fn main() -> Result<()> {
         Some(Commands::Positions { coredb_uri }) => {
             run_positions(&coredb_uri).await?;
         }
-        Some(Commands::UserChannel {}) => {
-            run_user_channel().await?;
+        Some(Commands::UserChannel { coredb_uri }) => {
+            run_user_channel(coredb_uri).await?;
         }
         Some(Commands::Dashboard { coredb_uri }) => {
             tui::run(&coredb_uri).await?;
@@ -376,7 +380,7 @@ async fn run_clob_auth() -> Result<()> {
 /// credentials from the env vars `rust-agent clob-auth` prints, sets
 /// up an ad-hoc shutdown channel wired to Ctrl+C, and runs until the
 /// user interrupts.
-async fn run_user_channel() -> Result<()> {
+async fn run_user_channel(coredb_uri: String) -> Result<()> {
     use std::sync::Arc;
     use tokio::signal;
     use tokio::sync::watch;
@@ -391,9 +395,22 @@ async fn run_user_channel() -> Result<()> {
         secret,
         passphrase,
     });
+    // APPLY_FILLS=1 → connect to CoreDB and let the listener write
+    // trade events back into the orders table. Default off; the
+    // listener observes-only.
+    let apply = matches!(std::env::var("APPLY_FILLS").as_deref(), Ok("1"));
+    let order_repo = if apply {
+        let db = coredb::CoreDb::connect(&coredb_uri).await?;
+        let repo = coredb::orders::OrderRepo::new(db.session()).await?;
+        Some(Arc::new(repo))
+    } else {
+        None
+    };
     let (tx, rx) = watch::channel(false);
-    let listener = tokio::spawn(data::user_channel::run(creds, rx));
-    println!("🔔 user-channel: subscribed. Ctrl+C to stop.");
+    let listener = tokio::spawn(data::user_channel::run(creds, order_repo, rx));
+    println!(
+        "🔔 user-channel: subscribed (apply_fills={apply}). Ctrl+C to stop."
+    );
     signal::ctrl_c().await?;
     let _ = tx.send(true);
     let _ = listener.await;

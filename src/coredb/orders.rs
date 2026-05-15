@@ -42,6 +42,47 @@ impl OrderRepo {
         Ok(())
     }
 
+    /// Apply a WebSocket-reported fill to the matching `orders` row.
+    /// Scans the current day's bucket, finds the row whose `order_id`
+    /// matches, re-inserts it with the WS-supplied `fill_size`,
+    /// `fill_price`, and `status` (CoreDB upserts on PK collision so
+    /// this overwrites cleanly). Returns `true` when a row was
+    /// updated, `false` when no matching `order_id` was found in the
+    /// scanned bucket — callers should treat the `false` case as
+    /// "trade for an order we don't track" rather than an error.
+    ///
+    /// `bucket_day_ms` is the partition to scan. For most realtime
+    /// fills that's today's bucket (`bucket_day(now_ms())`); a future
+    /// commit can extend this to also check yesterday's bucket if WS
+    /// events for orders placed near the UTC boundary start dropping.
+    pub async fn apply_ws_fill(
+        &self,
+        bucket_day_ms: Millis,
+        order_id: &str,
+        fill_size: f64,
+        fill_price: f64,
+        status: &str,
+    ) -> Result<bool, CoreDbError> {
+        let orders = self.list_day(bucket_day_ms).await?;
+        let target = match orders.into_iter().find(|o| o.order_id == order_id) {
+            Some(o) => o,
+            None => return Ok(false),
+        };
+        // Build an updated row keyed at the same (bucket_day, ts,
+        // order_id) so CoreDB's upsert lands on top of the existing
+        // row. We deliberately don't touch market_slug / side / size /
+        // price / decision_id — those describe the order intent and
+        // are owned by `route_decision`'s original insert.
+        let updated = Order {
+            fill_size,
+            fill_price,
+            status: status.to_string(),
+            ..target
+        };
+        self.insert(&updated).await?;
+        Ok(true)
+    }
+
     pub async fn list_day(&self, bucket_day_ms: Millis) -> Result<Vec<Order>, CoreDbError> {
         let q = format!(
             "SELECT bucket_day, ts, order_id, decision_id, market_slug, side, size, price, \

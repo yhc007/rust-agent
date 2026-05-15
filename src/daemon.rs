@@ -27,6 +27,7 @@ use tracing::{info, warn};
 use crate::backtest::{self, BacktestMode};
 use crate::coredb::btc::BtcTickRepo;
 use crate::coredb::markets::MarketRepo;
+use crate::coredb::orders::OrderRepo;
 use crate::coredb::CoreDb;
 use crate::data::{binance, polymarket, user_channel};
 use crate::execution::clob_auth::ApiCreds;
@@ -103,13 +104,24 @@ pub async fn run(cfg: DaemonConfig) -> Result<()> {
 
     // Polymarket user-channel WS listener — only spawned when CLOB
     // credentials are visible in env. Paper-only deployments skip
-    // this cleanly. Log-only for now; the next turn wires it into
-    // orders + positions writes.
+    // this cleanly. The listener writes back to the `orders` table
+    // only when APPLY_FILLS=1 is also exported (defense-in-depth:
+    // first stand it up observation-only, eyeball the payloads,
+    // then opt into mutation).
     let h_user_channel = match load_clob_creds_from_env() {
         Some(creds) => {
-            info!("daemon: CLOB creds present; spawning user-channel listener");
+            let apply = matches!(std::env::var("APPLY_FILLS").as_deref(), Ok("1"));
+            let order_repo_for_ws = if apply {
+                Some(Arc::new(OrderRepo::new(db.session()).await?))
+            } else {
+                None
+            };
+            info!(
+                "daemon: CLOB creds present; spawning user-channel listener (apply_fills={apply})"
+            );
             Some(tokio::spawn(user_channel::run(
                 std::sync::Arc::new(creds),
+                order_repo_for_ws,
                 shutdown_rx.clone(),
             )))
         }
