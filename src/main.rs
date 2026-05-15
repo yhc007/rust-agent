@@ -155,7 +155,7 @@ enum Commands {
         #[arg(long, default_value = "127.0.0.1:9042")]
         coredb_uri: String,
     },
-    /// Dump every row in `polymarket_btc.positions`, newest first.
+    /// Dump every row in `polymarket_btc.positions_v2`, newest first.
     /// The headless analogue of the dashboard's positions panel.
     Positions {
         #[arg(long, default_value = "127.0.0.1:9042")]

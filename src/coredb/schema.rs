@@ -106,20 +106,15 @@ pub const MIGRATIONS: &[&str] = &[
     "CREATE INDEX idx_orders_market ON polymarket_btc.orders (market_slug)",
     "CREATE INDEX idx_orders_status ON polymarket_btc.orders (status)",
 
-    // ---- Current positions (overwritten via LWT). ----
-    // v1: kept for backward-compat with rows that already landed before
-    // the v2 schema; the runtime no longer writes here.
-    "CREATE TABLE IF NOT EXISTS polymarket_btc.positions ( \
-        market_slug TEXT PRIMARY KEY, \
-        side        TEXT, \
-        size        DOUBLE, \
-        avg_price   DOUBLE, \
-        updated_at  TIMESTAMP \
-     )",
-    // v2: PK is (market_slug, side) so YES and NO positions on the
-    // same market are tracked independently. `apply_fill` does a
-    // read-modify-write to maintain volume-weighted average price +
-    // cumulative size across fills.
+    // ---- Current positions ----
+    // PK is (market_slug, side) so YES and NO positions on the same
+    // market are tracked independently. `apply_fill` does a read-
+    // modify-write to maintain volume-weighted average price +
+    // cumulative size across fills. (A pre-v2 `polymarket_btc.positions`
+    // table with PK = market_slug existed historically; nothing in the
+    // runtime reads or writes it any more. Existing deployments can
+    // leave it untouched or DROP TABLE polymarket_btc.positions
+    // manually via cqlsh — fresh installs simply don't create it.)
     "CREATE TABLE IF NOT EXISTS polymarket_btc.positions_v2 ( \
         market_slug TEXT, \
         side        TEXT, \

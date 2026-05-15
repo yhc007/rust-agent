@@ -46,13 +46,16 @@ impl CoreDb {
     }
 
     /// Tables created by `migrate`, in the order checks should run.
+    /// `positions` (pre-v2, PK = market_slug) is deliberately omitted —
+    /// it is no longer created, written, or read by the runtime.
+    /// Existing deployments may still have the orphan table on disk;
+    /// `DROP TABLE polymarket_btc.positions` via cqlsh removes it.
     pub const TABLES: &'static [&'static str] = &[
         "btc_ticks",
         "orderbook_snapshots",
         "markets",
         "decisions",
         "orders",
-        "positions",
         "positions_v2",
         "pnl_daily",
         "strategy_pnl_snapshots",
