@@ -519,6 +519,41 @@ fn strategies_in_view(snapshot: &Snapshot) -> Vec<String> {
     seen.into_iter().collect()
 }
 
+/// Order the consensus rows for rendering. When no filter is
+/// active, returns references in the same order `build_consensus`
+/// produced (split → all-agree → solo → all-pass, by size, by ts).
+///
+/// When `filter` is `Some(name)`, partitions into two tiers:
+///   - tier 0: markets that `active_picks` contains `name` for, OR
+///             that have `name` listed among their PASS strategies
+///             (i.e. the filtered strategy weighed in either way)
+///   - tier 1: everything else
+///
+/// We can't easily distinguish "this strategy passed on this market"
+/// from "this strategy hasn't been here yet" because `MarketConsensus`
+/// only stores a `pass_strategies` count, not the per-strategy list.
+/// So tier 0 only catches active picks. Solo / AllPass markets
+/// without the filter's strategy fall into tier 1.
+///
+/// Within each tier the existing pre-sort order is preserved (stable
+/// sort) so the secondary keys (agreement, size, ts) still apply.
+fn filter_aware_consensus<'a>(
+    rows: &'a [MarketConsensus],
+    filter: Option<&str>,
+) -> Vec<&'a MarketConsensus> {
+    let mut out: Vec<&'a MarketConsensus> = rows.iter().collect();
+    if let Some(name) = filter {
+        out.sort_by_key(|c| {
+            if c.active_picks.contains_key(name) {
+                0
+            } else {
+                1
+            }
+        });
+    }
+    out
+}
+
 /// Cycle the strategy filter forward (`step = 1`) or backward
 /// (`step = -1`) through the cached strategy list. `None` is part
 /// of the cycle (meaning "show all"), so the order is:
@@ -774,9 +809,19 @@ fn draw_consensus(
 ) {
     let header = Row::new(["market_slug", "agree", "picks", "Σ size"])
         .style(Style::default().add_modifier(Modifier::BOLD));
-    let rows: Vec<Row> = s
-        .consensus
-        .iter()
+    // Filter-aware view: when a strategy filter is active, prioritize
+    // markets that *involve* the focused strategy so they cluster at
+    // the top of the panel. Within each priority tier the existing
+    // (agreement kind → size → ts) ordering still applies.
+    //
+    // Why a per-frame sort instead of baking it into build_consensus:
+    // the operator can change the filter mid-session via the digit /
+    // +/- hotkeys, which only re-render — they don't re-fetch. A
+    // draw-time resort means the rearrange tracks the hotkey
+    // immediately without a full snapshot refresh.
+    let visible: Vec<&MarketConsensus> = filter_aware_consensus(&s.consensus, strategy_filter);
+    let rows: Vec<Row> = visible
+        .into_iter()
         .take(usize::from(area.height.saturating_sub(3)))
         .map(|c| {
             // "baseline=YES  llm=NO  anthropic=YES (+1 pass)" rendered
@@ -1609,6 +1654,48 @@ mod tests {
     fn cycle(strategies: &[&str], current: Option<&str>, step: i32) -> Option<String> {
         let s: Vec<String> = strategies.iter().map(|x| (*x).to_string()).collect();
         super::cycle_strategy(&s, current, step)
+    }
+
+    #[test]
+    fn filter_aware_consensus_passthrough_without_filter() {
+        // No filter → identity order.
+        let rows = vec![
+            dec("m-a", "baseline", "YES", 1.0, 1),
+            dec("m-a", "deepseek", "YES", 1.0, 1),
+            dec("m-b", "baseline", "YES", 1.0, 2),
+            dec("m-b", "deepseek", "NO", 1.0, 2),
+        ];
+        let consensus = super::build_consensus(&rows);
+        let out = super::filter_aware_consensus(&consensus, None);
+        let slugs: Vec<&str> = out.iter().map(|c| c.market_slug.as_str()).collect();
+        let original: Vec<&str> = consensus.iter().map(|c| c.market_slug.as_str()).collect();
+        assert_eq!(slugs, original);
+    }
+
+    #[test]
+    fn filter_aware_consensus_promotes_focused_strategy() {
+        // Build a 3-market table:
+        //   m-only-baseline: only baseline weighed in
+        //   m-only-deepseek: only deepseek weighed in
+        //   m-both:          baseline + deepseek both weighed in
+        // Filtering to "deepseek" should put m-only-deepseek and
+        // m-both in tier 0, m-only-baseline in tier 1.
+        let rows = vec![
+            dec("m-only-baseline", "baseline", "YES", 1.0, 1),
+            dec("m-only-deepseek", "deepseek", "YES", 1.0, 2),
+            dec("m-both", "baseline", "YES", 1.0, 3),
+            dec("m-both", "deepseek", "NO", 1.0, 3),
+        ];
+        let consensus = super::build_consensus(&rows);
+        let out = super::filter_aware_consensus(&consensus, Some("deepseek"));
+        // Tier 0 first: m-only-deepseek + m-both (order between them
+        // preserved from pre-sort: stable sort).
+        let tier0: std::collections::HashSet<&str> =
+            out.iter().take(2).map(|c| c.market_slug.as_str()).collect();
+        assert!(tier0.contains("m-only-deepseek"));
+        assert!(tier0.contains("m-both"));
+        // Tier 1 last: m-only-baseline.
+        assert_eq!(out[2].market_slug, "m-only-baseline");
     }
 
     #[test]
