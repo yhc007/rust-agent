@@ -111,20 +111,22 @@ pub async fn route_decision(
         return Ok(Outcome::ExecError(format!("orders.insert: {e}")));
     }
 
-    // apply_fill does the read-modify-write so cumulative size +
-    // volume-weighted avg_price accumulate correctly across multiple
-    // fills on the same (market_slug, side). Race-prone in principle,
-    // but the agent serialises orders through route_decision so two
-    // fills on the same key can't be in flight simultaneously.
-    let pos = Position {
-        market_slug: req.market_slug.clone(),
-        side: req.side.clone(),
-        size: fill.fill_size,
-        avg_price: fill.fill_price,
-        updated_at_ms: ts,
-    };
-    if let Err(e) = pos_repo.apply_fill(&pos).await {
-        return Ok(Outcome::ExecError(format!("positions.apply_fill: {e}")));
+    // Position update path. Paper executors apply optimistically here
+    // because there's no WS feed that will revisit the fill. Live
+    // executors defer (`defers_positions_to_ws() == true`) so the WS
+    // user-channel listener is the single source of truth — applying
+    // here AND on WS would double-count every live trade.
+    if !exec.defers_positions_to_ws() {
+        let pos = Position {
+            market_slug: req.market_slug.clone(),
+            side: req.side.clone(),
+            size: fill.fill_size,
+            avg_price: fill.fill_price,
+            updated_at_ms: ts,
+        };
+        if let Err(e) = pos_repo.apply_fill(&pos).await {
+            return Ok(Outcome::ExecError(format!("positions.apply_fill: {e}")));
+        }
     }
 
     Ok(Outcome::Filled(order))

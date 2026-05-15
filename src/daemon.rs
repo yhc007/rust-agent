@@ -27,7 +27,7 @@ use tracing::{info, warn};
 use crate::backtest::{self, BacktestMode};
 use crate::coredb::btc::BtcTickRepo;
 use crate::coredb::markets::MarketRepo;
-use crate::coredb::orders::OrderRepo;
+use crate::coredb::orders::{OrderRepo, PositionRepo};
 use crate::coredb::CoreDb;
 use crate::data::{binance, polymarket, user_channel};
 use crate::execution::clob_auth::ApiCreds;
@@ -111,10 +111,13 @@ pub async fn run(cfg: DaemonConfig) -> Result<()> {
     let h_user_channel = match load_clob_creds_from_env() {
         Some(creds) => {
             let apply = matches!(std::env::var("APPLY_FILLS").as_deref(), Ok("1"));
-            let order_repo_for_ws = if apply {
-                Some(Arc::new(OrderRepo::new(db.session()).await?))
+            let (order_repo_for_ws, pos_repo_for_ws) = if apply {
+                (
+                    Some(Arc::new(OrderRepo::new(db.session()).await?)),
+                    Some(Arc::new(PositionRepo::new(db.session()).await?)),
+                )
             } else {
-                None
+                (None, None)
             };
             info!(
                 "daemon: CLOB creds present; spawning user-channel listener (apply_fills={apply})"
@@ -122,6 +125,7 @@ pub async fn run(cfg: DaemonConfig) -> Result<()> {
             Some(tokio::spawn(user_channel::run(
                 std::sync::Arc::new(creds),
                 order_repo_for_ws,
+                pos_repo_for_ws,
                 shutdown_rx.clone(),
             )))
         }

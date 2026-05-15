@@ -33,8 +33,8 @@ use tokio::sync::watch;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{debug, info, warn};
 
-use crate::coredb::orders::OrderRepo;
-use crate::coredb::types::{bucket_day, now_ms};
+use crate::coredb::orders::{OrderRepo, PositionRepo};
+use crate::coredb::types::{bucket_day, now_ms, Position};
 use crate::execution::clob_auth::ApiCreds;
 
 const WS_URL: &str = "wss://ws-subscriptions-clob.polymarket.com/ws/user";
@@ -86,16 +86,24 @@ struct UserEvent {
 /// When `order_repo` is `Some`, incoming TRADE events with a
 /// matching `taker_order_id` in today's bucket cause an in-place
 /// upsert of the orders row (fill_size + fill_price + status). When
-/// `None`, the listener is observation-only. Daemon controls this
-/// via the `APPLY_FILLS=1` env gate.
+/// `pos_repo` is also `Some`, the same trade also propagates into
+/// `positions_v2` via `apply_fill` using the order's `market_slug` +
+/// `side` (which the WS event itself doesn't carry). The two repos
+/// are independent params so an operator can opt into orders writes
+/// without positions writes, but in practice the daemon supplies
+/// both together. When `order_repo` is `None`, the listener is
+/// observation-only. Daemon controls this via the `APPLY_FILLS=1`
+/// env gate.
 pub async fn run(
     creds: Arc<ApiCreds>,
     order_repo: Option<Arc<OrderRepo>>,
+    pos_repo: Option<Arc<PositionRepo>>,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<()> {
     info!(
-        "user-channel: connecting to {WS_URL} (apply_fills={})",
-        order_repo.is_some()
+        "user-channel: connecting to {WS_URL} (apply_orders={}, apply_positions={})",
+        order_repo.is_some(),
+        pos_repo.is_some()
     );
     let mut backoff = RECONNECT_INITIAL;
     let mut seen_trade_ids: HashSet<String> = HashSet::new();
@@ -105,7 +113,15 @@ pub async fn run(
             return Ok(());
         }
 
-        match run_one_session(&creds, order_repo.as_deref(), &mut seen_trade_ids, &mut shutdown).await {
+        match run_one_session(
+            &creds,
+            order_repo.as_deref(),
+            pos_repo.as_deref(),
+            &mut seen_trade_ids,
+            &mut shutdown,
+        )
+        .await
+        {
             Ok(()) => {
                 info!("user-channel: clean exit");
                 return Ok(());
@@ -131,6 +147,7 @@ pub async fn run(
 async fn run_one_session(
     creds: &ApiCreds,
     order_repo: Option<&OrderRepo>,
+    pos_repo: Option<&PositionRepo>,
     seen_trade_ids: &mut HashSet<String>,
     shutdown: &mut watch::Receiver<bool>,
 ) -> Result<()> {
@@ -195,7 +212,7 @@ async fn run_one_session(
                                 );
                                 if let Some(repo) = order_repo {
                                     if let Err(e) =
-                                        maybe_apply_trade(repo, &ev, seen_trade_ids).await
+                                        maybe_apply_trade(repo, pos_repo, &ev, seen_trade_ids).await
                                     {
                                         warn!("user-channel: apply trade failed: {e}");
                                     }
@@ -239,7 +256,8 @@ async fn run_one_session(
 /// fallback so a bad payload produces a `false` from
 /// `apply_ws_fill` rather than corrupting an existing row.
 async fn maybe_apply_trade(
-    repo: &OrderRepo,
+    order_repo: &OrderRepo,
+    pos_repo: Option<&PositionRepo>,
     ev: &UserEvent,
     seen_trade_ids: &mut HashSet<String>,
 ) -> Result<()> {
@@ -267,20 +285,45 @@ async fn maybe_apply_trade(
     let fill_size: f64 = ev.size.parse().unwrap_or(0.0);
     let fill_price: f64 = ev.price.parse().unwrap_or(0.0);
     let bd = bucket_day(now_ms());
-    let updated = repo
+    let updated = order_repo
         .apply_ws_fill(bd, &ev.taker_order_id, fill_size, fill_price, &ev.status)
         .await
         .context("apply_ws_fill")?;
-    if updated {
-        info!(
-            "user-channel: APPLIED trade {} → orders.order_id={} fill_size={fill_size} fill_price={fill_price} status={}",
-            ev.id, ev.taker_order_id, ev.status
-        );
-    } else {
+    let Some(order) = updated else {
         debug!(
             "user-channel: trade {} (taker_order_id={}) — no matching row in today's bucket",
             ev.id, ev.taker_order_id
         );
+        return Ok(());
+    };
+    info!(
+        "user-channel: APPLIED trade {} → orders.order_id={} fill_size={fill_size} fill_price={fill_price} status={}",
+        ev.id, ev.taker_order_id, ev.status
+    );
+    // Propagate the WS-reported fill into positions_v2 using the
+    // order's slug + side (which the WS event doesn't carry). This is
+    // the LiveExec source-of-truth path: route_decision deferred the
+    // positions update for live orders, so this is the only place
+    // they accumulate.
+    if let Some(pos_repo) = pos_repo {
+        let pos = Position {
+            market_slug: order.market_slug.clone(),
+            side: order.side.clone(),
+            size: fill_size,
+            avg_price: fill_price,
+            updated_at_ms: now_ms(),
+        };
+        if let Err(e) = pos_repo.apply_fill(&pos).await {
+            warn!(
+                "user-channel: positions.apply_fill failed for {} ({}): {e}",
+                order.market_slug, order.side
+            );
+        } else {
+            info!(
+                "user-channel: positions.apply_fill ok for {} ({}) size={fill_size} price={fill_price}",
+                order.market_slug, order.side
+            );
+        }
     }
     Ok(())
 }

@@ -46,10 +46,13 @@ impl OrderRepo {
     /// Scans the current day's bucket, finds the row whose `order_id`
     /// matches, re-inserts it with the WS-supplied `fill_size`,
     /// `fill_price`, and `status` (CoreDB upserts on PK collision so
-    /// this overwrites cleanly). Returns `true` when a row was
-    /// updated, `false` when no matching `order_id` was found in the
-    /// scanned bucket — callers should treat the `false` case as
-    /// "trade for an order we don't track" rather than an error.
+    /// this overwrites cleanly). Returns the **updated row** so the
+    /// caller can also propagate the fill to positions_v2 keyed by
+    /// the order's `market_slug` + `side` (which the WS event itself
+    /// does not carry). Returns `None` when no matching `order_id`
+    /// was found in the scanned bucket — callers should treat the
+    /// None case as "trade for an order we don't track" rather than
+    /// an error.
     ///
     /// `bucket_day_ms` is the partition to scan. For most realtime
     /// fills that's today's bucket (`bucket_day(now_ms())`); a future
@@ -62,11 +65,11 @@ impl OrderRepo {
         fill_size: f64,
         fill_price: f64,
         status: &str,
-    ) -> Result<bool, CoreDbError> {
+    ) -> Result<Option<Order>, CoreDbError> {
         let orders = self.list_day(bucket_day_ms).await?;
         let target = match orders.into_iter().find(|o| o.order_id == order_id) {
             Some(o) => o,
-            None => return Ok(false),
+            None => return Ok(None),
         };
         // Build an updated row keyed at the same (bucket_day, ts,
         // order_id) so CoreDB's upsert lands on top of the existing
@@ -80,7 +83,7 @@ impl OrderRepo {
             ..target
         };
         self.insert(&updated).await?;
-        Ok(true)
+        Ok(Some(updated))
     }
 
     pub async fn list_day(&self, bucket_day_ms: Millis) -> Result<Vec<Order>, CoreDbError> {

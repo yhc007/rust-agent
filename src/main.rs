@@ -399,15 +399,16 @@ async fn run_user_channel(coredb_uri: String) -> Result<()> {
     // trade events back into the orders table. Default off; the
     // listener observes-only.
     let apply = matches!(std::env::var("APPLY_FILLS").as_deref(), Ok("1"));
-    let order_repo = if apply {
+    let (order_repo, pos_repo) = if apply {
         let db = coredb::CoreDb::connect(&coredb_uri).await?;
-        let repo = coredb::orders::OrderRepo::new(db.session()).await?;
-        Some(Arc::new(repo))
+        let o = coredb::orders::OrderRepo::new(db.session()).await?;
+        let p = coredb::orders::PositionRepo::new(db.session()).await?;
+        (Some(Arc::new(o)), Some(Arc::new(p)))
     } else {
-        None
+        (None, None)
     };
     let (tx, rx) = watch::channel(false);
-    let listener = tokio::spawn(data::user_channel::run(creds, order_repo, rx));
+    let listener = tokio::spawn(data::user_channel::run(creds, order_repo, pos_repo, rx));
     println!(
         "🔔 user-channel: subscribed (apply_fills={apply}). Ctrl+C to stop."
     );

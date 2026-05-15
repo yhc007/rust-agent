@@ -209,6 +209,15 @@ impl Executor for LiveExec {
         "live"
     }
 
+    /// LiveExec lets the user-channel WS be the source of truth for
+    /// positions. `route_decision` would otherwise call apply_fill
+    /// optimistically against the POST /order response, and the same
+    /// fill would land again when the WS TRADE event arrived — so
+    /// positions_v2 would double-count every live trade.
+    fn defers_positions_to_ws(&self) -> bool {
+        true
+    }
+
     async fn place_order(&self, req: PlaceOrderRequest) -> Result<FillResult, ExecError> {
         // Resolve outcome tokenId via the markets repo. Refusing to
         // proceed without it is intentional: the prior commit signed
