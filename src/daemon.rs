@@ -361,6 +361,7 @@ pub async fn run(cfg: DaemonConfig) -> Result<()> {
             market_repo: market_repo_for_health,
             decision_repo,
             decisions_cache: Arc::new(RwLock::new(None)),
+            ingest_cache: Arc::new(RwLock::new(None)),
         };
         let app = Router::new()
             .route("/health", get(health_handler))
@@ -473,10 +474,30 @@ fn spawn_watchdog(
 /// (every 30 min in the default daemon config).
 const METRICS_DECISIONS_CACHE_TTL_MS: i64 = 10_000;
 
+/// TTL on the cached ingest-staleness probes. Shorter than the
+/// decisions cache because the underlying data ticks every ~500ms
+/// (Binance WS) and every 30s (Polymarket Gamma) — a 5s ceiling
+/// preserves real staleness signal while still saving CoreDB the
+/// per-scrape btc.latest + markets.list_open round-trips that
+/// /health and /metrics each used to issue independently.
+const INGEST_CACHE_TTL_MS: i64 = 5_000;
+
 #[derive(Debug, Clone)]
 struct DecisionsCacheEntry {
     fetched_at_ms: i64,
     counts: std::collections::BTreeMap<(String, String), u32>,
+}
+
+/// Cached pair of ingest-staleness ages. Stored as a unit (not
+/// per-source) so a transient one-source outage shows up in the
+/// next refresh as `None` rather than being masked by per-source
+/// stale-while-revalidate — operators want the gap to fire, not
+/// the last-known-good age to keep painting.
+#[derive(Debug, Clone)]
+struct IngestProbeCache {
+    fetched_at_ms: i64,
+    btc_age_ms: Option<i64>,
+    polymarket_age_ms: Option<i64>,
 }
 
 #[derive(Clone)]
@@ -494,26 +515,18 @@ struct HealthAppState {
     /// scraping. Refresh failures keep the previous entry around
     /// so transient CoreDB blips don't blank the Grafana panel.
     decisions_cache: Arc<RwLock<Option<DecisionsCacheEntry>>>,
+    /// Shared cache for the two ingest-staleness probes that
+    /// `/health` and `/metrics` both need. Refresh on TTL expiry
+    /// runs both probes once and stores whatever comes back, so a
+    /// concurrent scrape on the *other* endpoint reuses the work.
+    ingest_cache: Arc<RwLock<Option<IngestProbeCache>>>,
 }
 
 async fn health_handler(State(s): State<HealthAppState>) -> Json<HealthResponse> {
     let now = now_ms();
     let snap = s.health.read().await;
 
-    // Ingest freshness: read each repo's latest row. Treat any error
-    // (including "table empty") as missing data, which the status
-    // line will then flag as degraded.
-    let btc_age = match s.btc_repo.latest("BTCUSDT").await {
-        Ok(Some(t)) => Some(now.saturating_sub(t.ts_ms)),
-        _ => None,
-    };
-    let polymarket_age = match s.market_repo.list_open().await {
-        Ok(rows) if !rows.is_empty() => {
-            let newest = rows.iter().map(|m| m.updated_at_ms).max().unwrap_or(0);
-            Some(now.saturating_sub(newest))
-        }
-        _ => None,
-    };
+    let (btc_age, polymarket_age) = ingest_ages_cached(&s, now).await;
 
     let ingest_ok = match (btc_age, polymarket_age) {
         (Some(b), Some(p)) => b < INGEST_STALE_MS && p < INGEST_STALE_MS,
@@ -551,19 +564,7 @@ async fn metrics_handler(State(s): State<HealthAppState>) -> impl IntoResponse {
     let now = now_ms();
     let snap = s.health.read().await;
 
-    // Same ingest probes as the health handler — keeps the two
-    // endpoints from diverging.
-    let btc_age = match s.btc_repo.latest("BTCUSDT").await {
-        Ok(Some(t)) => Some(now.saturating_sub(t.ts_ms)),
-        _ => None,
-    };
-    let polymarket_age = match s.market_repo.list_open().await {
-        Ok(rows) if !rows.is_empty() => {
-            let newest = rows.iter().map(|m| m.updated_at_ms).max().unwrap_or(0);
-            Some(now.saturating_sub(newest))
-        }
-        _ => None,
-    };
+    let (btc_age, polymarket_age) = ingest_ages_cached(&s, now).await;
 
     let mut out = String::with_capacity(2048);
     let uptime_secs = (now - snap.started_at_ms).max(0) / 1000;
@@ -734,6 +735,65 @@ async fn metrics_handler(State(s): State<HealthAppState>) -> impl IntoResponse {
         HeaderValue::from_static("text/plain; version=0.0.4; charset=utf-8"),
     );
     (StatusCode::OK, headers, out)
+}
+
+/// Shared ingest-staleness cache lookup.
+///
+/// Both `/health` and `/metrics` hit `btc_repo.latest` +
+/// `market_repo.list_open` to derive the ingest-age signal. Without
+/// caching, two concurrent scrapes round-trip CoreDB four times for
+/// data that ticks every ~500ms (Binance WS) and 30s (Polymarket
+/// REST) anyway. The cache reduces that to at most one btc + one
+/// markets read per `INGEST_CACHE_TTL_MS` window across both
+/// endpoints.
+///
+/// Stored as a unit (no per-source stale-while-revalidate): if a
+/// source goes down we want the next scrape's gauge to drop the
+/// series, not paint the last-known-good age forever.
+async fn ingest_ages_cached(
+    s: &HealthAppState,
+    now: i64,
+) -> (Option<i64>, Option<i64>) {
+    let mut guard = s.ingest_cache.write().await;
+    let need_refresh = guard
+        .as_ref()
+        .map(|c| now - c.fetched_at_ms > INGEST_CACHE_TTL_MS)
+        .unwrap_or(true);
+
+    if need_refresh {
+        let btc_age_ms = match s.btc_repo.latest("BTCUSDT").await {
+            Ok(Some(t)) => Some(now.saturating_sub(t.ts_ms)),
+            _ => None,
+        };
+        let polymarket_age_ms = match s.market_repo.list_open().await {
+            Ok(rows) if !rows.is_empty() => {
+                let newest = rows.iter().map(|m| m.updated_at_ms).max().unwrap_or(0);
+                Some(now.saturating_sub(newest))
+            }
+            _ => None,
+        };
+        *guard = Some(IngestProbeCache {
+            fetched_at_ms: now,
+            btc_age_ms,
+            polymarket_age_ms,
+        });
+    }
+
+    // SAFETY: we either just refreshed or had an existing cache; both
+    // branches leave `guard` populated. `expect` over `unwrap` so a
+    // future refactor that drops the cache-set on refresh fails loud.
+    let cache = guard.as_ref().expect("ingest_cache populated above");
+    // Adjust the returned ages by the cache age so the values stay
+    // monotonic-ish across scrapes within a TTL window — without this
+    // a scrape 4s after refresh would report the same age the refresh
+    // captured 4s ago, which would look like a frozen clock to
+    // Grafana. The cap defends against a clock skew flipping the
+    // age negative.
+    let age_offset = (now - cache.fetched_at_ms).max(0);
+    (
+        cache.btc_age_ms.map(|a| a.saturating_add(age_offset)),
+        cache.polymarket_age_ms.map(|a| a.saturating_add(age_offset)),
+    )
 }
 
 /// Escape a Prometheus label-value: backslash, double-quote, and
