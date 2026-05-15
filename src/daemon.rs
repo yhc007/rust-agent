@@ -24,7 +24,7 @@ use tokio::sync::watch;
 use tokio::time::{interval, MissedTickBehavior};
 use tracing::{info, warn};
 
-use crate::backtest::{self, BacktestMode};
+use crate::backtest::{self, BacktestPlan};
 use crate::coredb::btc::BtcTickRepo;
 use crate::coredb::markets::MarketRepo;
 use crate::coredb::orders::{OrderRepo, PositionRepo};
@@ -45,6 +45,11 @@ pub struct DaemonConfig {
     /// PaperExec. LiveExec stays DRY_RUN unless `LIVE_TRADING_ENABLED=1`
     /// is also exported — two gates by design.
     pub live: bool,
+    /// LLM strategy presets to run on every periodic backtest. Empty
+    /// = legacy `--both` (baseline + single env-resolved LLM).
+    /// Non-empty = N-way run with these presets, with baseline always
+    /// included (the daemon's whole point is comparison).
+    pub llm_presets: Vec<String>,
 }
 
 impl DaemonConfig {
@@ -56,6 +61,7 @@ impl DaemonConfig {
             settle_every_secs: 60 * 60,
             execute: true,
             live: false,
+            llm_presets: Vec::new(),
         }
     }
 }
@@ -68,12 +74,18 @@ pub async fn run(cfg: DaemonConfig) -> Result<()> {
         settle_every_secs,
         execute,
         live,
+        llm_presets,
     } = cfg;
 
     println!("🛰️  daemon: starting");
     println!("    coredb_uri        = {coredb_uri}");
+    let plan_label = if llm_presets.is_empty() {
+        "both (baseline + single LLM)".to_string()
+    } else {
+        format!("baseline + [{}]", llm_presets.join(","))
+    };
     println!(
-        "    backtest every    = {backtest_every_secs}s (mode=both, execute={execute}, live={live})"
+        "    backtest every    = {backtest_every_secs}s (plan={plan_label}, execute={execute}, live={live})"
     );
     println!("    compare-pnl every = {compare_every_secs}s");
     println!("    settle-pnl every  = {settle_every_secs}s");
@@ -147,10 +159,17 @@ pub async fn run(cfg: DaemonConfig) -> Result<()> {
         shutdown_rx.clone(),
         {
             let uri = coredb_uri.clone();
+            let presets = llm_presets.clone();
             move || {
                 let uri = uri.clone();
+                let presets = presets.clone();
                 Box::pin(async move {
-                    backtest::run::run(&uri, BacktestMode::Both, execute, live).await
+                    let plan = if presets.is_empty() {
+                        BacktestPlan::both()
+                    } else {
+                        BacktestPlan::multi(true, presets)
+                    };
+                    backtest::run::run(&uri, plan, execute, live).await
                 })
                     as std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>>
             }

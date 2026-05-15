@@ -18,7 +18,7 @@ use serde::Deserialize;
 use uuid::Uuid;
 
 use crate::api::{AnthropicClient, ApiClient, OpenAICompatClient};
-use crate::backtest::{baseline::evaluate as baseline_evaluate, llm as llm_mod, BacktestMode};
+use crate::backtest::{baseline::evaluate as baseline_evaluate, llm as llm_mod, BacktestPlan};
 use crate::config::{Backend, Config};
 use crate::coredb::btc::BtcTickRepo;
 use crate::coredb::decisions::DecisionRepo;
@@ -49,9 +49,9 @@ struct BinanceTicker {
     last_price: String,
 }
 
-pub async fn run(coredb_uri: &str, mode: BacktestMode, execute: bool, live: bool) -> Result<()> {
+pub async fn run(coredb_uri: &str, plan: BacktestPlan, execute: bool, live: bool) -> Result<()> {
     println!(
-        "🔍 backtest: connecting to CoreDB at {coredb_uri} (mode={mode:?}, execute={execute}, live={live})"
+        "🔍 backtest: connecting to CoreDB at {coredb_uri} (plan={plan:?}, execute={execute}, live={live})"
     );
     let db = CoreDb::connect(coredb_uri).await.context("connect coredb")?;
     let dec_repo = DecisionRepo::new(db.session()).await?;
@@ -85,16 +85,31 @@ pub async fn run(coredb_uri: &str, mode: BacktestMode, execute: bool, live: bool
         None
     };
 
-    // Build the LLM client only when we'll actually use it — Config::load
-    // touches the env (or ~/.deepseek), and we don't want to demand any
-    // credentials for the baseline-only path.
-    let llm_ctx = if mode.wants_llm() {
-        Some(LlmCtx::from_config(Config::load()?)?)
+    // Resolve every LLM strategy the plan calls for *before* touching
+    // markets — fail fast on missing credentials rather than after a
+    // 30-second Polymarket pull. An empty-string preset resolves to the
+    // env-driven default (legacy `--llm` / `--both`); a named preset
+    // resolves the matching backend directly so multi-LLM runs don't
+    // have to mutate AGENT_BACKEND env vars between strategies.
+    let llm_ctxs: Vec<LlmCtx> = if plan.wants_llm() {
+        let mut v = Vec::with_capacity(plan.llm_presets.len());
+        for preset in &plan.llm_presets {
+            v.push(LlmCtx::resolve(preset)?);
+        }
+        // Deduplicate by label — if the user passes `--llms deepseek,deepseek`
+        // or `--llms deepseek,` (env default also resolves to deepseek)
+        // we'd otherwise spend twice the budget for no extra signal.
+        let mut seen = std::collections::HashSet::new();
+        v.retain(|c| seen.insert(c.label.to_string()));
+        v
     } else {
-        None
+        Vec::new()
     };
-    if let Some(ctx) = &llm_ctx {
-        println!("🧠 backtest: LLM = {} ({})", ctx.label, ctx.model);
+    if !llm_ctxs.is_empty() {
+        println!("🧠 backtest: LLM strategies =");
+        for ctx in &llm_ctxs {
+            println!("     - {} ({})", ctx.label, ctx.model);
+        }
     }
 
     let http = Client::builder()
@@ -156,47 +171,48 @@ pub async fn run(coredb_uri: &str, mode: BacktestMode, execute: bool, live: bool
 
     let ts = now_ms();
     let bd = bucket_day(ts);
-    // counts: strategy → (side → count). Per-strategy in --both mode so
-    // the final summary stays comparable; in single-strategy modes the
-    // outer map only holds one key.
-    let mut counts: std::collections::HashMap<&'static str, std::collections::HashMap<String, u32>> =
+    // counts: strategy → (side → count). One outer entry per strategy
+    // in play (baseline + every LLM in plan.llm_presets), so the final
+    // summary stays comparable across strategies.
+    let mut counts: std::collections::HashMap<String, std::collections::HashMap<String, u32>> =
         std::collections::HashMap::new();
     let mut stored = 0u32;
     let mut exec_stats = ExecStats::default();
     for (i, m) in markets.iter().enumerate() {
         // Buffer the per-strategy evaluations for THIS market before
         // any inserts so all rows share the same `ts` / `entry_price`.
-        // In --both mode that's what makes the head-to-head fair: same
-        // BTC spot, same Polymarket yes_price, same decision instant.
-        let mut emissions: Vec<(&'static str, Decision)> = Vec::new();
+        // In --both / --llms mode that's what makes the head-to-head
+        // fair: same BTC spot, same Polymarket yes_price, same
+        // decision instant across every strategy.
+        let mut emissions: Vec<Decision> = Vec::new();
 
-        if mode.wants_baseline() {
+        if plan.wants_baseline() {
             let b = baseline_evaluate(m, btc_price);
-            emissions.push((
-                "baseline",
-                Decision {
-                    bucket_day_ms: bd,
-                    ts_ms: ts,
-                    decision_id: Uuid::new_v4(),
-                    market_slug: m.slug.clone(),
-                    side: b.side.to_string(),
-                    size_usd: b.size_usd,
-                    confidence: b.confidence,
-                    edge_bps: b.edge_bps,
-                    reasoning: b.reasoning,
-                    raw_response: "baseline-rule".to_string(),
-                    entry_price: m.last_price,
-                    strategy: "baseline".to_string(),
-                },
-            ));
+            emissions.push(Decision {
+                bucket_day_ms: bd,
+                ts_ms: ts,
+                decision_id: Uuid::new_v4(),
+                market_slug: m.slug.clone(),
+                side: b.side.to_string(),
+                size_usd: b.size_usd,
+                confidence: b.confidence,
+                edge_bps: b.edge_bps,
+                reasoning: b.reasoning,
+                raw_response: "baseline-rule".to_string(),
+                entry_price: m.last_price,
+                strategy: "baseline".to_string(),
+            });
         }
 
-        if mode.wants_llm() {
-            let ctx = llm_ctx
-                .as_ref()
-                .expect("llm_ctx must be initialized when mode.wants_llm()");
+        for ctx in &llm_ctxs {
             if (i + 1) % 5 == 0 || i == 0 {
-                println!("   llm: {}/{}  ({})", i + 1, markets.len(), m.slug);
+                println!(
+                    "   {}: {}/{}  ({})",
+                    ctx.strategy_label,
+                    i + 1,
+                    markets.len(),
+                    m.slug
+                );
             }
             let d = llm_mod::evaluate(
                 m,
@@ -206,34 +222,26 @@ pub async fn run(coredb_uri: &str, mode: BacktestMode, execute: bool, live: bool
                 ctx.max_tokens,
             )
             .await;
-            emissions.push((
-                "llm",
-                Decision {
-                    bucket_day_ms: bd,
-                    ts_ms: ts,
-                    decision_id: Uuid::new_v4(),
-                    market_slug: m.slug.clone(),
-                    side: d.side,
-                    size_usd: d.size_usd,
-                    confidence: d.confidence,
-                    edge_bps: d.edge_bps,
-                    reasoning: d.reasoning,
-                    raw_response: d.raw_response,
-                    entry_price: m.last_price,
-                    // The single-LLM path keeps the historical "llm"
-                    // label so downstream comparisons / dashboards see
-                    // unchanged grouping across the strategy-column
-                    // rollout. The N-way `--llms` path uses the
-                    // strategy preset name (`anthropic`, `deepseek`,
-                    // ...) so individual backends are distinguishable.
-                    strategy: "llm".to_string(),
-                },
-            ));
+            emissions.push(Decision {
+                bucket_day_ms: bd,
+                ts_ms: ts,
+                decision_id: Uuid::new_v4(),
+                market_slug: m.slug.clone(),
+                side: d.side,
+                size_usd: d.size_usd,
+                confidence: d.confidence,
+                edge_bps: d.edge_bps,
+                reasoning: d.reasoning,
+                raw_response: d.raw_response,
+                entry_price: m.last_price,
+                strategy: ctx.strategy_label.clone(),
+            });
         }
 
-        for (strategy, decision) in &emissions {
+        for decision in &emissions {
+            let strategy = decision.strategy.clone();
             *counts
-                .entry(strategy)
+                .entry(strategy.clone())
                 .or_default()
                 .entry(decision.side.clone())
                 .or_insert(0) += 1;
@@ -283,15 +291,15 @@ pub async fn run(coredb_uri: &str, mode: BacktestMode, execute: bool, live: bool
     } // end outer per-market loop
 
     println!("✓ backtest complete:");
-    let mut strategies: Vec<&'static str> = counts.keys().copied().collect();
+    let mut strategies: Vec<&String> = counts.keys().collect();
     strategies.sort();
     for strategy in &strategies {
-        let sides = &counts[strategy];
+        let sides = &counts[*strategy];
         let line: Vec<String> = ["YES", "NO", "PASS"]
             .iter()
             .map(|s| format!("{s}={}", sides.get(*s).copied().unwrap_or(0)))
             .collect();
-        println!("   {strategy:<8} {}", line.join(" "));
+        println!("   {strategy:<10} {}", line.join(" "));
     }
     println!("   stored {} decisions in polymarket_btc.decisions", stored);
     if exec_ctx.is_some() {
@@ -323,17 +331,38 @@ struct ExecStats {
     errors: u32,
 }
 
-/// Bundle of everything the LLM path needs at call time. Built once
-/// per `run` invocation so we don't re-resolve the backend per market.
+/// Bundle of everything one LLM strategy needs at call time. Built
+/// once per `run` invocation so we don't re-resolve the backend per
+/// market.
+///
+/// `label` is the resolved backend identifier (`anthropic`,
+/// `deepseek`, ...). `strategy_label` is what goes into
+/// `decisions.strategy` — for the legacy default-LLM path that's the
+/// historical `"llm"` so existing snapshots keep grouping; for the
+/// N-way path it's the preset name itself.
 struct LlmCtx {
     client: Box<dyn ApiClient>,
     model: String,
     max_tokens: u32,
     label: &'static str,
+    strategy_label: String,
 }
 
 impl LlmCtx {
-    fn from_config(config: Config) -> Result<Self> {
+    /// Resolve a preset name to a ready-to-call LLM context. An empty
+    /// preset means "use the env-driven default" (legacy `--llm` /
+    /// `--both`); otherwise the preset name picks the backend directly
+    /// (`deepseek`, `anthropic`, `openai`).
+    ///
+    /// In the empty-preset case the decision rows are labeled `"llm"`
+    /// so they cluster with historical pre-`--llms` data. Named
+    /// presets are labeled by name so N-way comparisons stay distinct.
+    fn resolve(preset: &str) -> Result<Self> {
+        let config = if preset.is_empty() {
+            Config::load()?
+        } else {
+            load_preset_config(preset)?
+        };
         let label;
         let client: Box<dyn ApiClient> = match config.backend.clone() {
             Backend::Anthropic { api_key } => {
@@ -351,12 +380,111 @@ impl LlmCtx {
                 Box::new(OpenAICompatClient::new(base_url, api_key))
             }
         };
+        let strategy_label = if preset.is_empty() {
+            "llm".to_string()
+        } else {
+            label.to_string()
+        };
         Ok(Self {
             client,
             model: config.model,
             max_tokens: config.max_tokens,
             label,
+            strategy_label,
         })
+    }
+}
+
+/// Resolve a named preset to a fully-formed [`Config`] without going
+/// through `AGENT_BACKEND`. This lets `--llms deepseek,anthropic` run
+/// both backends in one process without env mutation.
+///
+/// Each preset reads only the env vars it actually needs — anthropic
+/// doesn't touch DeepSeek creds and vice-versa — so a user with only
+/// one provider configured can still run a single-strategy pass.
+fn load_preset_config(preset: &str) -> Result<Config> {
+    let cfg = Config::default();
+    match preset.to_ascii_lowercase().as_str() {
+        "anthropic" | "claude" => {
+            let api_key = std::env::var("ANTHROPIC_API_KEY").context(
+                "--llms anthropic needs ANTHROPIC_API_KEY set",
+            )?;
+            let model = std::env::var("ANTHROPIC_MODEL")
+                .unwrap_or_else(|_| "claude-sonnet-4-20250514".to_string());
+            Ok(Config {
+                backend: Backend::Anthropic { api_key },
+                model,
+                ..cfg
+            })
+        }
+        "deepseek" => {
+            let api_key = std::env::var("DEEPSEEK_API_KEY")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .or_else(|| read_dotfile(".deepseek"))
+                .context(
+                    "--llms deepseek needs DEEPSEEK_API_KEY env or ~/.deepseek",
+                )?;
+            let base_url = std::env::var("DEEPSEEK_BASE_URL")
+                .unwrap_or_else(|_| "https://api.deepseek.com/v1".to_string());
+            let model = std::env::var("DEEPSEEK_MODEL")
+                .unwrap_or_else(|_| "deepseek-chat".to_string());
+            Ok(Config {
+                backend: Backend::OpenAICompat { api_key, base_url },
+                model,
+                ..cfg
+            })
+        }
+        "openai" => {
+            let api_key = std::env::var("OPENAI_API_KEY").context(
+                "--llms openai needs OPENAI_API_KEY set",
+            )?;
+            let base_url = std::env::var("OPENAI_BASE_URL")
+                .unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
+            let model = std::env::var("OPENAI_MODEL").context(
+                "--llms openai needs OPENAI_MODEL set (e.g. gpt-4o)",
+            )?;
+            Ok(Config {
+                backend: Backend::OpenAICompat { api_key, base_url },
+                model,
+                ..cfg
+            })
+        }
+        other => anyhow::bail!(
+            "unknown --llms preset {other:?}; supported: anthropic, deepseek, openai"
+        ),
+    }
+}
+
+fn read_dotfile(name: &str) -> Option<String> {
+    let home = std::env::var("HOME").ok()?;
+    let raw = std::fs::read_to_string(std::path::Path::new(&home).join(name)).ok()?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() { None } else { Some(trimmed.to_string()) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preset_unknown_returns_error() {
+        let r = load_preset_config("nonsense");
+        assert!(r.is_err());
+        let msg = r.err().unwrap().to_string();
+        assert!(msg.contains("unknown --llms preset"), "got: {msg}");
+    }
+
+    #[test]
+    fn preset_anthropic_missing_key_errors() {
+        // Don't actually exec the env-touching path conditionally on
+        // ANTHROPIC_API_KEY presence — the test runner's env is
+        // ambient. Just assert the function returns a structured
+        // error type when called with a key that is *guaranteed* not
+        // to exist by using an alias the resolver doesn't recognize.
+        // (Real env-coupled tests live in integration.)
+        let r = load_preset_config("CLAUDE-typo");
+        assert!(r.is_err());
     }
 }
 

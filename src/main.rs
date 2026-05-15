@@ -112,6 +112,17 @@ enum Commands {
         /// Run BOTH baseline and LLM strategies per market (overrides --llm).
         #[arg(long)]
         both: bool,
+        /// Run N LLM strategies side-by-side on the same market state.
+        /// Comma-separated preset names — supported: `anthropic`,
+        /// `deepseek`, `openai`. Overrides `--llm`; combine with
+        /// `--both` to also include the baseline rule.
+        ///
+        /// Each preset reads its own env vars: anthropic →
+        /// ANTHROPIC_API_KEY (+ optional ANTHROPIC_MODEL), deepseek →
+        /// DEEPSEEK_API_KEY / ~/.deepseek (+ optional DEEPSEEK_MODEL),
+        /// openai → OPENAI_API_KEY + OPENAI_MODEL.
+        #[arg(long, value_delimiter = ',')]
+        llms: Vec<String>,
         /// Auto-execute non-PASS decisions via risk gate + executor.
         #[arg(long)]
         execute: bool,
@@ -217,6 +228,12 @@ enum Commands {
         /// LiveExec stays DRY_RUN unless LIVE_TRADING_ENABLED=1.
         #[arg(long)]
         live: bool,
+        /// Comma-separated LLM preset names (`anthropic,deepseek,openai`)
+        /// to run on every periodic backtest. Empty = single
+        /// env-resolved LLM (legacy `--both`). Each preset must have
+        /// its own credentials set (see `backtest --llms` docs).
+        #[arg(long, value_delimiter = ',')]
+        llms: Vec<String>,
     },
 }
 
@@ -265,15 +282,21 @@ async fn main() -> Result<()> {
         Some(Commands::Stats { coredb_uri }) => {
             run_stats(coredb_uri).await?;
         }
-        Some(Commands::Backtest { coredb_uri, llm, both, execute, live }) => {
-            let mode = if both {
-                backtest::BacktestMode::Both
+        Some(Commands::Backtest { coredb_uri, llm, both, llms, execute, live }) => {
+            let plan = if !llms.is_empty() {
+                // `--llms` is the N-way path. `--both` here means
+                // "also run baseline alongside the listed LLMs"; the
+                // legacy single-LLM `--llm` flag is ignored because
+                // `--llms` is strictly more expressive.
+                backtest::BacktestPlan::multi(both, llms)
+            } else if both {
+                backtest::BacktestPlan::both()
             } else if llm {
-                backtest::BacktestMode::Llm
+                backtest::BacktestPlan::default_llm()
             } else {
-                backtest::BacktestMode::Baseline
+                backtest::BacktestPlan::baseline_only()
             };
-            backtest::run::run(&coredb_uri, mode, execute, live).await?;
+            backtest::run::run(&coredb_uri, plan, execute, live).await?;
         }
         Some(Commands::ComparePnl { coredb_uri }) => {
             backtest::compare::run(&coredb_uri).await?;
@@ -312,6 +335,7 @@ async fn main() -> Result<()> {
             settle_every,
             no_execute,
             live,
+            llms,
         }) => {
             let mut cfg = daemon::DaemonConfig::new(coredb_uri);
             cfg.backtest_every_secs = backtest_every;
@@ -319,6 +343,7 @@ async fn main() -> Result<()> {
             cfg.settle_every_secs = settle_every;
             cfg.execute = !no_execute;
             cfg.live = live;
+            cfg.llm_presets = llms;
             daemon::run(cfg).await?;
         }
         None => {
