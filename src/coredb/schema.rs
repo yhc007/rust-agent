@@ -148,4 +148,21 @@ pub const MIGRATIONS: &[&str] = &[
         n_pass       INT, \
         PRIMARY KEY (bucket_day, ts, strategy) \
      )",
+
+    // ---- Pairwise agreement matrix snapshots ----
+    // N×(N-1) rows per compare-pnl invocation (no diagonal). PK
+    // matches the strategy_pnl_snapshots shape (partition on
+    // bucket_day, cluster on (ts, strategy_a, strategy_b)) so a
+    // day's worth of matrix rows stays together and the cron-driven
+    // `agreement-history` dump can replay them as a time series
+    // without scanning the whole table.
+    "CREATE TABLE IF NOT EXISTS polymarket_btc.agreement_snapshots ( \
+        bucket_day TIMESTAMP, \
+        ts         TIMESTAMP, \
+        strategy_a TEXT, \
+        strategy_b TEXT, \
+        shared     INT, \
+        matches    INT, \
+        PRIMARY KEY (bucket_day, ts, strategy_a, strategy_b) \
+     )",
 ];

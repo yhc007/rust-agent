@@ -157,6 +157,23 @@ enum Commands {
         #[arg(long, default_value_t = 1)]
         days: u32,
     },
+    /// Dump pairwise strategy agreement rates from CoreDB as a time
+    /// series. Pairs with `pnl-history` — same --days / --strategies
+    /// knobs, populated by the same cron-driven `compare-pnl` writes.
+    AgreementHistory {
+        #[arg(long, default_value = "127.0.0.1:9042")]
+        coredb_uri: String,
+        /// Restrict to snapshots whose *both* endpoints are in the
+        /// allow-list — keeps the displayed series self-consistent
+        /// (a half-filtered pair would be a misleading half-truth).
+        #[arg(long, value_delimiter = ',')]
+        strategies: Vec<String>,
+        /// Number of UTC days back from "today" to include. 1 = today
+        /// only, the historical default. Failed partition reads on
+        /// one day are logged but don't abort the rest of the window.
+        #[arg(long, default_value_t = 1)]
+        days: u32,
+    },
     /// Dump strategy PnL snapshots from CoreDB as a time series.
     /// Default scans today only; use `--days N` to widen the window
     /// to the last N UTC days. Intended consumer of the cron-driven
@@ -365,6 +382,10 @@ async fn main() -> Result<()> {
         Some(Commands::PnlHistory { coredb_uri, strategies, days }) => {
             let filter = if strategies.is_empty() { None } else { Some(strategies) };
             backtest::history::run(&coredb_uri, filter.as_deref(), days).await?;
+        }
+        Some(Commands::AgreementHistory { coredb_uri, strategies, days }) => {
+            let filter = if strategies.is_empty() { None } else { Some(strategies) };
+            backtest::agreement_history::run(&coredb_uri, filter.as_deref(), days).await?;
         }
         Some(Commands::SettlePnl { coredb_uri }) => {
             backtest::settle::run(&coredb_uri).await?;

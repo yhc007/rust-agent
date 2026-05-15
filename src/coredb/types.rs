@@ -99,6 +99,37 @@ impl Decision {
 }
 
 #[cfg(test)]
+mod agreement_snapshot_tests {
+    use super::*;
+
+    fn a(shared: i32, matches: i32) -> AgreementSnapshot {
+        AgreementSnapshot {
+            bucket_day_ms: 0,
+            ts_ms: 0,
+            strategy_a: "a".into(),
+            strategy_b: "b".into(),
+            shared,
+            matches,
+        }
+    }
+
+    #[test]
+    fn rate_zero_when_no_shared_markets() {
+        assert_eq!(a(0, 0).rate(), 0.0);
+        // matches > shared shouldn't happen in practice, but rate
+        // should still return *something* without panicking.
+        assert_eq!(a(0, 5).rate(), 0.0);
+    }
+
+    #[test]
+    fn rate_is_matches_over_shared() {
+        assert!((a(10, 7).rate() - 0.7).abs() < 1e-9);
+        assert_eq!(a(4, 4).rate(), 1.0);
+        assert_eq!(a(4, 0).rate(), 0.0);
+    }
+}
+
+#[cfg(test)]
 mod decision_tests {
     use super::*;
 
@@ -177,6 +208,37 @@ pub struct StrategyPnlSnapshot {
     pub n_yes: i32,
     pub n_no: i32,
     pub n_pass: i32,
+}
+
+/// One ordered-pair agreement cell from a `compare-pnl` matrix run.
+/// Stored as N×(N-1) rows per snapshot ts (no diagonal). Symmetric
+/// on the wire because the read path doesn't have to know that —
+/// each row carries its full (strategy_a, strategy_b) tuple and
+/// readers can pivot as needed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgreementSnapshot {
+    pub bucket_day_ms: Millis,
+    pub ts_ms: Millis,
+    pub strategy_a: String,
+    pub strategy_b: String,
+    /// Markets where both strategies emitted a decision (latest per
+    /// pair, matching the matrix builder's semantics).
+    pub shared: i32,
+    /// Subset of `shared` where both picked the same side (PASS
+    /// included — see compare-pnl matrix docstring).
+    pub matches: i32,
+}
+
+impl AgreementSnapshot {
+    /// matches / shared as a [0.0, 1.0] rate; 0.0 when shared is 0
+    /// (degenerate but the only sensible default for sparkline math).
+    pub fn rate(&self) -> f64 {
+        if self.shared == 0 {
+            0.0
+        } else {
+            self.matches as f64 / self.shared as f64
+        }
+    }
 }
 
 /// Daily PnL roll-up.

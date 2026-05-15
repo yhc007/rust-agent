@@ -4,6 +4,7 @@
 //! the `polymarket_btc` keyspace and tables. Wraps a `scylla::Session`
 //! that other repositories will share via `Arc`.
 
+pub mod agreement;
 pub mod btc;
 pub mod decisions;
 pub mod error;
@@ -59,6 +60,7 @@ impl CoreDb {
         "positions_v2",
         "pnl_daily",
         "strategy_pnl_snapshots",
+        "agreement_snapshots",
     ];
 
     /// Approximate row count for each known table. CoreDB's CQL parser

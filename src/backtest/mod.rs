@@ -9,6 +9,7 @@
 //! `polymarket_btc.decisions` with an explicit `strategy` label so
 //! downstream `compare-pnl` / `settle-pnl` can group it correctly.
 
+pub mod agreement_history;
 pub mod baseline;
 pub mod compare;
 pub mod history;

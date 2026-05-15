@@ -18,9 +18,12 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use reqwest::Client;
 
+use crate::coredb::agreement::AgreementRepo;
 use crate::coredb::decisions::DecisionRepo;
 use crate::coredb::strategy_pnl::StrategyPnlRepo;
-use crate::coredb::types::{bucket_day, now_ms, Decision, Millis, StrategyPnlSnapshot};
+use crate::coredb::types::{
+    bucket_day, now_ms, AgreementSnapshot, Decision, Millis, StrategyPnlSnapshot,
+};
 use crate::coredb::CoreDb;
 
 const DAY_MS: Millis = 86_400_000;
@@ -43,6 +46,7 @@ pub async fn run(
     let db = CoreDb::connect(coredb_uri).await.context("connect coredb")?;
     let repo = DecisionRepo::new(db.session()).await?;
     let snap_repo = StrategyPnlRepo::new(db.session()).await?;
+    let agree_repo = AgreementRepo::new(db.session()).await?;
 
     let snapshot_ts = now_ms();
     let bd = bucket_day(snapshot_ts);
@@ -168,7 +172,8 @@ pub async fn run(
     }
 
     print_summary(&by_strategy);
-    print_agreement_matrix(&usable);
+    let agreement_matrix = compute_agreement_matrix(&usable);
+    print_agreement_matrix_with(&agreement_matrix);
     print_disagreements(&usable);
 
     // Persist per-strategy aggregates as time-series snapshots so the
@@ -224,6 +229,44 @@ pub async fn run(
         };
         if let Err(e) = snap_repo.insert(&snap).await {
             eprintln!("  ! strategy_pnl_snapshots insert failed for {strategy}: {e}");
+        }
+    }
+
+    // Persist the agreement matrix as N×(N-1) rows (both orderings —
+    // see agreement.rs docstring). Skipped when only one strategy is
+    // in play; the matrix is degenerate there and writing zero-row
+    // partitions would just add noise to `agreement-history`.
+    if agreement_matrix.strategies.len() >= 2 {
+        let mut written = 0u32;
+        for (i, a) in agreement_matrix.strategies.iter().enumerate() {
+            for (j, b) in agreement_matrix.strategies.iter().enumerate() {
+                if i == j {
+                    continue;
+                }
+                let cell = &agreement_matrix.cells[i][j];
+                let snap = AgreementSnapshot {
+                    bucket_day_ms: bd,
+                    ts_ms: snapshot_ts,
+                    strategy_a: a.clone(),
+                    strategy_b: b.clone(),
+                    shared: cell.shared as i32,
+                    matches: cell.matches as i32,
+                };
+                if let Err(e) = agree_repo.insert(&snap).await {
+                    eprintln!(
+                        "  ! agreement_snapshots insert failed for {a}↔{b}: {e}"
+                    );
+                } else {
+                    written += 1;
+                }
+            }
+        }
+        if written > 0 {
+            println!(
+                "\n💾 agreement_snapshots: wrote {written} rows ({} strategies, {} ordered pairs)",
+                agreement_matrix.strategies.len(),
+                agreement_matrix.strategies.len() * (agreement_matrix.strategies.len() - 1),
+            );
         }
     }
 
@@ -310,8 +353,7 @@ fn print_summary(by_strategy: &HashMap<String, Vec<Marked>>) {
 /// market agree on it. That matches the intuition for the consensus
 /// dashboard ("did both look at this and reach the same conclusion?")
 /// even though PASS isn't really an "opinion".
-fn print_agreement_matrix(all: &[&Decision]) {
-    let matrix = compute_agreement_matrix(all);
+fn print_agreement_matrix_with(matrix: &AgreementMatrix) {
     if matrix.strategies.len() < 2 {
         // 0 or 1 strategies → matrix is degenerate; the summary table
         // already covers the single-strategy case.
