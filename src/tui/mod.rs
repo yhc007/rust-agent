@@ -817,7 +817,12 @@ fn draw(
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),                  // header
+            // 4-row header so both content lines (BTC + chip, then
+            // snap-age + chip detail) survive the surrounding
+            // borders. Length(3) — the old value — gave only one
+            // content line inside the box, hiding the meta line
+            // and rendering the chip's `detail` field invisible.
+            Constraint::Length(4),                  // header
             Constraint::Length(6),                  // strategy pnl
             Constraint::Min(5),                     // market consensus
             Constraint::Min(5),                     // positions
@@ -1791,7 +1796,14 @@ mod tests {
     /// PnL values are picked so one strategy is positive and one
     /// negative — exercises both coloring branches without making
     /// the test brittle to amplitude.
-    fn render_test_dashboard(filter: Option<&str>) -> String {
+    ///
+    /// `health` lets a caller inject a [`HealthChip`] into the
+    /// rendered Snapshot to exercise the header's chip + detail-line
+    /// rendering. `None` means "don't include a /health chip".
+    fn render_test_dashboard_with(
+        filter: Option<&str>,
+        health: Option<super::HealthChip>,
+    ) -> String {
         use crate::coredb::types::{BtcTick, StrategyPnlSnapshot};
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
@@ -1831,6 +1843,7 @@ mod tests {
                 n_pass: 10,
             },
         ];
+        s.health = health;
 
         let strategies = super::strategies_in_view(&s);
         let backend = TestBackend::new(140, 35);
@@ -1848,6 +1861,11 @@ mod tests {
             })
             .unwrap();
         render_buffer(terminal.backend().buffer())
+    }
+
+    /// Backwards-compat shim — `health` defaults to `None`.
+    fn render_test_dashboard(filter: Option<&str>) -> String {
+        render_test_dashboard_with(filter, None)
     }
 
     #[test]
@@ -1926,6 +1944,68 @@ mod tests {
         assert!(
             dump.contains("decisions today"),
             "decisions panel title missing"
+        );
+    }
+
+    #[test]
+    fn panel_header_chip_ok_renders_status_and_uptime() {
+        // Healthy daemon: status label + daemon uptime "up Xs" both
+        // visible. `detail` carries the ingest-age summary on the
+        // green path — render it as the second header line.
+        let chip = super::HealthChip {
+            status: super::HealthStatus::Ok,
+            daemon_uptime_secs: Some(125),
+            detail: Some("btc 412ms / poly 1234ms".into()),
+        };
+        let dump = render_test_dashboard_with(None, Some(chip));
+        assert!(dump.contains("daemon:"), "chip prefix missing");
+        assert!(dump.contains("ok"), "ok status label missing");
+        // Uptime fmt_dur(125s) = "2m05s".
+        assert!(dump.contains("up 2m05s"), "uptime label missing");
+        assert!(
+            dump.contains("btc 412ms / poly 1234ms"),
+            "ingest-age detail missing"
+        );
+    }
+
+    #[test]
+    fn panel_header_chip_degraded_surfaces_detail_message() {
+        // Degraded daemon: detail carries the worst subtask error
+        // instead of ingest ages. Operator needs to see "why?" in
+        // the header without journalctl.
+        let chip = super::HealthChip {
+            status: super::HealthStatus::Degraded,
+            daemon_uptime_secs: Some(3600),
+            detail: Some("backtest: 5× — connection refused".into()),
+        };
+        let dump = render_test_dashboard_with(None, Some(chip));
+        assert!(dump.contains("degraded"), "degraded status label missing");
+        // Uptime fmt_dur(3600s) = "1h00m00s".
+        assert!(dump.contains("up 1h00m00s"), "uptime label missing");
+        assert!(
+            dump.contains("backtest: 5× — connection refused"),
+            "degraded detail not surfaced"
+        );
+    }
+
+    #[test]
+    fn panel_header_chip_unreachable_shows_reason() {
+        // Unreachable: /health probe failed. daemon_uptime_secs is
+        // None on this branch (we couldn't read it). Detail
+        // captures the underlying GET / parse error.
+        let chip = super::HealthChip {
+            status: super::HealthStatus::Unreachable,
+            daemon_uptime_secs: None,
+            detail: Some("GET failed: connection refused".into()),
+        };
+        let dump = render_test_dashboard_with(None, Some(chip));
+        assert!(dump.contains("unreachable"), "unreachable label missing");
+        // No uptime suffix when daemon_uptime_secs is None — must not
+        // render a stale "up 0s".
+        assert!(!dump.contains(" up "), "uptime accidentally rendered without data");
+        assert!(
+            dump.contains("GET failed: connection refused"),
+            "unreachable detail missing"
         );
     }
 
