@@ -17,6 +17,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use reqwest::Client;
+use serde::Serialize;
 
 use crate::coredb::agreement::AgreementRepo;
 use crate::coredb::decisions::DecisionRepo;
@@ -40,9 +41,17 @@ pub async fn run(
     coredb_uri: &str,
     strategies_filter: Option<&[String]>,
     days: u32,
+    json: bool,
 ) -> Result<()> {
     let days = days.max(1);
-    println!("📊 compare-pnl: connecting to CoreDB at {coredb_uri}");
+    // Route every operator-facing println through this so `--json` mode
+    // emits a clean single-object payload that downstream scripts can
+    // pipe straight into `jq`, a spreadsheet, or Prometheus. Errors
+    // from the data path still surface on stderr.
+    macro_rules! say {
+        ($($t:tt)*) => { if !json { println!($($t)*); } };
+    }
+    say!("📊 compare-pnl: connecting to CoreDB at {coredb_uri}");
     let db = CoreDb::connect(coredb_uri).await.context("connect coredb")?;
     let repo = DecisionRepo::new(db.session()).await?;
     let snap_repo = StrategyPnlRepo::new(db.session()).await?;
@@ -75,14 +84,14 @@ pub async fn run(
         }
     }
     if days > 1 {
-        println!(
+        say!(
             "   spanning {} UTC days: {} → {} (today)",
             days,
             bd - (days as i64 - 1) * DAY_MS,
             bd,
         );
         if empty_days > 0 {
-            println!("   {empty_days} of {days} days had no decisions");
+            say!("   {empty_days} of {days} days had no decisions");
         }
     }
 
@@ -96,7 +105,7 @@ pub async fn run(
     if let Some(allow) = strategies_filter {
         let set: std::collections::HashSet<&str> = allow.iter().map(String::as_str).collect();
         decisions.retain(|d| set.contains(d.effective_strategy()));
-        println!(
+        say!(
             "   filter: {} → {} decisions ({} strategies allowed: {})",
             pre_filter_count,
             decisions.len(),
@@ -106,16 +115,35 @@ pub async fn run(
     }
 
     if days == 1 {
-        println!(
+        say!(
             "   {} decisions for bucket_day = {} (UTC ms)",
             decisions.len(),
             bd
         );
     } else {
-        println!("   {} decisions across the window", decisions.len());
+        say!("   {} decisions across the window", decisions.len());
     }
 
     if decisions.is_empty() {
+        if json {
+            // Stable JSON shape even on empty input — downstream
+            // scripts don't have to special-case "no data" vs an
+            // error.
+            print_json_payload(&JsonOut {
+                bucket_day_ms: bd,
+                ts_ms: snapshot_ts,
+                filter: JsonFilter {
+                    strategies: strategies_filter.map(|s| s.to_vec()),
+                    days,
+                },
+                n_decisions_total: pre_filter_count,
+                n_decisions_after_filter: 0,
+                strategies: Vec::new(),
+                agreement_matrix: None,
+                disagreements: Vec::new(),
+            });
+            return Ok(());
+        }
         let hint = if strategies_filter.is_some() {
             "   (filter excluded every row — drop --strategies or check the labels are correct.)"
         } else {
@@ -136,12 +164,12 @@ pub async fn run(
         .collect();
     let dropped = decisions.len() - usable.len();
     if dropped > 0 {
-        println!(
+        say!(
             "   skipped {dropped} pre-schema rows (no entry_price recorded)"
         );
     }
     if usable.is_empty() {
-        println!(
+        say!(
             "   (no rows with entry_price — re-run `backtest [--llm]` and try again.)"
         );
         return Ok(());
@@ -151,9 +179,9 @@ pub async fn run(
         .timeout(Duration::from_secs(15))
         .build()
         .context("reqwest client")?;
-    println!("🌐 compare-pnl: pulling current YES prices from Polymarket Gamma");
+    say!("🌐 compare-pnl: pulling current YES prices from Polymarket Gamma");
     let marks = fetch_current_yes_prices(&http).await?;
-    println!("   {} live yes prices", marks.len());
+    say!("   {} live yes prices", marks.len());
 
     // Mark each decision. PASS rows always get a defined PnL of 0; non-PASS
     // rows whose market isn't in the live pull get None and are excluded
@@ -171,10 +199,34 @@ pub async fn run(
             .push(Marked { decision: d, mark, pnl });
     }
 
-    print_summary(&by_strategy);
     let agreement_matrix = compute_agreement_matrix(&usable);
-    print_agreement_matrix_with(&agreement_matrix);
-    print_disagreements(&usable);
+    if !json {
+        print_summary(&by_strategy);
+        print_agreement_matrix_with(&agreement_matrix);
+        print_disagreements(&usable);
+    } else {
+        // Build the full structured payload and emit before
+        // persisting snapshots so a `--json | jq` pipeline gets the
+        // numbers it asked for even if writes fail afterward.
+        let payload = JsonOut {
+            bucket_day_ms: bd,
+            ts_ms: snapshot_ts,
+            filter: JsonFilter {
+                strategies: strategies_filter.map(|s| s.to_vec()),
+                days,
+            },
+            n_decisions_total: pre_filter_count,
+            n_decisions_after_filter: decisions.len(),
+            strategies: build_json_strategies(&by_strategy),
+            agreement_matrix: if agreement_matrix.strategies.len() >= 2 {
+                Some(build_json_matrix(&agreement_matrix))
+            } else {
+                None
+            },
+            disagreements: build_json_disagreements(&usable),
+        };
+        print_json_payload(&payload);
+    }
 
     // Persist per-strategy aggregates as time-series snapshots so the
     // history can be reconstructed later (or scraped by a cron-driven
@@ -188,7 +240,7 @@ pub async fn run(
     // mode is an ad-hoc analysis tool, not a heartbeat call — the
     // daemon's periodic compare always passes days=1.
     if days > 1 {
-        println!(
+        say!(
             "\n💾 snapshot persistence skipped (--days {days} is analysis-only; \
              would conflate multi-day data into a single 'today' bucket)"
         );
@@ -262,7 +314,7 @@ pub async fn run(
             }
         }
         if written > 0 {
-            println!(
+            say!(
                 "\n💾 agreement_snapshots: wrote {written} rows ({} strategies, {} ordered pairs)",
                 agreement_matrix.strategies.len(),
                 agreement_matrix.strategies.len() * (agreement_matrix.strategies.len() - 1),
@@ -271,6 +323,209 @@ pub async fn run(
     }
 
     Ok(())
+}
+
+// ---- JSON output --------------------------------------------------
+
+#[derive(Serialize)]
+struct JsonOut {
+    bucket_day_ms: i64,
+    ts_ms: i64,
+    filter: JsonFilter,
+    /// Total decisions read across the chosen window, before
+    /// `--strategies` filtering.
+    n_decisions_total: usize,
+    /// Same count after `--strategies` filtering. Equal to
+    /// `n_decisions_total` when no filter is in effect.
+    n_decisions_after_filter: usize,
+    strategies: Vec<JsonStrategyAggregate>,
+    /// `None` when fewer than 2 strategies participated (matrix is
+    /// degenerate). Always present otherwise.
+    agreement_matrix: Option<JsonMatrix>,
+    /// Markets where the surviving strategies didn't all pick the
+    /// same side. Empty when every market has unanimous picks.
+    disagreements: Vec<JsonDisagreement>,
+}
+
+#[derive(Serialize)]
+struct JsonFilter {
+    /// `None` when the operator passed no `--strategies` filter,
+    /// `Some(list)` otherwise — gives downstream scripts a clear
+    /// "was this dataset restricted?" signal.
+    strategies: Option<Vec<String>>,
+    days: u32,
+}
+
+#[derive(Serialize)]
+struct JsonStrategyAggregate {
+    strategy: String,
+    n_decisions: usize,
+    n_yes: u32,
+    n_no: u32,
+    n_pass: u32,
+    sum_size_usd: f64,
+    sum_pnl: f64,
+    /// PnL averaged across decisions whose mark was resolved (i.e.
+    /// matches were found in the live Polymarket pull). PASS rows
+    /// count as 0 PnL with a defined mark, so they don't dilute.
+    avg_pnl: f64,
+    /// Number of rows that contributed to `sum_pnl` / `avg_pnl`.
+    /// Below `n_decisions` when some non-PASS rows had no live mark.
+    n_marked: u32,
+}
+
+#[derive(Serialize)]
+struct JsonMatrix {
+    strategies: Vec<String>,
+    cells: Vec<JsonMatrixCell>,
+}
+
+#[derive(Serialize)]
+struct JsonMatrixCell {
+    a: String,
+    b: String,
+    shared: u32,
+    matches: u32,
+    rate: f64,
+}
+
+#[derive(Serialize)]
+struct JsonDisagreement {
+    market_slug: String,
+    picks: Vec<JsonPick>,
+}
+
+#[derive(Serialize)]
+struct JsonPick {
+    strategy: String,
+    side: String,
+    size_usd: f64,
+    confidence: f64,
+}
+
+fn build_json_strategies(
+    by_strategy: &HashMap<String, Vec<Marked>>,
+) -> Vec<JsonStrategyAggregate> {
+    let mut keys: Vec<&String> = by_strategy.keys().collect();
+    keys.sort();
+    keys.into_iter()
+        .map(|strategy| {
+            let rows = &by_strategy[strategy];
+            let mut counts = HashMap::<&str, u32>::new();
+            let mut sum_size = 0.0;
+            let mut sum_pnl = 0.0;
+            let mut n_marked = 0u32;
+            for r in rows {
+                *counts.entry(r.decision.side.as_str()).or_default() += 1;
+                if r.decision.side != "PASS" {
+                    sum_size += r.decision.size_usd;
+                }
+                if let Some(p) = r.pnl {
+                    sum_pnl += p;
+                    n_marked += 1;
+                }
+            }
+            let avg_pnl = if n_marked > 0 {
+                sum_pnl / n_marked as f64
+            } else {
+                0.0
+            };
+            JsonStrategyAggregate {
+                strategy: strategy.clone(),
+                n_decisions: rows.len(),
+                n_yes: counts.get("YES").copied().unwrap_or(0),
+                n_no: counts.get("NO").copied().unwrap_or(0),
+                n_pass: counts.get("PASS").copied().unwrap_or(0),
+                sum_size_usd: sum_size,
+                sum_pnl,
+                avg_pnl,
+                n_marked,
+            }
+        })
+        .collect()
+}
+
+fn build_json_matrix(matrix: &AgreementMatrix) -> JsonMatrix {
+    let n = matrix.strategies.len();
+    let mut cells = Vec::new();
+    for i in 0..n {
+        for j in 0..n {
+            if i == j {
+                continue;
+            }
+            let c = &matrix.cells[i][j];
+            let rate = if c.shared > 0 {
+                c.matches as f64 / c.shared as f64
+            } else {
+                0.0
+            };
+            cells.push(JsonMatrixCell {
+                a: matrix.strategies[i].clone(),
+                b: matrix.strategies[j].clone(),
+                shared: c.shared,
+                matches: c.matches,
+                rate,
+            });
+        }
+    }
+    JsonMatrix {
+        strategies: matrix.strategies.clone(),
+        cells,
+    }
+}
+
+fn build_json_disagreements(all: &[&Decision]) -> Vec<JsonDisagreement> {
+    use std::collections::{BTreeMap, HashSet};
+    let mut by_market: HashMap<&str, HashMap<&str, &Decision>> = HashMap::new();
+    for d in all {
+        let per_strat = by_market.entry(d.market_slug.as_str()).or_default();
+        let strat = d.effective_strategy();
+        let keep = per_strat
+            .get(strat)
+            .map(|prev: &&Decision| d.ts_ms >= prev.ts_ms)
+            .unwrap_or(true);
+        if keep {
+            per_strat.insert(strat, d);
+        }
+    }
+    let mut out = Vec::new();
+    let mut slugs: Vec<&&str> = by_market.keys().collect();
+    slugs.sort();
+    for slug in slugs {
+        let per_strat = &by_market[*slug];
+        let distinct: HashSet<&str> = per_strat.values().map(|d| d.side.as_str()).collect();
+        if distinct.len() <= 1 {
+            continue;
+        }
+        // Sort the per-strategy picks for stable JSON output.
+        let mut picks: BTreeMap<&str, &Decision> = BTreeMap::new();
+        for (k, v) in per_strat {
+            picks.insert(k, v);
+        }
+        out.push(JsonDisagreement {
+            market_slug: slug.to_string(),
+            picks: picks
+                .iter()
+                .map(|(strat, d)| JsonPick {
+                    strategy: (*strat).to_string(),
+                    side: d.side.clone(),
+                    size_usd: d.size_usd,
+                    confidence: d.confidence,
+                })
+                .collect(),
+        });
+    }
+    out
+}
+
+fn print_json_payload(payload: &JsonOut) {
+    // Use pretty-print so a `--json` run can be eyeballed without a
+    // separate `jq` pass. Downstream scripts that want compact JSON
+    // can pipe through `jq -c`.
+    match serde_json::to_string_pretty(payload) {
+        Ok(s) => println!("{s}"),
+        Err(e) => eprintln!("compare-pnl: serialize JSON failed: {e}"),
+    }
 }
 
 /// Marked-to-market PnL for a single decision. Treats Polymarket prices

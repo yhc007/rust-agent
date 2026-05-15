@@ -156,6 +156,14 @@ enum Commands {
         /// the daily-resolution time series.
         #[arg(long, default_value_t = 1)]
         days: u32,
+        /// Emit one JSON object to stdout instead of the human-
+        /// readable tables. Same data, machine-shaped — pipe into
+        /// `jq`, a spreadsheet, or a Prometheus exporter. Snapshot
+        /// persistence and the structured payload happen regardless,
+        /// so the JSON dump and the cron-driven history series stay
+        /// consistent.
+        #[arg(long)]
+        json: bool,
     },
     /// Dump pairwise strategy agreement rates from CoreDB as a time
     /// series. Pairs with `pnl-history` — same --days / --strategies
@@ -375,9 +383,9 @@ async fn main() -> Result<()> {
             };
             backtest::run::run(&coredb_uri, plan, execute, live).await?;
         }
-        Some(Commands::ComparePnl { coredb_uri, strategies, days }) => {
+        Some(Commands::ComparePnl { coredb_uri, strategies, days, json }) => {
             let filter = if strategies.is_empty() { None } else { Some(strategies) };
-            backtest::compare::run(&coredb_uri, filter.as_deref(), days).await?;
+            backtest::compare::run(&coredb_uri, filter.as_deref(), days, json).await?;
         }
         Some(Commands::PnlHistory { coredb_uri, strategies, days }) => {
             let filter = if strategies.is_empty() { None } else { Some(strategies) };
