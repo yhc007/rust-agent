@@ -51,14 +51,7 @@ pub async fn run(coredb_uri: &str) -> Result<()> {
     let decisions = dec_repo.list_day(bd).await.context("read decisions")?;
     let strategy_of: HashMap<Uuid, String> = decisions
         .iter()
-        .map(|d| {
-            let label = if d.raw_response == "baseline-rule" {
-                "baseline"
-            } else {
-                "llm"
-            };
-            (d.decision_id, label.to_string())
-        })
+        .map(|d| (d.decision_id, d.effective_strategy().to_string()))
         .collect();
 
     let http = Client::builder()

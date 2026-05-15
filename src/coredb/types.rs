@@ -61,6 +61,11 @@ pub struct Market {
 /// can mark-to-market without depending on a separate price timeseries.
 /// Decisions written before the schema column existed will read back
 /// as `0.0` and should be excluded from comparisons.
+///
+/// `strategy` is the explicit label ("baseline", "deepseek", "anthropic",
+/// ...). Rows written before that column existed read back as empty;
+/// use [`Decision::effective_strategy`] to get a sensible label that
+/// falls back to the legacy `raw_response == "baseline-rule"` inference.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Decision {
     pub bucket_day_ms: Millis,
@@ -74,6 +79,62 @@ pub struct Decision {
     pub reasoning: String,
     pub raw_response: String,
     pub entry_price: f64,
+    pub strategy: String,
+}
+
+impl Decision {
+    /// Strategy label for grouping / aggregation. Prefers the explicit
+    /// `strategy` column; on pre-schema rows where it's empty, falls
+    /// back to the historical `raw_response == "baseline-rule"`
+    /// inference so old data keeps comparing correctly.
+    pub fn effective_strategy(&self) -> &str {
+        if !self.strategy.is_empty() {
+            &self.strategy
+        } else if self.raw_response == "baseline-rule" {
+            "baseline"
+        } else {
+            "llm"
+        }
+    }
+}
+
+#[cfg(test)]
+mod decision_tests {
+    use super::*;
+
+    fn d(strategy: &str, raw: &str) -> Decision {
+        Decision {
+            bucket_day_ms: 0,
+            ts_ms: 0,
+            decision_id: Uuid::nil(),
+            market_slug: String::new(),
+            side: "PASS".into(),
+            size_usd: 0.0,
+            confidence: 0.0,
+            edge_bps: 0,
+            reasoning: String::new(),
+            raw_response: raw.into(),
+            entry_price: 0.0,
+            strategy: strategy.into(),
+        }
+    }
+
+    #[test]
+    fn effective_strategy_prefers_explicit_column() {
+        assert_eq!(d("deepseek", "baseline-rule").effective_strategy(), "deepseek");
+        assert_eq!(d("anthropic", "...llm json...").effective_strategy(), "anthropic");
+    }
+
+    #[test]
+    fn effective_strategy_legacy_baseline_inference() {
+        assert_eq!(d("", "baseline-rule").effective_strategy(), "baseline");
+    }
+
+    #[test]
+    fn effective_strategy_legacy_llm_inference() {
+        assert_eq!(d("", "{\"side\":\"YES\"}").effective_strategy(), "llm");
+        assert_eq!(d("", "").effective_strategy(), "llm");
+    }
 }
 
 /// Order lifecycle record. `status` is `pending|filled|canceled|partial`.

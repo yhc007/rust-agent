@@ -1,15 +1,16 @@
 //! Mark-to-market PnL comparison between strategies.
 //!
 //! Reads every `polymarket_btc.decisions` row for a chosen UTC day,
-//! buckets them by strategy (baseline rule vs LLM, based on the row's
-//! `raw_response` content), looks up the current YES price for each
-//! market live from Polymarket Gamma, and prints a side-by-side PnL
-//! summary plus a list of markets where the two strategies disagreed.
+//! buckets them by strategy (the explicit `strategy` column, with a
+//! legacy `raw_response == "baseline-rule"` fallback for pre-schema
+//! rows), looks up the current YES price for each market live from
+//! Polymarket Gamma, and prints a side-by-side PnL summary plus a list
+//! of markets where strategies disagreed.
 //!
 //! "PnL" here is a hypothetical paper PnL — no orders are placed, no
 //! fees / slippage are modeled. The point is comparative: same market
-//! prices, same time window, two strategies → which one would have
-//! made more money mark-to-market right now?
+//! prices, same time window, N strategies → which one would have made
+//! more money mark-to-market right now?
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -22,32 +23,10 @@ use crate::coredb::strategy_pnl::StrategyPnlRepo;
 use crate::coredb::types::{bucket_day, now_ms, Decision, StrategyPnlSnapshot};
 use crate::coredb::CoreDb;
 
-/// Strategy bucket for a single decision row.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum Strategy {
-    Baseline,
-    Llm,
-}
-
-impl Strategy {
-    fn classify(d: &Decision) -> Self {
-        if d.raw_response == "baseline-rule" {
-            Strategy::Baseline
-        } else {
-            Strategy::Llm
-        }
-    }
-    fn label(&self) -> &'static str {
-        match self {
-            Strategy::Baseline => "baseline",
-            Strategy::Llm => "llm",
-        }
-    }
-}
-
 /// One marked-to-market decision row.
 struct Marked<'a> {
     decision: &'a Decision,
+    #[allow(dead_code)]
     mark: Option<f64>,
     pnl: Option<f64>,
 }
@@ -110,7 +89,7 @@ pub async fn run(coredb_uri: &str) -> Result<()> {
     // Mark each decision. PASS rows always get a defined PnL of 0; non-PASS
     // rows whose market isn't in the live pull get None and are excluded
     // from per-strategy totals (would otherwise silently zero out).
-    let mut by_strategy: HashMap<Strategy, Vec<Marked>> = HashMap::new();
+    let mut by_strategy: HashMap<String, Vec<Marked>> = HashMap::new();
     for d in &usable {
         let mark = marks.get(&d.market_slug).copied();
         let pnl = match d.side.as_str() {
@@ -118,7 +97,7 @@ pub async fn run(coredb_uri: &str) -> Result<()> {
             _ => mark.map(|m| pnl_for(&d.side, d.size_usd, d.entry_price, m)),
         };
         by_strategy
-            .entry(Strategy::classify(d))
+            .entry(d.effective_strategy().to_string())
             .or_default()
             .push(Marked { decision: d, mark, pnl });
     }
@@ -156,7 +135,7 @@ pub async fn run(coredb_uri: &str) -> Result<()> {
         let snap = StrategyPnlSnapshot {
             bucket_day_ms: bd,
             ts_ms: snapshot_ts,
-            strategy: strategy.label().to_string(),
+            strategy: strategy.clone(),
             n_decisions: rows.len() as i32,
             sum_size_usd: sum_size,
             sum_pnl,
@@ -165,7 +144,7 @@ pub async fn run(coredb_uri: &str) -> Result<()> {
             n_pass,
         };
         if let Err(e) = snap_repo.insert(&snap).await {
-            eprintln!("  ! strategy_pnl_snapshots insert failed for {}: {e}", strategy.label());
+            eprintln!("  ! strategy_pnl_snapshots insert failed for {strategy}: {e}");
         }
     }
 
@@ -200,16 +179,16 @@ pub fn pnl_for(side: &str, size_usd: f64, entry: f64, mark: f64) -> f64 {
     }
 }
 
-fn print_summary(by_strategy: &HashMap<Strategy, Vec<Marked>>) {
+fn print_summary(by_strategy: &HashMap<String, Vec<Marked>>) {
     println!("\n🏆 Strategy comparison");
     println!(
-        "   {:<10} {:>10} {:>5} {:>5} {:>5} {:>10} {:>10} {:>10}",
+        "   {:<12} {:>10} {:>5} {:>5} {:>5} {:>10} {:>10} {:>10}",
         "strategy", "decisions", "YES", "NO", "PASS", "Σ size", "Σ pnl", "avg pnl"
     );
-    let mut strategies: Vec<_> = by_strategy.keys().copied().collect();
-    strategies.sort_by_key(|s| s.label());
+    let mut strategies: Vec<&String> = by_strategy.keys().collect();
+    strategies.sort();
     for s in strategies {
-        let rows = &by_strategy[&s];
+        let rows = &by_strategy[s];
         let n = rows.len();
         let mut counts = HashMap::<&str, u32>::new();
         let mut sum_size = 0.0;
@@ -231,8 +210,8 @@ fn print_summary(by_strategy: &HashMap<Strategy, Vec<Marked>>) {
             0.0
         };
         println!(
-            "   {:<10} {:>10} {:>5} {:>5} {:>5} {:>10} {:>10} {:>10}",
-            s.label(),
+            "   {:<12} {:>10} {:>5} {:>5} {:>5} {:>10} {:>10} {:>10}",
+            s,
             n,
             counts.get("YES").copied().unwrap_or(0),
             counts.get("NO").copied().unwrap_or(0),
@@ -244,26 +223,42 @@ fn print_summary(by_strategy: &HashMap<Strategy, Vec<Marked>>) {
     }
 }
 
-/// Print markets where baseline and LLM picked different sides on the
-/// same decision timestamp. Limited to the first 20 so the output
+/// Print markets where strategies picked different sides on the same
+/// decision timestamp. With N strategies in play we group by
+/// market_slug and flag any market whose (strategy → side) map has
+/// more than one distinct side. Limited to the first 20 so the output
 /// stays readable.
 fn print_disagreements(all: &[&Decision]) {
-    let mut by_market: HashMap<&str, (Option<&Decision>, Option<&Decision>)> = HashMap::new();
+    // market_slug → (strategy → decision). Latest decision per
+    // (market, strategy) wins so a periodic run that emitted multiple
+    // entries doesn't double-list.
+    let mut by_market: HashMap<&str, HashMap<&str, &Decision>> = HashMap::new();
     for d in all {
-        let slot = by_market.entry(d.market_slug.as_str()).or_default();
-        match Strategy::classify(d) {
-            Strategy::Baseline => slot.0 = Some(d),
-            Strategy::Llm => slot.1 = Some(d),
+        let per_strat = by_market.entry(d.market_slug.as_str()).or_default();
+        let strat = d.effective_strategy();
+        let keep = match per_strat.get(strat) {
+            Some(prev) => d.ts_ms >= prev.ts_ms,
+            None => true,
+        };
+        if keep {
+            per_strat.insert(strat, d);
         }
     }
-    let mut disagree: Vec<_> = by_market
+    let mut disagree: Vec<(&&str, Vec<(&&str, &&Decision)>)> = by_market
         .iter()
-        .filter_map(|(slug, (b, l))| match (b, l) {
-            (Some(b), Some(l)) if b.side != l.side => Some((slug, b, l)),
-            _ => None,
+        .filter_map(|(slug, per_strat)| {
+            let distinct: std::collections::HashSet<&str> =
+                per_strat.values().map(|d| d.side.as_str()).collect();
+            if distinct.len() > 1 {
+                let mut pairs: Vec<_> = per_strat.iter().collect();
+                pairs.sort_by_key(|(k, _)| **k);
+                Some((slug, pairs))
+            } else {
+                None
+            }
         })
         .collect();
-    disagree.sort_by_key(|(slug, _, _)| **slug);
+    disagree.sort_by_key(|(slug, _)| **slug);
 
     if disagree.is_empty() {
         println!("\n🤝 No same-day disagreements between strategies");
@@ -273,11 +268,14 @@ fn print_disagreements(all: &[&Decision]) {
         "\n🔀 {} markets where strategies disagreed (first 20 shown):",
         disagree.len()
     );
-    for (slug, b, l) in disagree.iter().take(20) {
-        println!(
-            "   {slug}\n       baseline = {:<4} size=${:.2}  conf={:.2}\n       llm      = {:<4} size=${:.2}  conf={:.2}",
-            b.side, b.size_usd, b.confidence, l.side, l.size_usd, l.confidence,
-        );
+    for (slug, pairs) in disagree.iter().take(20) {
+        println!("   {slug}");
+        for (strat, d) in pairs {
+            println!(
+                "       {:<10} = {:<4} size=${:.2}  conf={:.2}",
+                strat, d.side, d.size_usd, d.confidence,
+            );
+        }
     }
 }
 

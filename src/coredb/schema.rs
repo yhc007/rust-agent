@@ -82,6 +82,11 @@ pub const MIGRATIONS: &[&str] = &[
     // CoreDB returns "Column 'X' already exists" on duplicate, which migrate()
     // swallows, so re-running is safe on either old or new schema state.
     "ALTER TABLE polymarket_btc.decisions ADD entry_price DOUBLE",
+    // N-way LLM support — replaces the `raw_response == "baseline-rule"`
+    // inference pattern with an explicit per-row label. Legacy rows
+    // written before this column existed read back NULL/empty; consumers
+    // fall back to the old inference for those.
+    "ALTER TABLE polymarket_btc.decisions ADD strategy TEXT",
 
     // ---- Orders / fills. partition = bucket_day. ----
     "CREATE TABLE IF NOT EXISTS polymarket_btc.orders ( \

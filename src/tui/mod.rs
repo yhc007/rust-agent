@@ -394,11 +394,7 @@ fn draw_decisions(f: &mut ratatui::Frame, area: Rect, s: &Snapshot) {
             let ts = DateTime::<Utc>::from_timestamp_millis(d.ts_ms)
                 .map(|t| t.format("%H:%M:%S").to_string())
                 .unwrap_or_default();
-            let strategy = if d.raw_response == "baseline-rule" {
-                "baseline"
-            } else {
-                "llm"
-            };
+            let strategy = d.effective_strategy();
             let side_style = match d.side.as_str() {
                 "YES" => Style::default().fg(Color::Green),
                 "NO" => Style::default().fg(Color::Red),

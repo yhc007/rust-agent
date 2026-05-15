@@ -186,6 +186,7 @@ pub async fn run(coredb_uri: &str, mode: BacktestMode, execute: bool, live: bool
                     reasoning: b.reasoning,
                     raw_response: "baseline-rule".to_string(),
                     entry_price: m.last_price,
+                    strategy: "baseline".to_string(),
                 },
             ));
         }
@@ -219,6 +220,13 @@ pub async fn run(coredb_uri: &str, mode: BacktestMode, execute: bool, live: bool
                     reasoning: d.reasoning,
                     raw_response: d.raw_response,
                     entry_price: m.last_price,
+                    // The single-LLM path keeps the historical "llm"
+                    // label so downstream comparisons / dashboards see
+                    // unchanged grouping across the strategy-column
+                    // rollout. The N-way `--llms` path uses the
+                    // strategy preset name (`anthropic`, `deepseek`,
+                    // ...) so individual backends are distinguishable.
+                    strategy: "llm".to_string(),
                 },
             ));
         }

@@ -108,6 +108,11 @@ impl Tool for RecordDecisionTool {
             reasoning: input.reasoning,
             raw_response,
             entry_price: input.entry_price,
+            // The agent-tool path is taken by the QueryEngine LLM
+            // loop, so this is a tool-driven decision rather than a
+            // backtest one. Tag it "tool" so it's distinguishable from
+            // baseline/N-way LLM batch decisions.
+            strategy: "tool".to_string(),
         };
         repo.insert(&decision).await
             .map_err(|e| ToolError::ExecutionFailed(format!("decisions insert: {e}")))?;

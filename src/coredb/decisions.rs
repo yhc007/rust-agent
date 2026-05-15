@@ -23,8 +23,8 @@ impl DecisionRepo {
         let q = format!(
             "INSERT INTO polymarket_btc.decisions \
              (bucket_day, ts, decision_id, market_slug, side, size_usd, confidence, \
-              edge_bps, reasoning, raw_response, entry_price) \
-             VALUES ({bd}, {ts}, {id}, {slug}, {side}, {size}, {conf}, {edge}, {reasoning}, {raw}, {entry})",
+              edge_bps, reasoning, raw_response, entry_price, strategy) \
+             VALUES ({bd}, {ts}, {id}, {slug}, {side}, {size}, {conf}, {edge}, {reasoning}, {raw}, {entry}, {strategy})",
             bd = d.bucket_day_ms,
             ts = d.ts_ms,
             id = fuuid(d.decision_id),
@@ -36,6 +36,7 @@ impl DecisionRepo {
             reasoning = esc(&d.reasoning),
             raw = esc(&d.raw_response),
             entry = d.entry_price,
+            strategy = esc(&d.strategy),
         );
         self.session
             .query_unpaged(q, ())
@@ -47,7 +48,7 @@ impl DecisionRepo {
     pub async fn list_day(&self, bucket_day_ms: Millis) -> Result<Vec<Decision>, CoreDbError> {
         let q = format!(
             "SELECT bucket_day, ts, decision_id, market_slug, side, size_usd, confidence, \
-                    edge_bps, reasoning, raw_response, entry_price \
+                    edge_bps, reasoning, raw_response, entry_price, strategy \
              FROM polymarket_btc.decisions WHERE bucket_day = {bucket_day_ms}"
         );
         let qr = self
@@ -88,6 +89,7 @@ impl DecisionRepo {
                 reasoning: row.reasoning.unwrap_or_default(),
                 raw_response: row.raw_response.unwrap_or_default(),
                 entry_price: row.entry_price.unwrap_or(0.0),
+                strategy: row.strategy.unwrap_or_default(),
             });
         }
         Ok(out)
@@ -112,4 +114,5 @@ struct NamedRow {
     reasoning: Option<String>,
     raw_response: Option<String>,
     entry_price: Option<f64>,
+    strategy: Option<String>,
 }
