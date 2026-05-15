@@ -33,16 +33,25 @@ Type=simple
 WorkingDirectory=%h/workHard/rust-agent
 # Secrets in this env file: DEEPSEEK_API_KEY, ANTHROPIC_API_KEY,
 # POLYMARKET_CLOB_API_KEY / _SECRET / _PASSPHRASE,
-# POLYMARKET_PRIVATE_KEY, LIVE_TRADING_ENABLED, RISK_MAX_ORDER_USD, ...
+# POLYMARKET_PRIVATE_KEY, LIVE_TRADING_ENABLED, RISK_MAX_ORDER_USD,
+# HEALTH_PORT, ...
 # `-` prefix = don't fail to start if the file is missing (useful when
 # bringing up a paper-only deployment with credentials still in shells).
 EnvironmentFile=-%h/.config/polymarket-btc/agent.env
 
+# Default health-endpoint port baked into the unit. The env file (or
+# `systemctl --user edit rust-agent-daemon`) can override by setting
+# HEALTH_PORT to a different value. To disable the listener entirely,
+# remove `--health-port ${HEALTH_PORT}` from ExecStart below — clap
+# would otherwise reject an empty value at startup.
+Environment=HEALTH_PORT=9099
+
 # Default: paper trading. Add `--live` after `daemon` to flip to
 # LiveExec (still DRY_RUN unless LIVE_TRADING_ENABLED=1 in the env
 # file — two gates by design). Add `--llms anthropic,deepseek` etc.
-# for N-way comparison.
-ExecStart=%h/workHard/rust-agent/target/release/rust-agent daemon --coredb-uri 127.0.0.1:9042
+# for N-way comparison. `--health-port ${HEALTH_PORT}` exposes the
+# /health JSON on 0.0.0.0:${HEALTH_PORT} — see agent.env.example.
+ExecStart=%h/workHard/rust-agent/target/release/rust-agent daemon --coredb-uri 127.0.0.1:9042 --health-port ${HEALTH_PORT}
 
 Restart=on-failure
 RestartSec=10s
