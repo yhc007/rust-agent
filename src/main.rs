@@ -190,6 +190,19 @@ enum Commands {
         #[arg(long, default_value = "127.0.0.1:9042")]
         coredb_uri: String,
     },
+    /// One-shot helper to DROP the pre-v2 `polymarket_btc.positions`
+    /// table (the runtime no longer creates / writes / reads it).
+    /// Defaults to DRY_RUN — reports whether the table exists and
+    /// how many rows it has, but does NOT mutate. Pass `--execute`
+    /// to actually issue the DROP TABLE.
+    DropLegacyPositions {
+        #[arg(long, default_value = "127.0.0.1:9042")]
+        coredb_uri: String,
+        /// Actually issue `DROP TABLE polymarket_btc.positions`.
+        /// Without this flag the helper only inspects the table.
+        #[arg(long)]
+        execute: bool,
+    },
     /// Connect to Polymarket's user-channel WebSocket and log
     /// incoming fill/order notifications. Requires
     /// POLYMARKET_CLOB_API_KEY / _SECRET / _PASSPHRASE. Set
@@ -358,6 +371,9 @@ async fn main() -> Result<()> {
         }
         Some(Commands::Positions { coredb_uri }) => {
             run_positions(&coredb_uri).await?;
+        }
+        Some(Commands::DropLegacyPositions { coredb_uri, execute }) => {
+            run_drop_legacy_positions(&coredb_uri, execute).await?;
         }
         Some(Commands::UserChannel { coredb_uri }) => {
             run_user_channel(coredb_uri).await?;
@@ -543,6 +559,108 @@ fn truncate(s: &str, max: usize) -> String {
         out.push('…');
         out
     }
+}
+
+/// One-shot operator helper: inspect the legacy
+/// `polymarket_btc.positions` table (pre-v2, PK=market_slug) and
+/// optionally drop it. The runtime no longer touches this table —
+/// `schema::MIGRATIONS` stopped creating it, `CoreDb::TABLES` stopped
+/// verifying it, and every read/write path now goes through
+/// `positions_v2`. Existing deployments that ran older builds may
+/// still have an orphan with stale rows; this command surfaces and
+/// removes it without making operators drop into cqlsh.
+///
+/// Default is dry-run: probes the table, prints its row count, and
+/// exits without mutating. `--execute` issues the actual `DROP TABLE`.
+/// Both legs handle "table does not exist" cleanly so re-running
+/// after a successful drop is a no-op.
+async fn run_drop_legacy_positions(coredb_uri: &str, execute: bool) -> Result<()> {
+    use coredb::CoreDb;
+    use scylla::frame::value::CqlTimestamp;
+
+    let db = CoreDb::connect(coredb_uri).await?;
+    let session = db.session();
+
+    // Probe the table. The "Table 'positions' does not exist" message
+    // is what CoreDB returns for a missing table; surface that as a
+    // clean no-op instead of a hard error.
+    println!("🗑  drop-legacy-positions: probing polymarket_btc.positions ...");
+    let probe = session
+        .query_unpaged(
+            "SELECT market_slug, side, size, avg_price, updated_at \
+             FROM polymarket_btc.positions",
+            (),
+        )
+        .await;
+    let qr = match probe {
+        Ok(qr) => qr,
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("does not exist") || msg.contains("Unknown") {
+                println!("   table not found — nothing to drop. ✓");
+                return Ok(());
+            }
+            return Err(anyhow::anyhow!("probe failed: {e}"));
+        }
+    };
+    let rows = qr
+        .into_rows_result()
+        .map_err(|e| anyhow::anyhow!("probe rows: {e}"))?;
+    let row_count = rows.rows_num();
+    println!("   found legacy `positions` table with {row_count} row(s)");
+    // Type the result so we can preview a few. Empty-rowset short-
+    // circuit follows the same pattern as the other repos in this
+    // codebase — scylla rejects 0-column metadata otherwise.
+    if row_count > 0 {
+        #[derive(scylla::DeserializeRow)]
+        struct LegacyRow {
+            market_slug: Option<String>,
+            side: Option<String>,
+            size: Option<f64>,
+            avg_price: Option<f64>,
+            updated_at: Option<CqlTimestamp>,
+        }
+        let typed = rows
+            .rows::<LegacyRow>()
+            .map_err(|e| anyhow::anyhow!("probe typed: {e}"))?;
+        println!("   sample (first 5):");
+        for (i, row) in typed.enumerate().take(5) {
+            let r = row.map_err(|e| anyhow::anyhow!("probe row: {e}"))?;
+            println!(
+                "     {:<40} {:<5} size={:.2} avg={:.4} updated_at_ms={}",
+                truncate(&r.market_slug.unwrap_or_default(), 40),
+                r.side.unwrap_or_default(),
+                r.size.unwrap_or(0.0),
+                r.avg_price.unwrap_or(0.0),
+                r.updated_at.map(|t| t.0).unwrap_or(0),
+            );
+        }
+    }
+
+    if !execute {
+        println!(
+            "   DRY_RUN: re-run with `--execute` to actually \
+             `DROP TABLE polymarket_btc.positions` (irreversible)."
+        );
+        return Ok(());
+    }
+
+    println!("   --execute set; dropping ...");
+    match session
+        .query_unpaged("DROP TABLE polymarket_btc.positions", ())
+        .await
+    {
+        Ok(_) => println!("   ✓ table dropped."),
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("does not exist") || msg.contains("Unknown") {
+                println!("   table already gone (raced with another operator?). ✓");
+            } else {
+                return Err(anyhow::anyhow!("DROP TABLE failed: {e}"));
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn run_usdc_approve(
