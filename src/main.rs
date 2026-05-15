@@ -242,6 +242,12 @@ enum Commands {
         /// its own credentials set (see `backtest --llms` docs).
         #[arg(long, value_delimiter = ',')]
         llms: Vec<String>,
+        /// When set, the daemon exposes a tiny `/health` JSON
+        /// endpoint on `0.0.0.0:<port>`. Intended for external
+        /// monitors / reverse proxies / systemd watchdog scripts.
+        /// Default off (no listener).
+        #[arg(long)]
+        health_port: Option<u16>,
     },
 }
 
@@ -345,6 +351,7 @@ async fn main() -> Result<()> {
             no_execute,
             live,
             llms,
+            health_port,
         }) => {
             let mut cfg = daemon::DaemonConfig::new(coredb_uri);
             cfg.backtest_every_secs = backtest_every;
@@ -353,6 +360,7 @@ async fn main() -> Result<()> {
             cfg.execute = !no_execute;
             cfg.live = live;
             cfg.llm_presets = llms;
+            cfg.health_port = health_port;
             daemon::run(cfg).await?;
         }
         None => {
