@@ -759,7 +759,7 @@ fn draw(
         .split(f.area());
 
     draw_header(f, chunks[0], s, snap_age, uptime);
-    draw_strategy_pnl(f, chunks[1], s);
+    draw_strategy_pnl(f, chunks[1], s, strategy_filter);
     draw_consensus(f, chunks[2], s);
     draw_positions(f, chunks[3], s);
     draw_decisions(f, chunks[4], s, strategy_filter);
@@ -896,7 +896,12 @@ fn draw_header(
     f.render_widget(para, area);
 }
 
-fn draw_strategy_pnl(f: &mut ratatui::Frame, area: Rect, s: &Snapshot) {
+fn draw_strategy_pnl(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    s: &Snapshot,
+    strategy_filter: Option<&str>,
+) {
     // Group snapshots per strategy so we can both:
     //   (a) pick the latest row for the headline columns, and
     //   (b) reconstruct the time-ordered sum_pnl series to feed the
@@ -966,8 +971,29 @@ fn draw_strategy_pnl(f: &mut ratatui::Frame, area: Rect, s: &Snapshot) {
         // Color the agreement sparkline cyan to visually separate it
         // from the green/red pnl sparkline next to it.
         let agree_style = Style::default().fg(Color::Cyan);
+        // When the operator has a strategy filter active, the matching
+        // row gets a cyan-background `▶` gutter in the strategy column
+        // (and the cell is bolded). Matches the cyan highlight on the
+        // active hotkey chip in the footer so the operator can see
+        // their cycle position across both panels at a glance.
+        let is_active = strategy_filter == Some(latest.strategy.as_str());
+        let strategy_cell = if is_active {
+            // No space before the strategy name — keeps the 10-char
+            // column width unchanged for strategies up to 9 chars.
+            // The triangle marker plus cyan background is enough
+            // visual contrast even without extra padding.
+            Cell::from(Span::styled(
+                format!("▶{}", latest.strategy),
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ))
+        } else {
+            Cell::from(latest.strategy.clone())
+        };
         rows.push(Row::new(vec![
-            Cell::from(latest.strategy.clone()),
+            strategy_cell,
             Cell::from(ts),
             Cell::from(latest.n_decisions.to_string()),
             Cell::from(latest.n_yes.to_string()),
