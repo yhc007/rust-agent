@@ -31,7 +31,7 @@ struct Marked<'a> {
     pnl: Option<f64>,
 }
 
-pub async fn run(coredb_uri: &str) -> Result<()> {
+pub async fn run(coredb_uri: &str, strategies_filter: Option<&[String]>) -> Result<()> {
     println!("📊 compare-pnl: connecting to CoreDB at {coredb_uri}");
     let db = CoreDb::connect(coredb_uri).await.context("connect coredb")?;
     let repo = DecisionRepo::new(db.session()).await?;
@@ -39,10 +39,29 @@ pub async fn run(coredb_uri: &str) -> Result<()> {
 
     let snapshot_ts = now_ms();
     let bd = bucket_day(snapshot_ts);
-    let decisions = repo
+    let mut decisions = repo
         .list_day(bd)
         .await
         .context("list decisions for today")?;
+    let pre_filter_count = decisions.len();
+
+    // Strategy filter is applied immediately after the read so every
+    // downstream stage (summary table, agreement matrix, disagreements,
+    // strategy_pnl_snapshots persistence) sees the same restricted
+    // universe. Filtering downstream-only would leave the snapshot
+    // table tagged with strategies the operator explicitly excluded.
+    if let Some(allow) = strategies_filter {
+        let set: std::collections::HashSet<&str> = allow.iter().map(String::as_str).collect();
+        decisions.retain(|d| set.contains(d.effective_strategy()));
+        println!(
+            "   filter: {} → {} decisions ({} strategies allowed: {})",
+            pre_filter_count,
+            decisions.len(),
+            allow.len(),
+            allow.join(", "),
+        );
+    }
+
     println!(
         "   {} decisions for bucket_day = {} (UTC ms)",
         decisions.len(),
@@ -50,9 +69,12 @@ pub async fn run(coredb_uri: &str) -> Result<()> {
     );
 
     if decisions.is_empty() {
-        println!(
+        let hint = if strategies_filter.is_some() {
+            "   (filter excluded every row — drop --strategies or check the labels are correct.)"
+        } else {
             "   (nothing to compare — run `backtest` and `backtest --llm` first, then re-run.)"
-        );
+        };
+        println!("{hint}");
         return Ok(());
     }
 

@@ -141,6 +141,14 @@ enum Commands {
     ComparePnl {
         #[arg(long, default_value = "127.0.0.1:9042")]
         coredb_uri: String,
+        /// Restrict the comparison to a comma-separated subset of
+        /// strategy labels (e.g. `--strategies baseline,deepseek`).
+        /// Empty = include every strategy that appears in today's
+        /// decisions. Matches `Decision::effective_strategy()`, so
+        /// the same labels you see in the dashboard / consensus
+        /// panel work here.
+        #[arg(long, value_delimiter = ',')]
+        strategies: Vec<String>,
     },
     /// Dump today's strategy PnL snapshots from CoreDB as a time series.
     /// Intended consumer of the cron-driven `compare-pnl` writes.
@@ -298,8 +306,9 @@ async fn main() -> Result<()> {
             };
             backtest::run::run(&coredb_uri, plan, execute, live).await?;
         }
-        Some(Commands::ComparePnl { coredb_uri }) => {
-            backtest::compare::run(&coredb_uri).await?;
+        Some(Commands::ComparePnl { coredb_uri, strategies }) => {
+            let filter = if strategies.is_empty() { None } else { Some(strategies) };
+            backtest::compare::run(&coredb_uri, filter.as_deref()).await?;
         }
         Some(Commands::PnlHistory { coredb_uri }) => {
             backtest::history::run(&coredb_uri).await?;
