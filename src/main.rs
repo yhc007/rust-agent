@@ -291,6 +291,13 @@ enum Commands {
         /// set, the header gains a colored chip (ok/degraded/
         /// unreachable) plus a one-line detail summary. Typical
         /// value: `http://127.0.0.1:9099/health`.
+        ///
+        /// Resolution order (first wins): this CLI flag → the
+        /// `HEALTH_URL` env var → synthesized
+        /// `http://127.0.0.1:${HEALTH_PORT}/health` if `HEALTH_PORT`
+        /// is set. The last form matches the systemd unit's
+        /// default, so a dashboard launched on the same host as
+        /// the daemon picks up the chip for free without an arg.
         #[arg(long)]
         health_url: Option<String>,
         /// Number of UTC days back from "today" to feed the strategy-
@@ -471,7 +478,24 @@ async fn main() -> Result<()> {
             run_user_channel(coredb_uri).await?;
         }
         Some(Commands::Dashboard { coredb_uri, health_url, pnl_days }) => {
-            tui::run(&coredb_uri, health_url, pnl_days).await?;
+            // Resolve --health-url in this priority order so an
+            // operator running the dashboard on the systemd-managed
+            // box gets the chip for free:
+            //   1. Explicit CLI flag
+            //   2. HEALTH_URL env var (full URL)
+            //   3. HEALTH_PORT env var (synthesizes
+            //      http://127.0.0.1:${HEALTH_PORT}/health — matches
+            //      the systemd unit's default)
+            //   None of the above → no chip (silent, same as before)
+            let resolved = health_url
+                .or_else(|| std::env::var("HEALTH_URL").ok().filter(|s| !s.is_empty()))
+                .or_else(|| {
+                    std::env::var("HEALTH_PORT")
+                        .ok()
+                        .filter(|p| !p.is_empty())
+                        .map(|p| format!("http://127.0.0.1:{p}/health"))
+                });
+            tui::run(&coredb_uri, resolved, pnl_days).await?;
         }
         Some(Commands::ClobAuth {}) => {
             run_clob_auth().await?;
