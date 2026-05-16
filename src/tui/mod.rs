@@ -28,9 +28,10 @@ use crate::coredb::agreement::AgreementRepo;
 use crate::coredb::btc::BtcTickRepo;
 use crate::coredb::decisions::DecisionRepo;
 use crate::coredb::orders::PositionRepo;
+use crate::coredb::pnl_breakdown::PnlBreakdownRepo;
 use crate::coredb::strategy_pnl::StrategyPnlRepo;
 use crate::coredb::types::{
-    bucket_day, now_ms, AgreementSnapshot, BtcTick, Decision, Millis, Position,
+    bucket_day, now_ms, AgreementSnapshot, BtcTick, Decision, Millis, PnlBreakdown, Position,
     StrategyPnlSnapshot,
 };
 use crate::coredb::CoreDb;
@@ -67,6 +68,7 @@ pub async fn run(
     let pos_repo = PositionRepo::new(db.session()).await?;
     let pnl_repo = StrategyPnlRepo::new(db.session()).await?;
     let agree_repo = AgreementRepo::new(db.session()).await?;
+    let breakdown_repo = PnlBreakdownRepo::new(db.session()).await?;
 
     // Short-timeout HTTP client for the daemon's /health endpoint.
     // Built once and reused across refreshes — keep-alive matters
@@ -96,6 +98,7 @@ pub async fn run(
         &pos_repo,
         &pnl_repo,
         &agree_repo,
+        &breakdown_repo,
         health_url.as_deref(),
         health_client.as_ref(),
         pnl_days,
@@ -117,12 +120,14 @@ async fn main_loop(
     pos_repo: &PositionRepo,
     pnl_repo: &StrategyPnlRepo,
     agree_repo: &AgreementRepo,
+    breakdown_repo: &PnlBreakdownRepo,
     health_url: Option<&str>,
     health_client: Option<&reqwest::Client>,
     pnl_days: u32,
 ) -> Result<()> {
     let mut snapshot = fetch_snapshot(
-        btc_repo, dec_repo, pos_repo, pnl_repo, agree_repo, health_url, health_client, pnl_days,
+        btc_repo, dec_repo, pos_repo, pnl_repo, agree_repo, breakdown_repo, health_url,
+        health_client, pnl_days,
     )
     .await;
     let mut last_refresh = Instant::now();
@@ -152,8 +157,8 @@ async fn main_loop(
                     KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
                     KeyCode::Char('r') => {
                         snapshot = fetch_snapshot(
-                            btc_repo, dec_repo, pos_repo, pnl_repo, agree_repo, health_url, health_client,
-                            pnl_days,
+                            btc_repo, dec_repo, pos_repo, pnl_repo, agree_repo, breakdown_repo,
+                            health_url, health_client, pnl_days,
                         )
                         .await;
                         last_refresh = Instant::now();
@@ -189,7 +194,8 @@ async fn main_loop(
         // Auto-refresh on the cadence.
         if last_refresh.elapsed() >= REFRESH_EVERY {
             snapshot = fetch_snapshot(
-                btc_repo, dec_repo, pos_repo, pnl_repo, agree_repo, health_url, health_client, pnl_days,
+                btc_repo, dec_repo, pos_repo, pnl_repo, agree_repo, breakdown_repo, health_url,
+                health_client, pnl_days,
             )
             .await;
             last_refresh = Instant::now();
@@ -209,6 +215,11 @@ struct Snapshot {
     snapshots: Vec<StrategyPnlSnapshot>,
     agreements: Vec<AgreementSnapshot>,
     consensus: Vec<MarketConsensus>,
+    /// Yesterday's final realized PnL per (strategy, exec). Footer of
+    /// the strategy-pnl panel reads this to show end-of-day totals
+    /// alongside today's running numbers. One row per (strategy, exec)
+    /// — both paper and live get summed per strategy in the footer.
+    pnl_breakdown_yesterday: Vec<PnlBreakdown>,
     /// Result of the most recent /health probe. `None` when the
     /// dashboard wasn't started with --health-url. Otherwise carries
     /// a parsed result *or* an "unreachable" marker so the header
@@ -342,6 +353,7 @@ async fn fetch_snapshot(
     pos: &PositionRepo,
     pnl: &StrategyPnlRepo,
     agree: &AgreementRepo,
+    breakdown: &PnlBreakdownRepo,
     health_url: Option<&str>,
     health_client: Option<&reqwest::Client>,
     pnl_days: u32,
@@ -392,6 +404,16 @@ async fn fetch_snapshot(
         }
     }
     s.consensus = build_consensus(&s.decisions);
+    // Yesterday's pnl_breakdown — one extra CoreDB read so the
+    // strategy-pnl panel footer can show end-of-day final realized PnL
+    // by strategy alongside today's running totals. Empty rowset is
+    // expected on a fresh deployment; we surface that as "no settled
+    // trades yet" in the render path rather than as an error.
+    let yesterday_bd = bd - 86_400_000;
+    match breakdown.list_day(yesterday_bd).await {
+        Ok(v) => s.pnl_breakdown_yesterday = v,
+        Err(e) => s.errors.push(format!("pnl_breakdown.list_day({yesterday_bd}): {e}")),
+    }
     if let (Some(url), Some(client)) = (health_url, health_client) {
         s.health = Some(fetch_health(client, url).await);
     }
@@ -823,7 +845,9 @@ fn draw(
             // content line inside the box, hiding the meta line
             // and rendering the chip's `detail` field invisible.
             Constraint::Length(4),                  // header
-            Constraint::Length(6),                  // strategy pnl
+            // 7 = bordered table (6) + 1-row footer below it that
+            // surfaces yesterday's final realized PnL by strategy.
+            Constraint::Length(7),                  // strategy pnl + yesterday footer
             Constraint::Min(5),                     // market consensus
             Constraint::Min(5),                     // positions
             Constraint::Min(7),                     // recent decisions
@@ -1008,6 +1032,15 @@ fn draw_strategy_pnl(
     s: &Snapshot,
     strategy_filter: Option<&str>,
 ) {
+    // Split the panel into a bordered table (top) and a single-row
+    // yesterday-PnL footer (bottom). Footer sits *outside* the table's
+    // box so the table's row count isn't affected by its presence.
+    let split = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(3), Constraint::Length(1)])
+        .split(area);
+    let table_area = split[0];
+    let footer_area = split[1];
     // Group snapshots per strategy so we can both:
     //   (a) pick the latest row for the headline columns, and
     //   (b) reconstruct the time-ordered sum_pnl series to feed the
@@ -1170,7 +1203,76 @@ fn draw_strategy_pnl(
     let table = Table::new(rows, widths)
         .header(header)
         .block(Block::default().borders(Borders::ALL).title(title));
-    f.render_widget(table, area);
+    f.render_widget(table, table_area);
+
+    // One-line yesterday-PnL footer just under the table. Strategy is
+    // the grouping axis (paper + live summed within a strategy)
+    // because operators care about per-strategy edge — paper vs live
+    // splits live in /metrics + pnl-breakdown-history when they need
+    // them. Empty rowset renders as a hint line rather than an error.
+    let footer_line = render_yesterday_pnl_footer(&s.pnl_breakdown_yesterday, strategy_filter);
+    f.render_widget(Paragraph::new(footer_line), footer_area);
+}
+
+/// Build the one-line "Yesterday final: …" footer that lives just under
+/// the strategy-pnl table. Pulled out of the draw function so it's
+/// unit-testable without touching ratatui.
+///
+/// Rendering rules:
+///   - No rows → "Yesterday final: (no settled trades yet)".
+///   - With rows → sum realized_pnl per strategy (across paper+live)
+///     and emit "Yesterday final: a +$X.XX  b -$Y.YY". Strategy order
+///     is alphabetical for stable rendering across frames.
+///   - The active filter, if any, gets a cyan highlight on its chip so
+///     the operator's eye lands on it the same way it lands on the row
+///     marker in the table above.
+fn render_yesterday_pnl_footer<'a>(
+    rows: &'a [PnlBreakdown],
+    strategy_filter: Option<&str>,
+) -> Line<'a> {
+    if rows.is_empty() {
+        return Line::from(vec![
+            Span::styled(
+                "Yesterday final: ",
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "(no settled trades yet)",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]);
+    }
+    // Aggregate paper + live within a strategy: operators want
+    // per-strategy bottom-line, not a paper-vs-live split (the
+    // pnl-breakdown-history report already covers that axis).
+    let mut by_strategy: std::collections::BTreeMap<String, f64> =
+        std::collections::BTreeMap::new();
+    for r in rows {
+        *by_strategy.entry(r.strategy.clone()).or_insert(0.0) += r.realized_pnl;
+    }
+    let mut spans: Vec<Span<'a>> = vec![Span::styled(
+        "Yesterday final: ",
+        Style::default().add_modifier(Modifier::BOLD),
+    )];
+    let mut first = true;
+    for (strategy, total) in by_strategy {
+        if !first {
+            spans.push(Span::raw("  "));
+        }
+        first = false;
+        let color = if total >= 0.0 { Color::Green } else { Color::Red };
+        let label = format!("{strategy} ${:+.2}", total);
+        let style = if strategy_filter == Some(strategy.as_str()) {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(color).add_modifier(Modifier::BOLD)
+        };
+        spans.push(Span::styled(label, style));
+    }
+    Line::from(spans)
 }
 
 /// Render `values` as a unicode block sparkline. The output is exactly
@@ -1402,7 +1504,7 @@ fn fmt_dur(d: Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::{build_consensus, sparkline, AgreementKind};
-    use crate::coredb::types::Decision;
+    use crate::coredb::types::{Decision, PnlBreakdown};
     use ratatui::style::Color;
     use uuid::Uuid;
 
@@ -1804,6 +1906,18 @@ mod tests {
         filter: Option<&str>,
         health: Option<super::HealthChip>,
     ) -> String {
+        render_test_dashboard_full(filter, health, Vec::new())
+    }
+
+    /// Full test renderer that also accepts a `pnl_breakdown_yesterday`
+    /// fixture so the new footer line can be exercised end-to-end via
+    /// the standard `draw()` entry point. The two thinner shims keep the
+    /// existing test call sites stable.
+    fn render_test_dashboard_full(
+        filter: Option<&str>,
+        health: Option<super::HealthChip>,
+        pnl_breakdown_yesterday: Vec<PnlBreakdown>,
+    ) -> String {
         use crate::coredb::types::{BtcTick, StrategyPnlSnapshot};
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
@@ -1844,6 +1958,7 @@ mod tests {
             },
         ];
         s.health = health;
+        s.pnl_breakdown_yesterday = pnl_breakdown_yesterday;
 
         let strategies = super::strategies_in_view(&s);
         let backend = TestBackend::new(140, 35);
@@ -1917,6 +2032,133 @@ mod tests {
         assert!(
             !plain_dump.contains("vs "),
             "`vs ` leaked into no-filter render"
+        );
+    }
+
+    #[test]
+    fn panel_strategy_pnl_footer_empty_shows_hint() {
+        // No yesterday rows → hint line surfaces inside the dashboard,
+        // not an error. Confirms the empty-rowset branch.
+        let dump = render_test_dashboard(None);
+        assert!(
+            dump.contains("Yesterday final:"),
+            "footer prefix missing in default render"
+        );
+        assert!(
+            dump.contains("(no settled trades yet)"),
+            "expected empty-rowset hint to render"
+        );
+    }
+
+    #[test]
+    fn panel_strategy_pnl_footer_renders_per_strategy_totals() {
+        // Populated yesterday — paper+live within a strategy are
+        // summed (1.50 + 3.00 = 4.50 for baseline; -2.25 alone for
+        // deepseek). The rendered line includes both per-strategy
+        // chips. Strategy chips are formatted as "name $+X.XX" /
+        // "name $-X.XX" so a `+`-prefixed positive baseline is what
+        // the test pins.
+        let yesterday = vec![
+            super::PnlBreakdown {
+                bucket_day_ms: 0,
+                strategy: "baseline".into(),
+                exec: "paper".into(),
+                realized_pnl: 1.50,
+                n_settled: 1,
+            },
+            super::PnlBreakdown {
+                bucket_day_ms: 0,
+                strategy: "baseline".into(),
+                exec: "live".into(),
+                realized_pnl: 3.00,
+                n_settled: 2,
+            },
+            super::PnlBreakdown {
+                bucket_day_ms: 0,
+                strategy: "deepseek".into(),
+                exec: "paper".into(),
+                realized_pnl: -2.25,
+                n_settled: 1,
+            },
+        ];
+        let dump = render_test_dashboard_full(None, None, yesterday);
+        assert!(
+            dump.contains("Yesterday final:"),
+            "footer prefix missing in populated render"
+        );
+        assert!(
+            dump.contains("baseline $+4.50"),
+            "expected baseline paper+live aggregate \"baseline $+4.50\", got dump:\n{dump}"
+        );
+        assert!(
+            dump.contains("deepseek $-2.25"),
+            "expected deepseek total \"deepseek $-2.25\", got dump:\n{dump}"
+        );
+        // The empty hint must not leak through when data is present.
+        assert!(
+            !dump.contains("no settled trades yet"),
+            "empty hint leaked into populated render"
+        );
+    }
+
+    #[test]
+    fn yesterday_footer_pure_empty_branch() {
+        // Unit-test the pure helper directly so we don't have to spin
+        // up a TestBackend just to exercise the empty branch.
+        let line = super::render_yesterday_pnl_footer(&[], None);
+        let flat: String = line
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect::<String>();
+        assert!(flat.starts_with("Yesterday final:"), "got: {flat}");
+        assert!(
+            flat.contains("(no settled trades yet)"),
+            "expected empty hint, got: {flat}"
+        );
+    }
+
+    #[test]
+    fn yesterday_footer_pure_aggregates_paper_plus_live() {
+        let rows = vec![
+            super::PnlBreakdown {
+                bucket_day_ms: 0,
+                strategy: "alpha".into(),
+                exec: "paper".into(),
+                realized_pnl: 5.0,
+                n_settled: 1,
+            },
+            super::PnlBreakdown {
+                bucket_day_ms: 0,
+                strategy: "alpha".into(),
+                exec: "live".into(),
+                realized_pnl: 7.5,
+                n_settled: 2,
+            },
+            super::PnlBreakdown {
+                bucket_day_ms: 0,
+                strategy: "beta".into(),
+                exec: "paper".into(),
+                realized_pnl: -1.25,
+                n_settled: 1,
+            },
+        ];
+        let line = super::render_yesterday_pnl_footer(&rows, None);
+        let flat: String = line
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect::<String>();
+        // BTreeMap iteration → alphabetical: alpha before beta.
+        let alpha_pos = flat.find("alpha $+12.50").unwrap_or_else(|| {
+            panic!("alpha aggregate missing — got: {flat}")
+        });
+        let beta_pos = flat.find("beta $-1.25").unwrap_or_else(|| {
+            panic!("beta aggregate missing — got: {flat}")
+        });
+        assert!(
+            alpha_pos < beta_pos,
+            "strategies should render alphabetically — got: {flat}"
         );
     }
 
