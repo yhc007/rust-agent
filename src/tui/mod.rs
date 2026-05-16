@@ -1491,14 +1491,29 @@ fn draw_consensus(
                 AgreementKind::AllPass => pass += 1,
             }
         }
-        format!(
-            " market consensus ({} markets — ✓{} all, ✗{} split, {} solo, {} pass) ",
+        // Focused-strategy count when filter is active: how many
+        // markets the focused strategy actually picked a side on
+        // (i.e. is present in active_picks). Mirrors the positions
+        // panel's "N <strategy>-related" annotation so the
+        // operator sees both signals consistently.
+        let focused_count = strategy_filter.map(|name| {
+            s.consensus
+                .iter()
+                .filter(|c| c.active_picks.contains_key(name))
+                .count()
+        });
+        let base = format!(
+            " market consensus ({} markets — ✓{} all, ✗{} split, {} solo, {} pass",
             s.consensus.len(),
             all_agree,
             split,
             solo,
             pass,
-        )
+        );
+        match (strategy_filter, focused_count) {
+            (Some(name), Some(n)) => format!("{base} — {n} {name}-involved) "),
+            _ => format!("{base}) "),
+        }
     };
     let table = Table::new(rows, widths)
         .header(header)
@@ -4668,6 +4683,91 @@ mod tests {
         assert!(
             !focused.contains(&Color::DarkGray),
             "btc-100k position should NOT be dimmed:\n{dump}"
+        );
+    }
+
+    /// Consensus title carries the focused-market count when a
+    /// filter is active. With 2 markets (one where baseline
+    /// participates, one where it doesn't), filtered title reads
+    /// "...— 1 baseline-involved) "; unfiltered title just ends
+    /// after the pass count.
+    #[test]
+    fn panel_consensus_title_shows_focused_count() {
+        use crate::coredb::types::Decision;
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        use uuid::Uuid;
+        let mk = |slug: &str, strat: &str, side: &str, ts: i64| Decision {
+            bucket_day_ms: 0,
+            ts_ms: ts,
+            decision_id: Uuid::nil(),
+            market_slug: slug.into(),
+            side: side.into(),
+            size_usd: 1.0,
+            confidence: 0.0,
+            edge_bps: 0,
+            reasoning: String::new(),
+            raw_response: String::new(),
+            entry_price: 0.5,
+            strategy: strat.into(),
+        };
+        let mut s = super::Snapshot::default();
+        s.decisions = vec![
+            // btc-100k: baseline + deepseek both decided.
+            mk("btc-100k", "baseline", "YES", 1),
+            mk("btc-100k", "deepseek", "YES", 1),
+            // btc-200k: only deepseek (baseline not involved).
+            mk("btc-200k", "deepseek", "NO", 1),
+        ];
+        s.consensus = super::build_consensus(&s.decisions);
+        let strategies = super::strategies_in_view(&s);
+        let prev_ranks: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+
+        // Filter active → focused-count label in title.
+        let backend = TestBackend::new(140, 50);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                super::draw(
+                    f,
+                    &s,
+                    std::time::Duration::from_millis(0),
+                    std::time::Duration::from_secs(42),
+                    &strategies,
+                    Some("baseline"),
+                    &prev_ranks,
+                    super::ComparisonSort::DEFAULT,
+                )
+            })
+            .unwrap();
+        let dump_filtered = render_buffer(terminal.backend().buffer());
+        assert!(
+            dump_filtered.contains("1 baseline-involved"),
+            "expected focused-count annotation in title:\n{dump_filtered}",
+        );
+
+        // Filter inactive → no annotation.
+        let backend2 = TestBackend::new(140, 50);
+        let mut terminal2 = Terminal::new(backend2).unwrap();
+        terminal2
+            .draw(|f| {
+                super::draw(
+                    f,
+                    &s,
+                    std::time::Duration::from_millis(0),
+                    std::time::Duration::from_secs(42),
+                    &strategies,
+                    None,
+                    &prev_ranks,
+                    super::ComparisonSort::DEFAULT,
+                )
+            })
+            .unwrap();
+        let dump_plain = render_buffer(terminal2.backend().buffer());
+        assert!(
+            !dump_plain.contains("-involved"),
+            "no '-involved' should appear without filter:\n{dump_plain}",
         );
     }
 
