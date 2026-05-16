@@ -377,6 +377,7 @@ pub async fn run(cfg: DaemonConfig) -> Result<()> {
             pnl_daily_cache: Arc::new(RwLock::new(None)),
             pnl_breakdown_repo,
             pnl_breakdown_cache: Arc::new(RwLock::new(None)),
+            pnl_breakdown_yesterday_cache: Arc::new(RwLock::new(None)),
             position_repo_for_metrics,
             positions_cache: Arc::new(RwLock::new(None)),
             ingest_cache: Arc::new(RwLock::new(None)),
@@ -593,6 +594,13 @@ struct HealthAppState {
     /// Also written by settle-pnl, also cached with the 60s pnl TTL.
     pnl_breakdown_repo: Option<Arc<PnlBreakdownRepo>>,
     pnl_breakdown_cache: Arc<RwLock<Option<PnlBreakdownCacheEntry>>>,
+    /// Yesterday's pnl_breakdown — fixed once settle-pnl has done
+    /// its post-midnight pass. Surfaced via
+    /// agent_pnl_breakdown_yesterday_* so a Grafana panel can plot
+    /// "yesterday's final" as a baseline next to today's running
+    /// realized PnL. Same 60s TTL since the underlying data only
+    /// changes when settle-pnl runs.
+    pnl_breakdown_yesterday_cache: Arc<RwLock<Option<PnlBreakdownCacheEntry>>>,
     /// Open positions read from positions_v2 for the
     /// agent_open_positions_* gauges. 10s scrape cache.
     position_repo_for_metrics: Option<Arc<PositionRepo>>,
@@ -678,6 +686,7 @@ pub struct MetricsSnapshot {
     pub orders: Option<OrdersCacheEntry>,
     pub pnl_daily: Option<PnlDailyCacheEntry>,
     pub pnl_breakdown: Option<PnlBreakdownCacheEntry>,
+    pub pnl_breakdown_yesterday: Option<PnlBreakdownCacheEntry>,
     pub positions: Option<PositionsCacheEntry>,
     pub risk: RiskLimits,
     /// Operator-facing comment lines to prepend at the top of the
@@ -914,6 +923,40 @@ pub fn render_metrics(s: &MetricsSnapshot) -> String {
             for row in &cache.rows {
                 out.push_str(&format!(
                     "agent_pnl_breakdown_trades_count{{strategy=\"{}\",exec=\"{}\"}} {}\n",
+                    escape_label(&row.strategy),
+                    escape_label(&row.exec),
+                    row.n_settled,
+                ));
+            }
+        }
+    }
+
+    // Yesterday's pnl_breakdown — fixed once settle-pnl has done
+    // its post-midnight pass. Lets Grafana panel "yesterday final
+    // realized PnL by strategy" as a baseline alongside today's
+    // running total. Empty when no settle ran yesterday (early in
+    // a daemon's life or a missed cron).
+    if let Some(cache) = s.pnl_breakdown_yesterday.as_ref() {
+        if !cache.rows.is_empty() {
+            out.push_str(
+                "# HELP agent_pnl_breakdown_yesterday_realized_usd Yesterday's final realized PnL in USD per (strategy, exec). Useful as a baseline next to agent_pnl_breakdown_realized_usd.\n",
+            );
+            out.push_str("# TYPE agent_pnl_breakdown_yesterday_realized_usd gauge\n");
+            for row in &cache.rows {
+                out.push_str(&format!(
+                    "agent_pnl_breakdown_yesterday_realized_usd{{strategy=\"{}\",exec=\"{}\"}} {}\n",
+                    escape_label(&row.strategy),
+                    escape_label(&row.exec),
+                    row.realized_pnl,
+                ));
+            }
+            out.push_str(
+                "# HELP agent_pnl_breakdown_yesterday_trades_count Number of settled trades counted into yesterday's realized PnL bucket.\n",
+            );
+            out.push_str("# TYPE agent_pnl_breakdown_yesterday_trades_count gauge\n");
+            for row in &cache.rows {
+                out.push_str(&format!(
+                    "agent_pnl_breakdown_yesterday_trades_count{{strategy=\"{}\",exec=\"{}\"}} {}\n",
                     escape_label(&row.strategy),
                     escape_label(&row.exec),
                     row.n_settled,
@@ -1185,6 +1228,50 @@ async fn gather_metrics_snapshot(s: &HealthAppState, now: i64) -> MetricsSnapsho
             None
         };
 
+    // Yesterday's pnl_breakdown — same repo, same TTL, just a
+    // different bucket_day. Stored in its own cache slot so the
+    // today/yesterday refreshes are independent.
+    let pnl_breakdown_yesterday: Option<PnlBreakdownCacheEntry> =
+        if let Some(breakdown_repo) = s.pnl_breakdown_repo.as_ref() {
+            let mut cache_guard = s.pnl_breakdown_yesterday_cache.write().await;
+            // Also invalidate the cache if the day rolled — without
+            // this check a daemon that's been up across midnight
+            // would keep returning the day-before-yesterday's data
+            // until the TTL expired.
+            let cached_day = cache_guard.as_ref().and_then(|c| c.rows.first()).map(|r| r.bucket_day_ms);
+            let yesterday_bd = bucket_day(now) - 86_400_000;
+            let day_rolled = cached_day.map(|d| d != yesterday_bd).unwrap_or(false);
+            let need_refresh = day_rolled
+                || cache_guard
+                    .as_ref()
+                    .map(|c| now - c.fetched_at_ms > METRICS_PNL_DAILY_CACHE_TTL_MS)
+                    .unwrap_or(true);
+            if need_refresh {
+                match breakdown_repo.list_day(yesterday_bd).await {
+                    Ok(rows) => {
+                        *cache_guard = Some(PnlBreakdownCacheEntry {
+                            fetched_at_ms: now,
+                            rows,
+                        });
+                    }
+                    Err(e) => {
+                        if cache_guard.is_none() {
+                            notes.push(format!(
+                                "# pnl_breakdown_yesterday read failed (no cached fallback): {e}"
+                            ));
+                        } else {
+                            notes.push(format!(
+                                "# pnl_breakdown_yesterday refresh failed; serving cached data: {e}"
+                            ));
+                        }
+                    }
+                }
+            }
+            cache_guard.clone()
+        } else {
+            None
+        };
+
     // Positions cache refresh.
     let positions: Option<PositionsCacheEntry> =
         if let Some(position_repo) = s.position_repo_for_metrics.as_ref() {
@@ -1228,6 +1315,7 @@ async fn gather_metrics_snapshot(s: &HealthAppState, now: i64) -> MetricsSnapsho
         orders,
         pnl_daily,
         pnl_breakdown,
+        pnl_breakdown_yesterday,
         positions,
         risk: RiskLimits::default(),
         notes,
@@ -1575,6 +1663,16 @@ mod tests {
                     n_settled: 5,
                 }],
             }),
+            pnl_breakdown_yesterday: Some(super::PnlBreakdownCacheEntry {
+                fetched_at_ms: 1_700_000_009_000,
+                rows: vec![PnlBreakdown {
+                    bucket_day_ms: 1_699_913_600_000,
+                    strategy: "baseline".into(),
+                    exec: "paper".into(),
+                    realized_pnl: 100.0,
+                    n_settled: 20,
+                }],
+            }),
             positions: Some(super::PositionsCacheEntry {
                 fetched_at_ms: 1_700_000_009_000,
                 rows: vec![Position {
@@ -1611,6 +1709,8 @@ mod tests {
             "agent_orders_today_total",
             "agent_pnl_breakdown_realized_usd",
             "agent_pnl_breakdown_trades_count",
+            "agent_pnl_breakdown_yesterday_realized_usd",
+            "agent_pnl_breakdown_yesterday_trades_count",
             "agent_pnl_daily_realized_usd",
             "agent_pnl_daily_trades_count",
             "agent_risk_kill_switch_active",
@@ -1670,6 +1770,8 @@ mod tests {
             "agent_orders_today_total",
             "agent_pnl_breakdown_realized_usd",
             "agent_pnl_breakdown_trades_count",
+            "agent_pnl_breakdown_yesterday_realized_usd",
+            "agent_pnl_breakdown_yesterday_trades_count",
             "agent_pnl_daily_realized_usd",
             "agent_pnl_daily_trades_count",
             "agent_risk_kill_switch_active",
