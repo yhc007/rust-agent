@@ -2044,7 +2044,32 @@ fn draw_strategy_comparison(
     let title = if rows.is_empty() {
         " strategy comparison (no data yet) ".to_string()
     } else {
-        format!(" strategy comparison • sorted by: {} ", sort.label())
+        let base = format!(" strategy comparison • sorted by: {}", sort.label());
+        // Filter-aware annotation: when filter is active, append
+        // the focused strategy's rank (1-based, from the sorted
+        // rows_data) and its spread vs the 7d leader. Same idiom
+        // as the strategy-pnl / positions / consensus titles.
+        let focused_stats = strategy_filter.and_then(|name| {
+            let (idx, row) = rows_data
+                .iter()
+                .enumerate()
+                .find(|(_, r)| r.strategy == name)?;
+            let rank = idx + 1;
+            let spread_label = match leader_pnl {
+                Some(_) if idx == 0 => "(leader)".to_string(),
+                Some(lp) => {
+                    let spread = row.window_pnl - lp;
+                    if spread.abs() < f64::EPSILON {
+                        "(tied)".to_string()
+                    } else {
+                        format!("${:+.2} vs leader", spread)
+                    }
+                }
+                None => "—".to_string(),
+            };
+            Some(format!(" — {name}: rank #{rank}, {spread_label}"))
+        });
+        format!("{base}{} ", focused_stats.as_deref().unwrap_or(""))
     };
     let widths = [
         Constraint::Length(2),  // Δ rank change
@@ -3880,6 +3905,60 @@ mod tests {
             head(super::ComparisonSort { key: super::SortKey::Strategy, dir: super::SortDir::Asc }),
             vec!["anthropic", "baseline", "deepseek"],
             "strategy-asc",
+        );
+    }
+
+    /// Comparison panel title gets a focused-stats annotation
+    /// when filter is active. Format:
+    ///   " strategy comparison • sorted by: <sort> — <name>:
+    ///     rank #N, $-X.XX vs leader "
+    /// Leader row's annotation reads "(leader)" instead of a
+    /// spread; ties read "(tied)".
+    #[test]
+    fn panel_strategy_comparison_title_shows_focused_stats() {
+        let window = vec![
+            super::PnlBreakdown {
+                bucket_day_ms: 0, strategy: "deepseek".into(),
+                exec: "paper".into(), realized_pnl: 100.0, n_settled: 1,
+            },
+            super::PnlBreakdown {
+                bucket_day_ms: 0, strategy: "anthropic".into(),
+                exec: "paper".into(), realized_pnl: 50.0, n_settled: 1,
+            },
+            super::PnlBreakdown {
+                bucket_day_ms: 0, strategy: "baseline".into(),
+                exec: "paper".into(), realized_pnl: -10.0, n_settled: 1,
+            },
+        ];
+        // Filter on "baseline" → rank #3, spread = -110 vs leader.
+        let dump = render_test_dashboard_full(
+            Some("baseline"),
+            None,
+            Vec::new(),
+            window.clone(),
+        );
+        assert!(
+            dump.contains("baseline: rank #3, $-110.00 vs leader"),
+            "expected focused-stats annotation in comparison title:\n{dump}",
+        );
+
+        // Filter on "deepseek" (the leader) → "(leader)" label.
+        let dump_leader = render_test_dashboard_full(
+            Some("deepseek"),
+            None,
+            Vec::new(),
+            window.clone(),
+        );
+        assert!(
+            dump_leader.contains("deepseek: rank #1, (leader)"),
+            "expected leader annotation in comparison title:\n{dump_leader}",
+        );
+
+        // No filter → no annotation.
+        let dump_plain = render_test_dashboard_full(None, None, Vec::new(), window);
+        assert!(
+            !dump_plain.contains(": rank #"),
+            "no rank annotation should appear without filter:\n{dump_plain}",
         );
     }
 
