@@ -1650,7 +1650,17 @@ fn draw_strategy_pnl(
         // Safe: keys only contains strategies that pushed at least one
         // snapshot into `by_strategy`, so the Vec is non-empty.
         let latest = *series.last().unwrap();
-        let pnl_style = if latest.sum_pnl >= 0.0 {
+        // Same dim-as-unfocused contract as the comparison +
+        // consensus panels: when filter is active and this row
+        // isn't the focused strategy, every cell renders in
+        // DarkGray (including both sparklines). Filter inactive
+        // → natural colors everywhere.
+        let is_active = strategy_filter == Some(latest.strategy.as_str());
+        let dim = strategy_filter.is_some() && !is_active;
+        let dim_style = Style::default().fg(Color::DarkGray);
+        let pnl_style = if dim {
+            dim_style
+        } else if latest.sum_pnl >= 0.0 {
             Style::default().fg(Color::Green)
         } else {
             Style::default().fg(Color::Red)
@@ -1685,14 +1695,14 @@ fn draw_strategy_pnl(
             })
             .unwrap_or_default();
         // Color the agreement sparkline cyan to visually separate it
-        // from the green/red pnl sparkline next to it.
-        let agree_style = Style::default().fg(Color::Cyan);
+        // from the green/red pnl sparkline next to it — unless the
+        // row is dimmed, then both sparklines collapse to DarkGray.
+        let agree_style = if dim { dim_style } else { Style::default().fg(Color::Cyan) };
         // When the operator has a strategy filter active, the matching
         // row gets a cyan-background `▶` gutter in the strategy column
         // (and the cell is bolded). Matches the cyan highlight on the
         // active hotkey chip in the footer so the operator can see
         // their cycle position across both panels at a glance.
-        let is_active = strategy_filter == Some(latest.strategy.as_str());
         let strategy_cell = if is_active {
             // No space before the strategy name — keeps the 10-char
             // column width unchanged for strategies up to 9 chars.
@@ -1705,17 +1715,27 @@ fn draw_strategy_pnl(
                     .bg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
             ))
+        } else if dim {
+            Cell::from(Span::styled(latest.strategy.clone(), dim_style))
         } else {
             Cell::from(latest.strategy.clone())
         };
+        // Helper to optionally dim a plain-text Cell.
+        let plain = |text: String| -> Cell<'static> {
+            if dim {
+                Cell::from(Span::styled(text, dim_style))
+            } else {
+                Cell::from(text)
+            }
+        };
         rows.push(Row::new(vec![
             strategy_cell,
-            Cell::from(ts),
-            Cell::from(latest.n_decisions.to_string()),
-            Cell::from(latest.n_yes.to_string()),
-            Cell::from(latest.n_no.to_string()),
-            Cell::from(latest.n_pass.to_string()),
-            Cell::from(format!("${:.2}", latest.sum_size_usd)),
+            plain(ts),
+            plain(latest.n_decisions.to_string()),
+            plain(latest.n_yes.to_string()),
+            plain(latest.n_no.to_string()),
+            plain(latest.n_pass.to_string()),
+            plain(format!("${:.2}", latest.sum_size_usd)),
             Cell::from(Span::styled(format!("${:+.2}", latest.sum_pnl), pnl_style)),
             Cell::from(Span::styled(sparkline(&pnls), pnl_style)),
             Cell::from(Span::styled(sparkline(&agrees), agree_style)),
@@ -4342,6 +4362,73 @@ mod tests {
             }
         }
         out
+    }
+
+    /// Strategy-pnl panel applies the same dim treatment as the
+    /// comparison + consensus panels. Pin via the Σ pnl cell's
+    /// fg color: focused row keeps green/red; unfocused row goes
+    /// DarkGray. The default fixture has two strategies
+    /// (baseline=$+12.34, deepseek=$-5.67) — filter on "deepseek"
+    /// puts baseline in the dim state.
+    #[test]
+    fn panel_strategy_pnl_dims_unfocused_rows() {
+        // Default render_test_dashboard_full fixture has two
+        // strategy_pnl_snapshots: baseline (+12.34, latest at
+        // ts=1700000000000) and deepseek (-5.67). With
+        // filter="deepseek" the deepseek row is focused; the
+        // baseline row should be dim.
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let mut s = super::Snapshot::default();
+        s.snapshots = vec![
+            crate::coredb::types::StrategyPnlSnapshot {
+                bucket_day_ms: 0, ts_ms: 1, strategy: "baseline".into(),
+                n_decisions: 0, sum_size_usd: 0.0, sum_pnl: 12.34,
+                n_yes: 0, n_no: 0, n_pass: 0,
+            },
+            crate::coredb::types::StrategyPnlSnapshot {
+                bucket_day_ms: 0, ts_ms: 1, strategy: "deepseek".into(),
+                n_decisions: 0, sum_size_usd: 0.0, sum_pnl: -5.67,
+                n_yes: 0, n_no: 0, n_pass: 0,
+            },
+        ];
+        let strategies = super::strategies_in_view(&s);
+        let prev_ranks: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        let backend = TestBackend::new(140, 50);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                super::draw(
+                    f,
+                    &s,
+                    std::time::Duration::from_millis(0),
+                    std::time::Duration::from_secs(42),
+                    &strategies,
+                    Some("deepseek"),
+                    &prev_ranks,
+                    super::ComparisonSort::DEFAULT,
+                )
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let dump = render_buffer(buf);
+        // Baseline row's Σ pnl cell shows "$+12.34". The first
+        // occurrence in the dump is in the strategy-pnl panel
+        // (the comparison panel appears below it). DarkGray fg
+        // means the dim treatment fired.
+        let baseline_fg = sample_row_fg(buf, "$+12.34");
+        assert!(
+            baseline_fg.contains(&Color::DarkGray),
+            "baseline (unfocused) row should be dimmed:\n{dump}"
+        );
+        // Deepseek row's Σ pnl cell shows "$-5.67". Focused →
+        // should NOT be DarkGray (red for negative money).
+        let deepseek_fg = sample_row_fg(buf, "$-5.67");
+        assert!(
+            !deepseek_fg.contains(&Color::DarkGray),
+            "deepseek (focused) row should NOT be dimmed:\n{dump}"
+        );
     }
 
     /// Consensus panel applies the same dim treatment as the
