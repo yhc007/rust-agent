@@ -1778,9 +1778,28 @@ fn draw_strategy_pnl(
         // a profitable yesterday and a losing today, and that
         // distinction matters for the "who's winning right now"
         // call.
+        //
+        // The arrow prefix is a "trend within the trend" signal —
+        // it tracks the recent 12h slope independently of the 24h
+        // headline sign. ↑ / ↓ when |delta_12h| is above the
+        // ARROW_NOISE_USD floor, → when it's flat, blank when 12h
+        // doesn't have a usable baseline (daemon < ~9h old, sparse
+        // series, etc.). The floor keeps the arrow from flapping
+        // around zero in low-volume markets.
         let delta_24h = crate::coredb::strategy_pnl::pnl_delta_24h(series);
+        let delta_12h = crate::coredb::strategy_pnl::pnl_delta_12h(series);
+        const ARROW_NOISE_USD: f64 = 0.50;
+        let arrow = match delta_12h {
+            Some(d) if d > ARROW_NOISE_USD => "↑",
+            Some(d) if d < -ARROW_NOISE_USD => "↓",
+            Some(_) => "→",
+            None => "",
+        };
         let delta_text = match delta_24h {
-            Some(v) => format!("${:+.2}", v),
+            // No-space concat keeps the cell ≤ 10 chars wide for
+            // realistic deltas (4-digit + sign + cents = 9 chars +
+            // arrow = 10). The column width caps at 10.
+            Some(v) => format!("{arrow}${:+.2}", v),
             None => "—".to_string(),
         };
         let delta_style = if dim {
@@ -3302,6 +3321,30 @@ mod tests {
     }
 
     #[test]
+    fn pnl_delta_12h_returns_change_over_12h() {
+        let half_day_ms = 12 * 60 * 60 * 1000_i64;
+        let mut a = snap(0);
+        a.sum_pnl = 10.0;
+        let mut b = snap(half_day_ms);
+        b.sum_pnl = 18.0;
+        let series = vec![&a, &b];
+        let d = crate::coredb::strategy_pnl::pnl_delta_12h(&series)
+            .expect("should compute");
+        assert!((d - 8.0).abs() < 1e-9, "expected +8.0, got {d}");
+    }
+
+    #[test]
+    fn pnl_delta_12h_none_when_window_too_short() {
+        // 30 min apart — no snapshot within ±3h of (latest - 12h).
+        let mut a = snap(0);
+        a.sum_pnl = 10.0;
+        let mut b = snap(30 * 60 * 1000);
+        b.sum_pnl = 30.0;
+        let series = vec![&a, &b];
+        assert_eq!(crate::coredb::strategy_pnl::pnl_delta_12h(&series), None);
+    }
+
+    #[test]
     fn pnl_delta_24h_picks_closest_snapshot_within_tolerance() {
         // Three points: 0h, 22h, 24h. Latest = 24h, target = 0h.
         // 0h matches exactly; 22h is 2h off-target.
@@ -3801,6 +3844,133 @@ mod tests {
         assert!(
             dump.contains("$+13.50"),
             "expected Δ24h cell to show $+13.50; dump:\n{dump}"
+        );
+    }
+
+    /// The Δ24h cell prefixes its value with ↑/↓/→ when the
+    /// recent 12h delta exists. Builds a 3-point series spanning
+    /// 24h with the recent 12h showing a positive slope, asserts
+    /// the up-arrow + amount appear concatenated in the buffer.
+    #[test]
+    fn panel_strategy_pnl_delta_24h_renders_up_arrow_on_recent_gain() {
+        use crate::coredb::types::StrategyPnlSnapshot;
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let hour = 3_600_000_i64;
+        let now = 1_700_000_000_000_i64;
+        let mut s = super::Snapshot::default();
+        // 24h ago: pnl=5, 12h ago: pnl=8, now: pnl=18.5
+        //   → delta_24h = +13.5 (green)
+        //   → delta_12h = +10.5 (well above $0.50 noise floor → ↑)
+        s.snapshots = vec![
+            StrategyPnlSnapshot {
+                bucket_day_ms: 0,
+                ts_ms: now - 24 * hour,
+                strategy: "baseline".into(),
+                n_decisions: 0,
+                sum_size_usd: 0.0,
+                sum_pnl: 5.0,
+                n_yes: 0,
+                n_no: 0,
+                n_pass: 0,
+            },
+            StrategyPnlSnapshot {
+                bucket_day_ms: 0,
+                ts_ms: now - 12 * hour,
+                strategy: "baseline".into(),
+                n_decisions: 0,
+                sum_size_usd: 0.0,
+                sum_pnl: 8.0,
+                n_yes: 0,
+                n_no: 0,
+                n_pass: 0,
+            },
+            StrategyPnlSnapshot {
+                bucket_day_ms: 0,
+                ts_ms: now,
+                strategy: "baseline".into(),
+                n_decisions: 0,
+                sum_size_usd: 0.0,
+                sum_pnl: 18.5,
+                n_yes: 0,
+                n_no: 0,
+                n_pass: 0,
+            },
+        ];
+        let backend = TestBackend::new(140, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                super::draw_strategy_pnl(f, f.area(), &s, None);
+            })
+            .unwrap();
+        let dump = render_buffer(terminal.backend().buffer());
+        assert!(
+            dump.contains("↑$+13.50"),
+            "expected up-arrow + Δ24h; dump:\n{dump}",
+        );
+    }
+
+    /// And the recovery case: 24h headline is negative, but the
+    /// recent 12h is positive → ↑ (recovering), not ↓.
+    #[test]
+    fn panel_strategy_pnl_delta_24h_renders_recovery_arrow() {
+        use crate::coredb::types::StrategyPnlSnapshot;
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let hour = 3_600_000_i64;
+        let now = 1_700_000_000_000_i64;
+        let mut s = super::Snapshot::default();
+        // 24h ago: pnl=20, 12h ago: pnl=5, now: pnl=10
+        //   → delta_24h = -10 (red) — losing money over 24h
+        //   → delta_12h = +5  (above floor → ↑) — but recovering
+        s.snapshots = vec![
+            StrategyPnlSnapshot {
+                bucket_day_ms: 0,
+                ts_ms: now - 24 * hour,
+                strategy: "baseline".into(),
+                n_decisions: 0,
+                sum_size_usd: 0.0,
+                sum_pnl: 20.0,
+                n_yes: 0,
+                n_no: 0,
+                n_pass: 0,
+            },
+            StrategyPnlSnapshot {
+                bucket_day_ms: 0,
+                ts_ms: now - 12 * hour,
+                strategy: "baseline".into(),
+                n_decisions: 0,
+                sum_size_usd: 0.0,
+                sum_pnl: 5.0,
+                n_yes: 0,
+                n_no: 0,
+                n_pass: 0,
+            },
+            StrategyPnlSnapshot {
+                bucket_day_ms: 0,
+                ts_ms: now,
+                strategy: "baseline".into(),
+                n_decisions: 0,
+                sum_size_usd: 0.0,
+                sum_pnl: 10.0,
+                n_yes: 0,
+                n_no: 0,
+                n_pass: 0,
+            },
+        ];
+        let backend = TestBackend::new(140, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                super::draw_strategy_pnl(f, f.area(), &s, None);
+            })
+            .unwrap();
+        let dump = render_buffer(terminal.backend().buffer());
+        // Δ24h headline is "-10.00" (red), arrow shows recovery (↑).
+        assert!(
+            dump.contains("↑$-10.00"),
+            "expected ↑ + red Δ24h on recovery; dump:\n{dump}",
         );
     }
 

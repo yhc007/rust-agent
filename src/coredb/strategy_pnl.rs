@@ -92,17 +92,17 @@ impl StrategyPnlRepo {
     }
 }
 
-/// Compute the change in `sum_pnl` over the trailing 24h window for
-/// one strategy's snapshot series. Returns `None` when no baseline
-/// snapshot lands within ±6h of `latest.ts_ms - 24h` — e.g. the
-/// daemon has been running for less than ~18h, or snapshots are
-/// sparse around that mark — so callers render an empty cell /
-/// emit no series rather than booking a delta against an arbitrary
-/// older point.
+/// Compute the change in `sum_pnl` over a trailing window for one
+/// strategy's snapshot series. Returns `None` when no baseline
+/// snapshot lands within `±tolerance_ms` of `latest.ts_ms -
+/// window_ms` — e.g. the daemon has been running for less than the
+/// window, or snapshots are sparse around that mark — so callers
+/// render an empty cell / emit no series rather than booking a
+/// delta against an arbitrary older point.
 ///
 /// The reference clock is the latest snapshot's `ts_ms`, not
 /// `Utc::now()`: a halted `compare-pnl` then shows the most recent
-/// valid 24h delta instead of going blank, which matches the trend
+/// valid delta instead of going blank, which matches the trend
 /// sparkline's own latest-row semantics.
 ///
 /// Pure function on the input slice so it's testable without any
@@ -114,20 +114,41 @@ impl StrategyPnlRepo {
 /// `&[StrategyPnlSnapshot]` because the natural shape on the caller
 /// side is "per-strategy grouped refs into a larger Vec" — owned
 /// callers can adapt with `iter().collect::<Vec<_>>()`.
-pub fn pnl_delta_24h(series: &[&StrategyPnlSnapshot]) -> Option<f64> {
+pub fn pnl_delta_window(
+    series: &[&StrategyPnlSnapshot],
+    window_ms: i64,
+    tolerance_ms: i64,
+) -> Option<f64> {
     let latest = series.last()?;
-    let target = latest.ts_ms - 24 * 60 * 60 * 1000;
-    let tolerance = 6 * 60 * 60 * 1000;
+    let target = latest.ts_ms - window_ms;
     let baseline = *series
         .iter()
         .min_by_key(|s| (s.ts_ms - target).abs())?;
-    if (baseline.ts_ms - target).abs() > tolerance {
+    if (baseline.ts_ms - target).abs() > tolerance_ms {
         return None;
     }
     if baseline.ts_ms >= latest.ts_ms {
         return None;
     }
     Some(latest.sum_pnl - baseline.sum_pnl)
+}
+
+/// 24h delta with a ±6h tolerance — the headline number the
+/// strategy-pnl dashboard column + the
+/// `agent_pnl_delta_24h_usd{strategy=...}` Prometheus gauge both
+/// surface. See `pnl_delta_window` for the general form.
+pub fn pnl_delta_24h(series: &[&StrategyPnlSnapshot]) -> Option<f64> {
+    pnl_delta_window(series, 24 * 60 * 60 * 1000, 6 * 60 * 60 * 1000)
+}
+
+/// 12h delta with a ±3h tolerance — the "trend within the trend"
+/// signal that prefixes the Δ24h column with ↑/↓/→. Window and
+/// tolerance scale linearly with the 24h variant so the same
+/// "snapshot density at half-window" assumption holds: snapshots
+/// sparse around the 12h mark return None and the arrow falls back
+/// to blank rather than rendering noise.
+pub fn pnl_delta_12h(series: &[&StrategyPnlSnapshot]) -> Option<f64> {
+    pnl_delta_window(series, 12 * 60 * 60 * 1000, 3 * 60 * 60 * 1000)
 }
 
 /// Name-keyed projection matching the SELECT above. Same shape as the
