@@ -289,6 +289,33 @@ struct HealthWire {
     ingest_btc_age_ms: Option<i64>,
     #[serde(default)]
     ingest_polymarket_age_ms: Option<i64>,
+    /// Per-cache freshness ages (ms) keyed by cache slot. Surfaced
+    /// in the chip detail line when a cache is way past its TTL so
+    /// the operator can pinpoint which sub-system is stuck without
+    /// reading a `/metrics` page. Missing on pre-2026-05-16 daemons;
+    /// `#[serde(default)]` keeps backward compat.
+    #[serde(default)]
+    cache_ages_ms: HealthCacheAgesWire,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+struct HealthCacheAgesWire {
+    #[serde(default)]
+    decisions: Option<i64>,
+    #[serde(default)]
+    orders: Option<i64>,
+    #[serde(default)]
+    pnl_daily: Option<i64>,
+    #[serde(default)]
+    pnl_breakdown: Option<i64>,
+    #[serde(default)]
+    pnl_breakdown_yesterday: Option<i64>,
+    #[serde(default)]
+    pnl_breakdown_window: Option<i64>,
+    #[serde(default)]
+    positions: Option<i64>,
+    #[serde(default)]
+    ingest_probe: Option<i64>,
 }
 
 #[derive(Debug, Default, serde::Deserialize)]
@@ -480,7 +507,7 @@ async fn fetch_health(client: &reqwest::Client, url: &str) -> HealthChip {
         "ok" => HealthStatus::Ok,
         _ => HealthStatus::Degraded,
     };
-    let detail = if status == HealthStatus::Ok {
+    let mut detail = if status == HealthStatus::Ok {
         // Healthy path: include a compact ingest-age summary instead
         // of the worst-error line so the dashboard surfaces actionable
         // info even when nothing is broken yet.
@@ -500,11 +527,58 @@ async fn fetch_health(client: &reqwest::Client, url: &str) -> HealthChip {
             }
         })
     };
+    // Append a stalest-cache hint when any cache has been sitting
+    // past its TTL for a while. Highlights stuck sub-systems without
+    // making the operator open /metrics. STALE_CACHE_HINT_MS is
+    // intentionally generous — settle-pnl runs hourly so the pnl
+    // caches legitimately sit at 5+ minutes between refreshes.
+    if let Some(hint) = stalest_cache_hint(&body.cache_ages_ms) {
+        let combined = match detail {
+            Some(existing) => format!("{existing} · {hint}"),
+            None => hint,
+        };
+        detail = Some(combined);
+    }
     HealthChip {
         status,
         daemon_uptime_secs: Some(body.uptime_secs),
         detail,
     }
+}
+
+/// Threshold above which a cache is flagged as "stale" in the chip
+/// detail. settle-pnl runs hourly, so the pnl caches commonly sit at
+/// minutes-old between refreshes — 10 min is the rough operator-pain
+/// threshold ("we should look at this") without being so tight that
+/// every legitimate quiet period triggers a warning.
+const STALE_CACHE_HINT_MS: i64 = 10 * 60 * 1000;
+
+/// Render a chip hint like "stale: pnl_breakdown 1234s" when at
+/// least one cache slot's age is above [`STALE_CACHE_HINT_MS`].
+/// Returns `None` when every cache is fresh or unpopulated (None
+/// ages are treated as "never refreshed" rather than "stale forever"
+/// — the operator already sees that signal via the dashboard's
+/// empty-row state).
+///
+/// Pure helper so the threshold logic + label formatting are
+/// unit-testable without spinning up a /health server.
+fn stalest_cache_hint(ages: &HealthCacheAgesWire) -> Option<String> {
+    let slots: [(&str, Option<i64>); 8] = [
+        ("decisions", ages.decisions),
+        ("orders", ages.orders),
+        ("pnl_daily", ages.pnl_daily),
+        ("pnl_breakdown", ages.pnl_breakdown),
+        ("pnl_breakdown_yesterday", ages.pnl_breakdown_yesterday),
+        ("pnl_breakdown_window", ages.pnl_breakdown_window),
+        ("positions", ages.positions),
+        ("ingest_probe", ages.ingest_probe),
+    ];
+    let (name, age) = slots
+        .iter()
+        .filter_map(|(n, a)| a.map(|v| (*n, v)))
+        .filter(|(_, a)| *a > STALE_CACHE_HINT_MS)
+        .max_by_key(|(_, a)| *a)?;
+    Some(format!("stale: {name} {}s", age / 1000))
 }
 
 fn worst_subtask_error(body: &HealthWire) -> Option<String> {
@@ -1759,6 +1833,7 @@ mod tests {
             settle: super::HealthSubtaskWire { consecutive_errors: 3, last_error: Some("c".into()) },
             ingest_btc_age_ms: Some(100),
             ingest_polymarket_age_ms: Some(200),
+            cache_ages_ms: super::HealthCacheAgesWire::default(),
         };
         let msg = super::worst_subtask_error(&body).unwrap();
         assert!(msg.starts_with("compare: 5×"), "got: {msg}");
@@ -1775,8 +1850,54 @@ mod tests {
             settle: super::HealthSubtaskWire::default(),
             ingest_btc_age_ms: Some(100),
             ingest_polymarket_age_ms: Some(200),
+            cache_ages_ms: super::HealthCacheAgesWire::default(),
         };
         assert!(super::worst_subtask_error(&body).is_none());
+    }
+
+    #[test]
+    fn stalest_cache_hint_returns_none_when_all_fresh() {
+        let ages = super::HealthCacheAgesWire {
+            decisions: Some(1_000),
+            orders: Some(500),
+            pnl_daily: Some(60_000),
+            pnl_breakdown: Some(30_000),
+            pnl_breakdown_yesterday: Some(120_000),
+            pnl_breakdown_window: Some(45_000),
+            positions: Some(2_000),
+            ingest_probe: Some(100),
+        };
+        assert!(super::stalest_cache_hint(&ages).is_none());
+    }
+
+    #[test]
+    fn stalest_cache_hint_picks_max_age_over_threshold() {
+        // Threshold is 10 min = 600_000 ms. Two slots over (pnl_breakdown_window
+        // at 12 min, pnl_daily at 11 min); pnl_breakdown_window wins.
+        let ages = super::HealthCacheAgesWire {
+            decisions: Some(1_000),
+            orders: None,
+            pnl_daily: Some(11 * 60 * 1000),
+            pnl_breakdown: None,
+            pnl_breakdown_yesterday: Some(60_000),
+            pnl_breakdown_window: Some(12 * 60 * 1000),
+            positions: None,
+            ingest_probe: Some(100),
+        };
+        let hint = super::stalest_cache_hint(&ages).unwrap();
+        assert!(
+            hint.starts_with("stale: pnl_breakdown_window"),
+            "expected window to be the stalest, got: {hint}",
+        );
+        assert!(hint.contains("720s"), "expected age in seconds, got: {hint}");
+    }
+
+    #[test]
+    fn stalest_cache_hint_ignores_none_slots() {
+        // All None → "never refreshed" → no hint (operator already
+        // sees this via empty-row dashboard state).
+        let ages = super::HealthCacheAgesWire::default();
+        assert!(super::stalest_cache_hint(&ages).is_none());
     }
 
     #[test]

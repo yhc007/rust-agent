@@ -163,6 +163,28 @@ struct HealthResponse {
     /// Age in ms of the newest `markets.updated_at_ms`. Same
     /// semantics as `ingest_btc_age_ms`.
     ingest_polymarket_age_ms: Option<i64>,
+    /// Per-cache freshness ages in ms. `None` for a cache that has
+    /// never been populated (e.g. on a brand-new daemon before the
+    /// first /metrics scrape). Dashboard surfaces these in the chip
+    /// detail line so a single stuck cache is visible without
+    /// staring at the whole snapshot. NOT factored into `status` —
+    /// each cache has its own TTL and "stuck" means different
+    /// things for different sources (the pnl caches refresh hourly
+    /// when settle-pnl runs; the orders cache refreshes when CQL
+    /// writes land).
+    cache_ages_ms: HealthCacheAges,
+}
+
+#[derive(Debug, Default, Clone, Serialize)]
+pub struct HealthCacheAges {
+    pub decisions: Option<i64>,
+    pub orders: Option<i64>,
+    pub pnl_daily: Option<i64>,
+    pub pnl_breakdown: Option<i64>,
+    pub pnl_breakdown_yesterday: Option<i64>,
+    pub pnl_breakdown_window: Option<i64>,
+    pub positions: Option<i64>,
+    pub ingest_probe: Option<i64>,
 }
 
 const UNHEALTHY_AFTER_ERRORS: u32 = 3;
@@ -658,16 +680,73 @@ pub struct HealthInputs {
     pub health: HealthState,
     pub btc_age_ms: Option<i64>,
     pub polymarket_age_ms: Option<i64>,
+    pub cache_ages: HealthCacheAges,
 }
 
 async fn gather_health_inputs(s: &HealthAppState, now: i64) -> HealthInputs {
     let health = s.health.read().await.clone();
     let (btc_age_ms, polymarket_age_ms) = ingest_ages_cached(s, now).await;
+    // Per-cache freshness — read each cache's `fetched_at_ms` under
+    // a brief read lock and compute age. Order matters only for the
+    // read-lock contention story (we acquire each lock sequentially
+    // and release before moving on); the slot order in the struct
+    // is alphabetical for stable JSON output.
+    let cache_ages = HealthCacheAges {
+        decisions: s
+            .decisions_cache
+            .read()
+            .await
+            .as_ref()
+            .map(|c| (now - c.fetched_at_ms).max(0)),
+        orders: s
+            .orders_cache
+            .read()
+            .await
+            .as_ref()
+            .map(|c| (now - c.fetched_at_ms).max(0)),
+        pnl_daily: s
+            .pnl_daily_cache
+            .read()
+            .await
+            .as_ref()
+            .map(|c| (now - c.fetched_at_ms).max(0)),
+        pnl_breakdown: s
+            .pnl_breakdown_cache
+            .read()
+            .await
+            .as_ref()
+            .map(|c| (now - c.fetched_at_ms).max(0)),
+        pnl_breakdown_yesterday: s
+            .pnl_breakdown_yesterday_cache
+            .read()
+            .await
+            .as_ref()
+            .map(|c| (now - c.fetched_at_ms).max(0)),
+        pnl_breakdown_window: s
+            .pnl_breakdown_window_cache
+            .read()
+            .await
+            .as_ref()
+            .map(|c| (now - c.fetched_at_ms).max(0)),
+        positions: s
+            .positions_cache
+            .read()
+            .await
+            .as_ref()
+            .map(|c| (now - c.fetched_at_ms).max(0)),
+        ingest_probe: s
+            .ingest_cache
+            .read()
+            .await
+            .as_ref()
+            .map(|c| (now - c.fetched_at_ms).max(0)),
+    };
     HealthInputs {
         now_ms: now,
         health,
         btc_age_ms,
         polymarket_age_ms,
+        cache_ages,
     }
 }
 
@@ -697,6 +776,7 @@ pub fn compute_health_response(inp: &HealthInputs) -> HealthResponse {
         user_channel_present: inp.health.user_channel_present,
         ingest_btc_age_ms: inp.btc_age_ms,
         ingest_polymarket_age_ms: inp.polymarket_age_ms,
+        cache_ages_ms: inp.cache_ages.clone(),
     }
 }
 
@@ -1692,6 +1772,7 @@ mod tests {
             },
             btc_age_ms: Some(500),
             polymarket_age_ms: Some(12_000),
+            cache_ages: super::HealthCacheAges::default(),
         }
     }
 
@@ -1734,6 +1815,63 @@ mod tests {
         inp.health.backtest.consecutive_errors = super::UNHEALTHY_AFTER_ERRORS - 1;
         let r = super::compute_health_response(&inp);
         assert_eq!(r.status, "ok");
+    }
+
+    /// `cache_ages_ms` round-trips from inputs → response → JSON. The
+    /// dashboard reads the JSON shape directly, so pin both that the
+    /// field is present (non-null when input has it set) and that
+    /// the missing-cache case serializes as `null` so the chip
+    /// renderer can tell "cache never populated" from "cache
+    /// freshly refreshed at 0ms".
+    #[test]
+    fn health_response_carries_cache_ages_per_slot() {
+        let mut inp = happy_inputs();
+        inp.cache_ages = super::HealthCacheAges {
+            decisions: Some(1_234),
+            orders: Some(2_345),
+            pnl_daily: None,
+            pnl_breakdown: Some(34_000),
+            pnl_breakdown_yesterday: None,
+            pnl_breakdown_window: Some(60_000),
+            positions: Some(800),
+            ingest_probe: Some(100),
+        };
+        let r = super::compute_health_response(&inp);
+        assert_eq!(r.cache_ages_ms.decisions, Some(1_234));
+        assert_eq!(r.cache_ages_ms.orders, Some(2_345));
+        assert_eq!(r.cache_ages_ms.pnl_daily, None);
+        assert_eq!(r.cache_ages_ms.pnl_breakdown, Some(34_000));
+        assert_eq!(r.cache_ages_ms.pnl_breakdown_yesterday, None);
+        assert_eq!(r.cache_ages_ms.pnl_breakdown_window, Some(60_000));
+        assert_eq!(r.cache_ages_ms.positions, Some(800));
+        assert_eq!(r.cache_ages_ms.ingest_probe, Some(100));
+
+        // JSON shape pin: dashboard depends on the exact field
+        // names + None → null mapping. Build the JSON via the
+        // existing Serialize impl rather than asserting it
+        // text-equally because field order may vary.
+        let json = serde_json::to_value(&r).unwrap();
+        let ages = &json["cache_ages_ms"];
+        assert_eq!(ages["decisions"], 1234);
+        assert_eq!(ages["pnl_daily"], serde_json::Value::Null);
+        assert_eq!(ages["pnl_breakdown_window"], 60_000);
+        assert_eq!(ages["ingest_probe"], 100);
+    }
+
+    /// All-None cache_ages is the default state on a brand-new
+    /// daemon (no /metrics scrape yet). Status must still be "ok"
+    /// based on ingest + subtask signals — cache ages aren't
+    /// factored into the overall status by design (each cache has
+    /// its own TTL and "stuck" means different things for different
+    /// sources).
+    #[test]
+    fn health_status_independent_of_cache_freshness() {
+        let inp = happy_inputs();
+        // cache_ages all None via Default in happy_inputs.
+        let r = super::compute_health_response(&inp);
+        assert_eq!(r.status, "ok");
+        assert_eq!(r.cache_ages_ms.decisions, None);
+        assert_eq!(r.cache_ages_ms.orders, None);
     }
 
     /// Drive `render_metrics` with a fully-populated synthetic
