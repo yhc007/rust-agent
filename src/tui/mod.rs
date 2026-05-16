@@ -136,6 +136,10 @@ async fn main_loop(
     // mentally. Empty on first frame → no indicator shown.
     let mut prev_ranks: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
+    // Sort key for the strategy comparison panel. Hotkey 's'
+    // cycles. Resets on dashboard restart — intentional, since
+    // operator preferences are usually session-scoped.
+    let mut comparison_sort: ComparisonSort = ComparisonSort::Window7dDesc;
     let mut snapshot = fetch_snapshot(
         btc_repo, dec_repo, pos_repo, pnl_repo, agree_repo, breakdown_repo, health_url,
         health_client, pnl_days, prev_ingest_restarts,
@@ -167,14 +171,20 @@ async fn main_loop(
                 &strategies,
                 strategy_filter.as_deref(),
                 &prev_ranks,
+                comparison_sort,
             )
         })?;
         // Refresh prev_ranks to the ordering this frame just
         // rendered, so the next frame's Δ column shows momentum
-        // relative to "the rendering the operator just saw."
-        // Rebuilding the rows is cheap; one BTreeMap traversal
-        // + a sort per refresh.
-        let next_rows = build_strategy_comparison_rows(&snapshot, strategy_filter.as_deref());
+        // relative to "the rendering the operator just saw." Uses
+        // the same sort key the panel just rendered with so the
+        // ranks line up; switching sort mid-session changes the
+        // baseline naturally.
+        let next_rows = build_strategy_comparison_rows_sorted(
+            &snapshot,
+            strategy_filter.as_deref(),
+            comparison_sort,
+        );
         prev_ranks = next_rows
             .iter()
             .enumerate()
@@ -224,6 +234,14 @@ async fn main_loop(
                     }
                     KeyCode::Char('-') | KeyCode::Char('_') => {
                         strategy_filter = cycle_strategy(&strategies, strategy_filter.as_deref(), -1);
+                    }
+                    // Cycle the comparison panel's sort key. No
+                    // refresh required; the next terminal.draw
+                    // pick the new order. Operator preferences
+                    // stay session-scoped (resets on dashboard
+                    // restart, same as the strategy filter).
+                    KeyCode::Char('s') | KeyCode::Char('S') => {
+                        comparison_sort = comparison_sort.cycle();
                     }
                     _ => {}
                 },
@@ -1105,6 +1123,7 @@ fn draw(
     strategies: &[String],
     strategy_filter: Option<&str>,
     prev_ranks: &std::collections::HashMap<String, usize>,
+    sort: ComparisonSort,
 ) {
     // Footer needs an extra line to surface the strategy hotkeys, so
     // grow it to 4 rows when at least one strategy is available.
@@ -1143,7 +1162,7 @@ fn draw(
 
     draw_header(f, chunks[0], s, snap_age, uptime);
     draw_strategy_pnl(f, chunks[1], s, strategy_filter);
-    draw_strategy_comparison(f, chunks[2], s, strategy_filter, prev_ranks);
+    draw_strategy_comparison(f, chunks[2], s, strategy_filter, prev_ranks, sort);
     draw_consensus(f, chunks[3], s, strategy_filter);
     draw_positions(f, chunks[4], s);
     draw_decisions(f, chunks[5], s, strategy_filter);
@@ -1516,8 +1535,9 @@ fn draw_strategy_comparison(
     s: &Snapshot,
     strategy_filter: Option<&str>,
     prev_ranks: &std::collections::HashMap<String, usize>,
+    sort: ComparisonSort,
 ) {
-    let rows_data = build_strategy_comparison_rows(s, strategy_filter);
+    let rows_data = build_strategy_comparison_rows_sorted(s, strategy_filter, sort);
     let agree_header: String = match strategy_filter {
         None => "agree (mean)".to_string(),
         Some(name) => format!("vs {name}"),
@@ -1698,7 +1718,7 @@ fn draw_strategy_comparison(
     let title = if rows.is_empty() {
         " strategy comparison (no data yet) ".to_string()
     } else {
-        " strategy comparison ".to_string()
+        format!(" strategy comparison • sorted by: {} ", sort.label())
     };
     let widths = [
         Constraint::Length(2),  // Δ rank change
@@ -1735,9 +1755,56 @@ struct StrategyComparisonRow {
     agree_rate: Option<f64>,
 }
 
+/// Hotkey-driven sort key for the strategy-comparison table.
+/// Cycled by the `s` hotkey: default → today-desc → yesterday-desc
+/// → name-asc → back to default. Default mirrors the historical
+/// ranking the panel shipped with so dashboards behave unchanged
+/// for operators who never press `s`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ComparisonSort {
+    Window7dDesc,
+    TodayDesc,
+    YesterdayDesc,
+    StrategyAsc,
+}
+
+impl ComparisonSort {
+    /// Step to the next sort key in the cycle. Used by the `s`
+    /// hotkey in main_loop.
+    fn cycle(self) -> Self {
+        match self {
+            ComparisonSort::Window7dDesc => ComparisonSort::TodayDesc,
+            ComparisonSort::TodayDesc => ComparisonSort::YesterdayDesc,
+            ComparisonSort::YesterdayDesc => ComparisonSort::StrategyAsc,
+            ComparisonSort::StrategyAsc => ComparisonSort::Window7dDesc,
+        }
+    }
+
+    /// Short label used in the comparison panel title so the
+    /// operator can see which axis is sorted-by at a glance.
+    /// Uses "desc" / "asc" rather than ↑/↓ glyphs so the title
+    /// doesn't collide with the Δ column's arrow indicators.
+    fn label(self) -> &'static str {
+        match self {
+            ComparisonSort::Window7dDesc => "7d desc",
+            ComparisonSort::TodayDesc => "today desc",
+            ComparisonSort::YesterdayDesc => "yesterday desc",
+            ComparisonSort::StrategyAsc => "name asc",
+        }
+    }
+}
+
 fn build_strategy_comparison_rows(
     s: &Snapshot,
     strategy_filter: Option<&str>,
+) -> Vec<StrategyComparisonRow> {
+    build_strategy_comparison_rows_sorted(s, strategy_filter, ComparisonSort::Window7dDesc)
+}
+
+fn build_strategy_comparison_rows_sorted(
+    s: &Snapshot,
+    strategy_filter: Option<&str>,
+    sort: ComparisonSort,
 ) -> Vec<StrategyComparisonRow> {
     use std::collections::BTreeMap;
 
@@ -1802,18 +1869,32 @@ fn build_strategy_comparison_rows(
             strategy,
         });
     }
-    // Rank order: highest 7d PnL first so the operator's eye lands
-    // on the winning strategy. Alphabetical tiebreak keeps the
-    // rendering deterministic when two strategies happen to be
-    // tied (e.g. both at $0.00 on a fresh deployment). NaN
-    // window_pnls — shouldn't happen in practice, but be defensive
-    // — sort last so they don't poison the top of the list.
-    out.sort_by(|a, b| {
-        b.window_pnl
-            .partial_cmp(&a.window_pnl)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.strategy.cmp(&b.strategy))
-    });
+    // Rank order: dictated by the operator's sort key (default
+    // Window7dDesc puts the winning strategy on top). Alphabetical
+    // tiebreak keeps the rendering deterministic when two
+    // strategies happen to be tied (e.g. both at $0.00 on a fresh
+    // deployment). NaN pnls — shouldn't happen in practice, but be
+    // defensive — sort last so they don't poison the top of the
+    // list via Equal-fallback in partial_cmp.
+    use std::cmp::Ordering;
+    let by_strategy = |a: &StrategyComparisonRow, b: &StrategyComparisonRow| -> Ordering {
+        a.strategy.cmp(&b.strategy)
+    };
+    let cmp_desc = |x: f64, y: f64| -> Ordering {
+        y.partial_cmp(&x).unwrap_or(Ordering::Equal)
+    };
+    match sort {
+        ComparisonSort::Window7dDesc => out.sort_by(|a, b| {
+            cmp_desc(a.window_pnl, b.window_pnl).then_with(|| by_strategy(a, b))
+        }),
+        ComparisonSort::TodayDesc => out.sort_by(|a, b| {
+            cmp_desc(a.today_pnl, b.today_pnl).then_with(|| by_strategy(a, b))
+        }),
+        ComparisonSort::YesterdayDesc => out.sort_by(|a, b| {
+            cmp_desc(a.yesterday_pnl, b.yesterday_pnl).then_with(|| by_strategy(a, b))
+        }),
+        ComparisonSort::StrategyAsc => out.sort_by(by_strategy),
+    }
     out
 }
 
@@ -1973,7 +2054,7 @@ fn draw_footer(
     strategy_filter: Option<&str>,
 ) {
     let mut lines = vec![Line::from(
-        " [q]/Esc quit   [r] refresh now   (auto-refresh every 5 s) ",
+        " [q]/Esc quit   [r] refresh now   [s] cycle sort   (auto-refresh every 5 s) ",
     )];
 
     // Strategy hotkeys line. Each visible strategy gets its digit
@@ -2702,6 +2783,7 @@ mod tests {
                     &strategies,
                     filter,
                     &prev_ranks,
+                    super::ComparisonSort::Window7dDesc,
                 )
             })
             .unwrap();
@@ -2753,6 +2835,7 @@ mod tests {
                     &strategies,
                     None,
                     &prev_ranks,
+                    super::ComparisonSort::Window7dDesc,
                 )
             })
             .unwrap();
@@ -2969,6 +3052,124 @@ mod tests {
         assert_eq!(names, vec!["anthropic", "baseline", "deepseek"]);
     }
 
+    /// Sort key cycles through 4 states and returns to the start.
+    /// Locks the cycle order so a refactor that reshuffles the
+    /// match arm doesn't silently break the hotkey UX.
+    #[test]
+    fn comparison_sort_cycles_through_all_four() {
+        let s0 = super::ComparisonSort::Window7dDesc;
+        let s1 = s0.cycle();
+        let s2 = s1.cycle();
+        let s3 = s2.cycle();
+        let s4 = s3.cycle();
+        assert_eq!(s1, super::ComparisonSort::TodayDesc);
+        assert_eq!(s2, super::ComparisonSort::YesterdayDesc);
+        assert_eq!(s3, super::ComparisonSort::StrategyAsc);
+        assert_eq!(s4, super::ComparisonSort::Window7dDesc, "cycle should wrap");
+    }
+
+    /// Each sort key produces the expected ordering on a fixture
+    /// where every column has a distinct ranking, so misrouting
+    /// a sort key surfaces as a different head-of-list strategy.
+    #[test]
+    fn build_strategy_comparison_sorts_by_each_key() {
+        use crate::coredb::types::StrategyPnlSnapshot;
+        let mut s = super::Snapshot::default();
+        // today:     baseline=+50 > deepseek=+10 > anthropic=-5
+        // yesterday: anthropic=+20 > deepseek=+5 > baseline=-3
+        // 7d:        deepseek=+100 > anthropic=+50 > baseline=-10
+        // name asc:  anthropic, baseline, deepseek
+        s.snapshots = vec![
+            StrategyPnlSnapshot {
+                bucket_day_ms: 0, ts_ms: 1, strategy: "baseline".into(),
+                n_decisions: 0, sum_size_usd: 0.0, sum_pnl: 50.0,
+                n_yes: 0, n_no: 0, n_pass: 0,
+            },
+            StrategyPnlSnapshot {
+                bucket_day_ms: 0, ts_ms: 1, strategy: "deepseek".into(),
+                n_decisions: 0, sum_size_usd: 0.0, sum_pnl: 10.0,
+                n_yes: 0, n_no: 0, n_pass: 0,
+            },
+            StrategyPnlSnapshot {
+                bucket_day_ms: 0, ts_ms: 1, strategy: "anthropic".into(),
+                n_decisions: 0, sum_size_usd: 0.0, sum_pnl: -5.0,
+                n_yes: 0, n_no: 0, n_pass: 0,
+            },
+        ];
+        s.pnl_breakdown_yesterday = vec![
+            super::PnlBreakdown {
+                bucket_day_ms: 0, strategy: "anthropic".into(),
+                exec: "paper".into(), realized_pnl: 20.0, n_settled: 1,
+            },
+            super::PnlBreakdown {
+                bucket_day_ms: 0, strategy: "deepseek".into(),
+                exec: "paper".into(), realized_pnl: 5.0, n_settled: 1,
+            },
+            super::PnlBreakdown {
+                bucket_day_ms: 0, strategy: "baseline".into(),
+                exec: "paper".into(), realized_pnl: -3.0, n_settled: 1,
+            },
+        ];
+        s.pnl_breakdown_window = vec![
+            super::PnlBreakdown {
+                bucket_day_ms: 0, strategy: "deepseek".into(),
+                exec: "paper".into(), realized_pnl: 100.0, n_settled: 1,
+            },
+            super::PnlBreakdown {
+                bucket_day_ms: 0, strategy: "anthropic".into(),
+                exec: "paper".into(), realized_pnl: 50.0, n_settled: 1,
+            },
+            super::PnlBreakdown {
+                bucket_day_ms: 0, strategy: "baseline".into(),
+                exec: "paper".into(), realized_pnl: -10.0, n_settled: 1,
+            },
+        ];
+
+        let head =
+            |sort: super::ComparisonSort| -> Vec<String> {
+                super::build_strategy_comparison_rows_sorted(&s, None, sort)
+                    .into_iter()
+                    .map(|r| r.strategy)
+                    .collect()
+            };
+        assert_eq!(
+            head(super::ComparisonSort::Window7dDesc),
+            vec!["deepseek", "anthropic", "baseline"],
+            "7d-desc",
+        );
+        assert_eq!(
+            head(super::ComparisonSort::TodayDesc),
+            vec!["baseline", "deepseek", "anthropic"],
+            "today-desc",
+        );
+        assert_eq!(
+            head(super::ComparisonSort::YesterdayDesc),
+            vec!["anthropic", "deepseek", "baseline"],
+            "yesterday-desc",
+        );
+        assert_eq!(
+            head(super::ComparisonSort::StrategyAsc),
+            vec!["anthropic", "baseline", "deepseek"],
+            "strategy-asc",
+        );
+    }
+
+    /// Title carries the active sort label so the operator can
+    /// see at a glance which key the panel is ordered by.
+    /// Default (Window7dDesc) → "7d↓" in title.
+    #[test]
+    fn panel_strategy_comparison_title_shows_sort_label() {
+        let window = vec![super::PnlBreakdown {
+            bucket_day_ms: 0, strategy: "baseline".into(),
+            exec: "paper".into(), realized_pnl: 5.0, n_settled: 1,
+        }];
+        let dump = render_test_dashboard_full(None, None, Vec::new(), window);
+        assert!(
+            dump.contains("sorted by: 7d desc"),
+            "expected default sort label in title:\n{dump}",
+        );
+    }
+
     /// Rank order on the comparison panel is "winning strategy
     /// first" — sort by 7d PnL descending, with alphabetical
     /// tiebreak for determinism on ties. Pin this with a fixture
@@ -3168,6 +3369,7 @@ mod tests {
                     &strategies,
                     None,
                     &prev_ranks,
+                    super::ComparisonSort::Window7dDesc,
                 )
             })
             .unwrap();
@@ -3351,6 +3553,7 @@ mod tests {
                     &strategies,
                     None,
                     &prev_ranks,
+                    super::ComparisonSort::Window7dDesc,
                 )
             })
             .unwrap();
