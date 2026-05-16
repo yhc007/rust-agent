@@ -1361,7 +1361,7 @@ fn draw(
     draw_strategy_pnl(f, chunks[1], s, strategy_filter);
     draw_strategy_comparison(f, chunks[2], s, strategy_filter, prev_ranks, sort);
     draw_consensus(f, chunks[3], s, strategy_filter);
-    draw_positions(f, chunks[4], s);
+    draw_positions(f, chunks[4], s, strategy_filter);
     draw_decisions(f, chunks[5], s, strategy_filter);
     draw_footer(f, chunks[6], s, strategies, strategy_filter);
 }
@@ -2276,28 +2276,57 @@ fn sparkline(values: &[f64]) -> String {
     out
 }
 
-fn draw_positions(f: &mut ratatui::Frame, area: Rect, s: &Snapshot) {
+fn draw_positions(f: &mut ratatui::Frame, area: Rect, s: &Snapshot, strategy_filter: Option<&str>) {
     let header = Row::new(["market_slug", "side", "size", "avg_price", "updated"])
         .style(Style::default().add_modifier(Modifier::BOLD));
+    // Dim policy: positions table doesn't carry strategy
+    // attribution, but s.decisions does. A position is "focused"
+    // when the focused strategy made any decision (today's
+    // bucket) on the same market_slug. Filter inactive →
+    // focused_markets is None → no dim.
+    let focused_markets: Option<std::collections::HashSet<&str>> =
+        strategy_filter.map(|name| {
+            s.decisions
+                .iter()
+                .filter(|d| d.effective_strategy() == name)
+                .map(|d| d.market_slug.as_str())
+                .collect()
+        });
+    let dim_style = Style::default().fg(Color::DarkGray);
     let rows: Vec<Row> = s
         .positions
         .iter()
         .take(usize::from(area.height.saturating_sub(3)))
         .map(|p| {
+            let dim = match &focused_markets {
+                Some(set) => !set.contains(p.market_slug.as_str()),
+                None => false,
+            };
             let ts = DateTime::<Utc>::from_timestamp_millis(p.updated_at_ms)
                 .map(|d| d.format("%H:%M:%S").to_string())
                 .unwrap_or_default();
-            let side_style = match p.side.as_str() {
-                "YES" => Style::default().fg(Color::Green),
-                "NO" => Style::default().fg(Color::Red),
-                _ => Style::default(),
+            let side_style = if dim {
+                dim_style
+            } else {
+                match p.side.as_str() {
+                    "YES" => Style::default().fg(Color::Green),
+                    "NO" => Style::default().fg(Color::Red),
+                    _ => Style::default(),
+                }
+            };
+            let plain = |text: String| -> Cell<'static> {
+                if dim {
+                    Cell::from(Span::styled(text, dim_style))
+                } else {
+                    Cell::from(text)
+                }
             };
             Row::new(vec![
-                Cell::from(p.market_slug.clone()),
+                plain(p.market_slug.clone()),
                 Cell::from(Span::styled(p.side.clone(), side_style)),
-                Cell::from(format!("{:.2}", p.size)),
-                Cell::from(format!("${:.4}", p.avg_price)),
-                Cell::from(ts),
+                plain(format!("{:.2}", p.size)),
+                plain(format!("${:.4}", p.avg_price)),
+                plain(ts),
             ])
         })
         .collect();
@@ -4441,6 +4470,86 @@ mod tests {
         assert!(
             !deepseek_fg.contains(&Color::DarkGray),
             "deepseek (focused) row should NOT be dimmed:\n{dump}"
+        );
+    }
+
+    /// Positions table dims any position whose market_slug
+    /// isn't a market the focused strategy decided on today.
+    /// Positions themselves don't carry strategy attribution, so
+    /// the dim policy uses s.decisions as the proxy.
+    #[test]
+    fn panel_positions_dims_unfocused_markets() {
+        use crate::coredb::types::{Decision, Position};
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        use uuid::Uuid;
+        let mut s = super::Snapshot::default();
+        // Decisions: baseline decided on btc-100k today.
+        s.decisions = vec![Decision {
+            bucket_day_ms: 0,
+            ts_ms: 1,
+            decision_id: Uuid::nil(),
+            market_slug: "btc-100k".into(),
+            side: "YES".into(),
+            size_usd: 1.0,
+            confidence: 0.0,
+            edge_bps: 0,
+            reasoning: String::new(),
+            raw_response: String::new(),
+            entry_price: 0.5,
+            strategy: "baseline".into(),
+        }];
+        // Two positions: one on btc-100k (decided on by baseline),
+        // one on btc-200k (no decision attribution today).
+        s.positions = vec![
+            Position {
+                market_slug: "btc-100k".into(),
+                side: "YES".into(),
+                size: 10.0,
+                avg_price: 0.5,
+                updated_at_ms: 1,
+            },
+            Position {
+                market_slug: "btc-200k".into(),
+                side: "NO".into(),
+                size: 5.0,
+                avg_price: 0.7,
+                updated_at_ms: 1,
+            },
+        ];
+        let strategies = super::strategies_in_view(&s);
+        let prev_ranks: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        let backend = TestBackend::new(140, 50);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                super::draw(
+                    f,
+                    &s,
+                    std::time::Duration::from_millis(0),
+                    std::time::Duration::from_secs(42),
+                    &strategies,
+                    Some("baseline"),
+                    &prev_ranks,
+                    super::ComparisonSort::DEFAULT,
+                )
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let dump = render_buffer(buf);
+        // btc-200k row in positions panel: baseline didn't
+        // decide on it today → dim.
+        let unfocused = sample_row_fg(buf, "btc-200k");
+        assert!(
+            unfocused.contains(&Color::DarkGray),
+            "btc-200k position should be dimmed:\n{dump}"
+        );
+        // btc-100k row: baseline decided on it → not dim.
+        let focused = sample_row_fg(buf, "btc-100k");
+        assert!(
+            !focused.contains(&Color::DarkGray),
+            "btc-100k position should NOT be dimmed:\n{dump}"
         );
     }
 
