@@ -220,6 +220,11 @@ struct Snapshot {
     /// alongside today's running numbers. One row per (strategy, exec)
     /// — both paper and live get summed per strategy in the footer.
     pnl_breakdown_yesterday: Vec<PnlBreakdown>,
+    /// Rolling 7-day pnl_breakdown rows (one per (strategy, exec) per
+    /// bucket_day) concatenated across the last 7 UTC days. The
+    /// "7d total:" footer line aggregates these per strategy.
+    /// Mirrors the agent_pnl_breakdown_window_* /metrics gauge.
+    pnl_breakdown_window: Vec<PnlBreakdown>,
     /// Result of the most recent /health probe. `None` when the
     /// dashboard wasn't started with --health-url. Otherwise carries
     /// a parsed result *or* an "unreachable" marker so the header
@@ -413,6 +418,24 @@ async fn fetch_snapshot(
     match breakdown.list_day(yesterday_bd).await {
         Ok(v) => s.pnl_breakdown_yesterday = v,
         Err(e) => s.errors.push(format!("pnl_breakdown.list_day({yesterday_bd}): {e}")),
+    }
+    // 7-day rolling pnl_breakdown for the "7d total:" footer line.
+    // One list_day per day across the last 7 UTC bucket_days. A
+    // failed read on any single day is recorded as an error but
+    // doesn't poison the rest of the window — the footer renders
+    // whatever days returned successfully. Yesterday (already read
+    // above) is included again here so the aggregate is complete;
+    // CoreDB-side caching makes the duplicate cheap.
+    const WINDOW_DAYS: i64 = 7;
+    const DAY_MS_WIN: Millis = 86_400_000;
+    for i in 0..WINDOW_DAYS {
+        let day_bd = bd - i * DAY_MS_WIN;
+        match breakdown.list_day(day_bd).await {
+            Ok(v) => s.pnl_breakdown_window.extend(v),
+            Err(e) => s
+                .errors
+                .push(format!("pnl_breakdown.list_day({day_bd}) [7d window]: {e}")),
+        }
     }
     if let (Some(url), Some(client)) = (health_url, health_client) {
         s.health = Some(fetch_health(client, url).await);
@@ -845,9 +868,10 @@ fn draw(
             // content line inside the box, hiding the meta line
             // and rendering the chip's `detail` field invisible.
             Constraint::Length(4),                  // header
-            // 7 = bordered table (6) + 1-row footer below it that
-            // surfaces yesterday's final realized PnL by strategy.
-            Constraint::Length(7),                  // strategy pnl + yesterday footer
+            // 8 = bordered table (6) + 1-row "Yesterday final:"
+            // footer + 1-row "7d total:" footer, both rendered
+            // below the table's box.
+            Constraint::Length(8),                  // strategy pnl + yesterday + 7d footers
             Constraint::Min(5),                     // market consensus
             Constraint::Min(5),                     // positions
             Constraint::Min(7),                     // recent decisions
@@ -1032,15 +1056,21 @@ fn draw_strategy_pnl(
     s: &Snapshot,
     strategy_filter: Option<&str>,
 ) {
-    // Split the panel into a bordered table (top) and a single-row
-    // yesterday-PnL footer (bottom). Footer sits *outside* the table's
-    // box so the table's row count isn't affected by its presence.
+    // Split the panel into a bordered table (top) and two single-row
+    // footers (bottom): "Yesterday final:" then "7d total:". Both
+    // sit *outside* the table's box so the table's row count isn't
+    // affected by their presence.
     let split = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(3), Constraint::Length(1)])
+        .constraints([
+            Constraint::Min(3),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
         .split(area);
     let table_area = split[0];
     let footer_area = split[1];
+    let window_footer_area = split[2];
     // Group snapshots per strategy so we can both:
     //   (a) pick the latest row for the headline columns, and
     //   (b) reconstruct the time-ordered sum_pnl series to feed the
@@ -1212,6 +1242,14 @@ fn draw_strategy_pnl(
     // them. Empty rowset renders as a hint line rather than an error.
     let footer_line = render_yesterday_pnl_footer(&s.pnl_breakdown_yesterday, strategy_filter);
     f.render_widget(Paragraph::new(footer_line), footer_area);
+
+    // Second footer line: rolling 7-day total per strategy. Same
+    // shape as yesterday's (per-strategy sum across paper+live and
+    // across all 7 days), giving the operator both end-of-day and
+    // longer-horizon numbers without leaving the dashboard. Mirrors
+    // the daemon's `agent_pnl_breakdown_window_realized_usd` metric.
+    let window_line = render_window_pnl_footer(&s.pnl_breakdown_window, strategy_filter);
+    f.render_widget(Paragraph::new(window_line), window_footer_area);
 }
 
 /// Build the one-line "Yesterday final: …" footer that lives just under
@@ -1252,6 +1290,63 @@ fn render_yesterday_pnl_footer<'a>(
     }
     let mut spans: Vec<Span<'a>> = vec![Span::styled(
         "Yesterday final: ",
+        Style::default().add_modifier(Modifier::BOLD),
+    )];
+    let mut first = true;
+    for (strategy, total) in by_strategy {
+        if !first {
+            spans.push(Span::raw("  "));
+        }
+        first = false;
+        let color = if total >= 0.0 { Color::Green } else { Color::Red };
+        let label = format!("{strategy} ${:+.2}", total);
+        let style = if strategy_filter == Some(strategy.as_str()) {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(color).add_modifier(Modifier::BOLD)
+        };
+        spans.push(Span::styled(label, style));
+    }
+    Line::from(spans)
+}
+
+/// Build the "7d total: …" footer line. Same per-strategy
+/// (paper+live summed) aggregation as the yesterday footer, just over
+/// the 7-day window of rows instead of a single day. The label
+/// prefix differs so the operator can tell the two footers apart at
+/// a glance; everything else (color logic, filter highlight,
+/// alphabetical strategy order, empty-rowset hint) is identical.
+///
+/// Mirrors the daemon's `agent_pnl_breakdown_window_realized_usd`
+/// gauge — the dashboard reads the source CoreDB rows directly
+/// rather than scraping the metric so it works without /metrics
+/// being wired up.
+fn render_window_pnl_footer<'a>(
+    rows: &'a [PnlBreakdown],
+    strategy_filter: Option<&str>,
+) -> Line<'a> {
+    if rows.is_empty() {
+        return Line::from(vec![
+            Span::styled(
+                "7d total: ",
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "(no settled trades yet)",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]);
+    }
+    let mut by_strategy: std::collections::BTreeMap<String, f64> =
+        std::collections::BTreeMap::new();
+    for r in rows {
+        *by_strategy.entry(r.strategy.clone()).or_insert(0.0) += r.realized_pnl;
+    }
+    let mut spans: Vec<Span<'a>> = vec![Span::styled(
+        "7d total: ",
         Style::default().add_modifier(Modifier::BOLD),
     )];
     let mut first = true;
@@ -1906,17 +2001,18 @@ mod tests {
         filter: Option<&str>,
         health: Option<super::HealthChip>,
     ) -> String {
-        render_test_dashboard_full(filter, health, Vec::new())
+        render_test_dashboard_full(filter, health, Vec::new(), Vec::new())
     }
 
     /// Full test renderer that also accepts a `pnl_breakdown_yesterday`
-    /// fixture so the new footer line can be exercised end-to-end via
-    /// the standard `draw()` entry point. The two thinner shims keep the
-    /// existing test call sites stable.
+    /// and `pnl_breakdown_window` fixture so the new footer lines can
+    /// be exercised end-to-end via the standard `draw()` entry point.
+    /// The thinner shims keep the existing test call sites stable.
     fn render_test_dashboard_full(
         filter: Option<&str>,
         health: Option<super::HealthChip>,
         pnl_breakdown_yesterday: Vec<PnlBreakdown>,
+        pnl_breakdown_window: Vec<PnlBreakdown>,
     ) -> String {
         use crate::coredb::types::{BtcTick, StrategyPnlSnapshot};
         use ratatui::backend::TestBackend;
@@ -1959,6 +2055,7 @@ mod tests {
         ];
         s.health = health;
         s.pnl_breakdown_yesterday = pnl_breakdown_yesterday;
+        s.pnl_breakdown_window = pnl_breakdown_window;
 
         let strategies = super::strategies_in_view(&s);
         let backend = TestBackend::new(140, 35);
@@ -2081,7 +2178,10 @@ mod tests {
                 n_settled: 1,
             },
         ];
-        let dump = render_test_dashboard_full(None, None, yesterday);
+        // Populate the window footer too so the "(no settled trades
+        // yet)" hint doesn't leak from the second (empty) footer.
+        let window = yesterday.clone();
+        let dump = render_test_dashboard_full(None, None, yesterday, window);
         assert!(
             dump.contains("Yesterday final:"),
             "footer prefix missing in populated render"
@@ -2159,6 +2259,129 @@ mod tests {
         assert!(
             alpha_pos < beta_pos,
             "strategies should render alphabetically — got: {flat}"
+        );
+    }
+
+    #[test]
+    fn window_footer_pure_empty_branch() {
+        let line = super::render_window_pnl_footer(&[], None);
+        let flat: String = line
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect::<String>();
+        assert!(flat.starts_with("7d total:"), "got: {flat}");
+        assert!(
+            flat.contains("(no settled trades yet)"),
+            "expected empty hint, got: {flat}"
+        );
+    }
+
+    #[test]
+    fn window_footer_pure_aggregates_across_days() {
+        // 3 days × 1 strategy × paper exec — the rolling sum should
+        // flatten all three days into one per-strategy chip.
+        let rows = vec![
+            super::PnlBreakdown {
+                bucket_day_ms: 0,
+                strategy: "baseline".into(),
+                exec: "paper".into(),
+                realized_pnl: 1.0,
+                n_settled: 1,
+            },
+            super::PnlBreakdown {
+                bucket_day_ms: 86_400_000,
+                strategy: "baseline".into(),
+                exec: "paper".into(),
+                realized_pnl: 2.5,
+                n_settled: 2,
+            },
+            super::PnlBreakdown {
+                bucket_day_ms: 172_800_000,
+                strategy: "baseline".into(),
+                exec: "live".into(),
+                realized_pnl: 4.0,
+                n_settled: 1,
+            },
+        ];
+        let line = super::render_window_pnl_footer(&rows, None);
+        let flat: String = line
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect::<String>();
+        assert!(flat.starts_with("7d total:"), "got: {flat}");
+        assert!(
+            flat.contains("baseline $+7.50"),
+            "expected baseline 7d sum \"baseline $+7.50\", got: {flat}",
+        );
+    }
+
+    #[test]
+    fn panel_strategy_pnl_window_footer_empty_shows_hint() {
+        // Default fixture (no window data) → empty hint surfaces in
+        // the rendered dashboard, NOT an error.
+        let dump = render_test_dashboard(None);
+        assert!(
+            dump.contains("7d total:"),
+            "7d footer prefix missing in default render"
+        );
+    }
+
+    #[test]
+    fn panel_strategy_pnl_window_footer_renders_per_strategy_totals() {
+        // Window rows span 3 days for two strategies; the footer
+        // should sum each strategy across all rows. baseline =
+        // 1.5 + 3.0 - 0.25 = 4.25; deepseek = -1.0 + 6.5 = 5.50.
+        let window = vec![
+            super::PnlBreakdown {
+                bucket_day_ms: 0,
+                strategy: "baseline".into(),
+                exec: "paper".into(),
+                realized_pnl: 1.5,
+                n_settled: 1,
+            },
+            super::PnlBreakdown {
+                bucket_day_ms: 86_400_000,
+                strategy: "baseline".into(),
+                exec: "paper".into(),
+                realized_pnl: 3.0,
+                n_settled: 2,
+            },
+            super::PnlBreakdown {
+                bucket_day_ms: 172_800_000,
+                strategy: "baseline".into(),
+                exec: "live".into(),
+                realized_pnl: -0.25,
+                n_settled: 1,
+            },
+            super::PnlBreakdown {
+                bucket_day_ms: 0,
+                strategy: "deepseek".into(),
+                exec: "paper".into(),
+                realized_pnl: -1.0,
+                n_settled: 1,
+            },
+            super::PnlBreakdown {
+                bucket_day_ms: 86_400_000,
+                strategy: "deepseek".into(),
+                exec: "live".into(),
+                realized_pnl: 6.5,
+                n_settled: 1,
+            },
+        ];
+        let dump = render_test_dashboard_full(None, None, Vec::new(), window);
+        assert!(
+            dump.contains("7d total:"),
+            "7d footer prefix missing in populated render"
+        );
+        assert!(
+            dump.contains("baseline $+4.25"),
+            "expected baseline 7d sum, got dump:\n{dump}"
+        );
+        assert!(
+            dump.contains("deepseek $+5.50"),
+            "expected deepseek 7d sum, got dump:\n{dump}"
         );
     }
 
