@@ -1400,6 +1400,89 @@ mod tests {
         assert_eq!(escape_label("a\nb"), "a\\nb");
     }
 
+    /// Pin the set of metric family names the daemon's /metrics
+    /// endpoint emits. Catches accidental rename / removal at
+    /// `cargo test` time instead of waiting for a Grafana panel
+    /// to silently break.
+    ///
+    /// This is a textual grep over `daemon.rs` rather than a real
+    /// handler render — the handler depends on live CoreDB repos
+    /// and building scylla sessions for a unit test is heavier
+    /// than the safety this test buys. Adding a new metric:
+    /// extend `EXPECTED_FAMILIES` below.
+    #[test]
+    fn metrics_handler_emits_expected_families() {
+        // Every metric family the handler `out.push_str`s a
+        // `# TYPE <name> <type>` line for. Sorted for diff
+        // readability when adding new entries.
+        const EXPECTED_FAMILIES: &[&str] = &[
+            "agent_decisions_today",
+            "agent_decisions_today_cache_age_seconds",
+            "agent_decisions_today_total",
+            "agent_ingest_age_seconds",
+            "agent_open_positions_avg_price",
+            "agent_open_positions_count",
+            "agent_open_positions_notional_usd",
+            "agent_open_positions_size",
+            "agent_open_positions_total_notional_usd",
+            "agent_orders_today",
+            "agent_orders_today_total",
+            "agent_pnl_breakdown_realized_usd",
+            "agent_pnl_breakdown_trades_count",
+            "agent_pnl_daily_realized_usd",
+            "agent_pnl_daily_trades_count",
+            "agent_risk_kill_switch_active",
+            "agent_risk_max_order_usd",
+            "agent_subtask_consecutive_errors",
+            "agent_subtask_last_success_age_seconds",
+            "agent_subtask_last_tick_age_seconds",
+            "agent_uptime_seconds",
+            "agent_user_channel_present",
+        ];
+
+        // Read the source of this same file. include_str! pins the
+        // path at compile time, so a refactor that splits daemon.rs
+        // (e.g. into a daemon/ module dir) would need to update
+        // the path here too — that's the *only* time this test
+        // should fail without an intentional metric change.
+        let src = include_str!("daemon.rs");
+        for family in EXPECTED_FAMILIES {
+            assert!(
+                src.contains(&format!("# TYPE {family} gauge")),
+                "metric family `{family}` no longer emits a `# TYPE` line — \
+                 either it was renamed (update EXPECTED_FAMILIES) or removed \
+                 (audit downstream Grafana panels first)",
+            );
+        }
+
+        // Inverse check: every `# TYPE agent_…` line in the source
+        // is in the expected list. Catches "new metric added but
+        // test not updated" — preserves the snapshot's
+        // completeness over time.
+        let mut emitted: Vec<&str> = src
+            .lines()
+            .filter_map(|line| {
+                let trimmed = line.trim();
+                let prefix = "out.push_str(\"# TYPE ";
+                let idx = trimmed.find(prefix)?;
+                let rest = &trimmed[idx + prefix.len()..];
+                rest.split(' ').next()
+            })
+            .filter(|name| name.starts_with("agent_"))
+            .collect();
+            emitted.sort();
+            emitted.dedup();
+        let expected: std::collections::HashSet<&str> =
+            EXPECTED_FAMILIES.iter().copied().collect();
+        for name in &emitted {
+            assert!(
+                expected.contains(name),
+                "new metric family `{name}` emitted but missing from \
+                 EXPECTED_FAMILIES — please add it (and update CLAUDE.md)",
+            );
+        }
+    }
+
     #[tokio::test]
     async fn watchdog_disabled_returns_none_without_env() {
         // Some test runners propagate systemd vars from the parent;
