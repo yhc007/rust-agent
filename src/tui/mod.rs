@@ -2337,7 +2337,28 @@ fn draw_positions(f: &mut ratatui::Frame, area: Rect, s: &Snapshot, strategy_fil
         Constraint::Length(10),
         Constraint::Length(10),
     ];
-    let title = format!(" positions ({} open) ", s.positions.len());
+    // Title surfaces the focused-strategy count when a filter is
+    // active, so the operator sees how many positions match
+    // without scanning. Computed against the same
+    // `focused_markets` set used for dim rendering; counts every
+    // position whose market_slug is in the set (no "take N" cap
+    // — we want the true count, not the on-screen count).
+    let title = match (strategy_filter, &focused_markets) {
+        (Some(name), Some(set)) => {
+            let focused_count = s
+                .positions
+                .iter()
+                .filter(|p| set.contains(p.market_slug.as_str()))
+                .count();
+            format!(
+                " positions ({} open, {} {}-related) ",
+                s.positions.len(),
+                focused_count,
+                name,
+            )
+        }
+        _ => format!(" positions ({} open) ", s.positions.len()),
+    };
     let table = Table::new(rows, widths)
         .header(header)
         .block(Block::default().borders(Borders::ALL).title(title));
@@ -4470,6 +4491,103 @@ mod tests {
         assert!(
             !deepseek_fg.contains(&Color::DarkGray),
             "deepseek (focused) row should NOT be dimmed:\n{dump}"
+        );
+    }
+
+    /// Positions panel title carries the focused-strategy count
+    /// when filter is active. With 2 positions (one on a market
+    /// the focused strategy decided, one not), title should read
+    /// " positions (2 open, 1 baseline-related) ".
+    /// Filter inactive → title stays " positions (N open) ".
+    #[test]
+    fn panel_positions_title_shows_focused_count() {
+        use crate::coredb::types::{Decision, Position};
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        use uuid::Uuid;
+        let mut s = super::Snapshot::default();
+        s.decisions = vec![Decision {
+            bucket_day_ms: 0,
+            ts_ms: 1,
+            decision_id: Uuid::nil(),
+            market_slug: "btc-100k".into(),
+            side: "YES".into(),
+            size_usd: 1.0,
+            confidence: 0.0,
+            edge_bps: 0,
+            reasoning: String::new(),
+            raw_response: String::new(),
+            entry_price: 0.5,
+            strategy: "baseline".into(),
+        }];
+        s.positions = vec![
+            Position {
+                market_slug: "btc-100k".into(),
+                side: "YES".into(),
+                size: 10.0,
+                avg_price: 0.5,
+                updated_at_ms: 1,
+            },
+            Position {
+                market_slug: "btc-200k".into(),
+                side: "NO".into(),
+                size: 5.0,
+                avg_price: 0.7,
+                updated_at_ms: 1,
+            },
+        ];
+        let strategies = super::strategies_in_view(&s);
+        let prev_ranks: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+
+        // Filter active → focused-count label in title.
+        let backend = TestBackend::new(140, 50);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                super::draw(
+                    f,
+                    &s,
+                    std::time::Duration::from_millis(0),
+                    std::time::Duration::from_secs(42),
+                    &strategies,
+                    Some("baseline"),
+                    &prev_ranks,
+                    super::ComparisonSort::DEFAULT,
+                )
+            })
+            .unwrap();
+        let dump_filtered = render_buffer(terminal.backend().buffer());
+        assert!(
+            dump_filtered.contains("positions (2 open, 1 baseline-related)"),
+            "expected focused-count title under filter:\n{dump_filtered}",
+        );
+
+        // Filter inactive → no focused-count.
+        let backend2 = TestBackend::new(140, 50);
+        let mut terminal2 = Terminal::new(backend2).unwrap();
+        terminal2
+            .draw(|f| {
+                super::draw(
+                    f,
+                    &s,
+                    std::time::Duration::from_millis(0),
+                    std::time::Duration::from_secs(42),
+                    &strategies,
+                    None,
+                    &prev_ranks,
+                    super::ComparisonSort::DEFAULT,
+                )
+            })
+            .unwrap();
+        let dump_plain = render_buffer(terminal2.backend().buffer());
+        assert!(
+            dump_plain.contains("positions (2 open)"),
+            "expected plain title without filter:\n{dump_plain}",
+        );
+        assert!(
+            !dump_plain.contains("-related"),
+            "no '-related' should appear without filter:\n{dump_plain}",
         );
     }
 
