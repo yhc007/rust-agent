@@ -130,6 +130,12 @@ async fn main_loop(
     // assignment that rebuilds `snapshot` on each refresh — the
     // whole point is comparing across consecutive snapshots.
     let mut prev_ingest_restarts: Option<(u64, u64)> = None;
+    // Per-strategy rank from the previous render's comparison
+    // panel. Feeds the Δ column so the operator sees momentum
+    // ("X moved up since last refresh") without diffing snapshots
+    // mentally. Empty on first frame → no indicator shown.
+    let mut prev_ranks: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
     let mut snapshot = fetch_snapshot(
         btc_repo, dec_repo, pos_repo, pnl_repo, agree_repo, breakdown_repo, health_url,
         health_client, pnl_days, prev_ingest_restarts,
@@ -152,7 +158,28 @@ async fn main_loop(
         // footer "[1] baseline ..." render are consistent within a
         // single frame.
         let strategies = strategies_in_view(&snapshot);
-        terminal.draw(|f| draw(f, &snapshot, snap_age, uptime, &strategies, strategy_filter.as_deref()))?;
+        terminal.draw(|f| {
+            draw(
+                f,
+                &snapshot,
+                snap_age,
+                uptime,
+                &strategies,
+                strategy_filter.as_deref(),
+                &prev_ranks,
+            )
+        })?;
+        // Refresh prev_ranks to the ordering this frame just
+        // rendered, so the next frame's Δ column shows momentum
+        // relative to "the rendering the operator just saw."
+        // Rebuilding the rows is cheap; one BTreeMap traversal
+        // + a sort per refresh.
+        let next_rows = build_strategy_comparison_rows(&snapshot, strategy_filter.as_deref());
+        prev_ranks = next_rows
+            .iter()
+            .enumerate()
+            .map(|(i, r)| (r.strategy.clone(), i + 1))
+            .collect();
 
         // Drain pending input with a small budget so the auto-refresh
         // tick is still responsive. We poll for `min(REFRESH_EVERY -
@@ -1077,6 +1104,7 @@ fn draw(
     uptime: Duration,
     strategies: &[String],
     strategy_filter: Option<&str>,
+    prev_ranks: &std::collections::HashMap<String, usize>,
 ) {
     // Footer needs an extra line to surface the strategy hotkeys, so
     // grow it to 4 rows when at least one strategy is available.
@@ -1112,7 +1140,7 @@ fn draw(
 
     draw_header(f, chunks[0], s, snap_age, uptime);
     draw_strategy_pnl(f, chunks[1], s, strategy_filter);
-    draw_strategy_comparison(f, chunks[2], s, strategy_filter);
+    draw_strategy_comparison(f, chunks[2], s, strategy_filter, prev_ranks);
     draw_consensus(f, chunks[3], s, strategy_filter);
     draw_positions(f, chunks[4], s);
     draw_decisions(f, chunks[5], s, strategy_filter);
@@ -1508,6 +1536,7 @@ fn draw_strategy_comparison(
     area: Rect,
     s: &Snapshot,
     strategy_filter: Option<&str>,
+    prev_ranks: &std::collections::HashMap<String, usize>,
 ) {
     let rows_data = build_strategy_comparison_rows(s, strategy_filter);
     let agree_header: String = match strategy_filter {
@@ -1515,6 +1544,7 @@ fn draw_strategy_comparison(
         Some(name) => format!("vs {name}"),
     };
     let header = Row::new(vec![
+        Cell::from("Δ"),
         Cell::from("#"),
         Cell::from("strategy"),
         Cell::from("today Σpnl"),
@@ -1549,6 +1579,22 @@ fn draw_strategy_comparison(
         let rank_cell = Cell::from(Span::styled(
             format!("#{rank}"),
             Style::default().fg(rank_color).add_modifier(Modifier::BOLD),
+        ));
+        // Rank-change indicator: compare against the rank we saw
+        // for this strategy on the previous refresh. Empty
+        // (single space) when there's no prior baseline — a fresh
+        // strategy joining mid-session shouldn't show "↑" against
+        // a phantom worst rank. The empty cell stays width-stable
+        // so the column doesn't shift between renders.
+        let (delta_glyph, delta_color) = match prev_ranks.get(&r.strategy).copied() {
+            None => (" ", Color::DarkGray), // unseen previously
+            Some(prev) if prev == rank => ("=", Color::DarkGray),
+            Some(prev) if prev > rank => ("↑", Color::Green), // moved up
+            Some(_) => ("↓", Color::Red),                       // moved down
+        };
+        let delta_cell = Cell::from(Span::styled(
+            delta_glyph.to_string(),
+            Style::default().fg(delta_color).add_modifier(Modifier::BOLD),
         ));
         let is_active = strategy_filter == Some(r.strategy.as_str());
         let strategy_cell = if is_active {
@@ -1607,6 +1653,7 @@ fn draw_strategy_comparison(
             None => Cell::from(""),
         };
         rows.push(Row::new(vec![
+            delta_cell,
             rank_cell,
             strategy_cell,
             cell_money(r.today_pnl),
@@ -1623,6 +1670,7 @@ fn draw_strategy_comparison(
         " strategy comparison ".to_string()
     };
     let widths = [
+        Constraint::Length(2),  // Δ rank change
         Constraint::Length(3),  // rank "#NN"
         Constraint::Length(12), // strategy
         Constraint::Length(12), // today
@@ -2745,6 +2793,11 @@ mod tests {
         // the comparison panel's bottom rows back when this was 35).
         let backend = TestBackend::new(140, 50);
         let mut terminal = Terminal::new(backend).unwrap();
+        // Default to "no previous ranks" — first frame shows blank
+        // Δ column. Tests that exercise rank momentum use
+        // `render_test_dashboard_with_prev_ranks` below.
+        let prev_ranks: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
         terminal
             .draw(|f| {
                 super::draw(
@@ -2754,6 +2807,7 @@ mod tests {
                     Duration::from_secs(42),
                     &strategies,
                     filter,
+                    &prev_ranks,
                 )
             })
             .unwrap();
@@ -2793,6 +2847,8 @@ mod tests {
         let strategies = super::strategies_in_view(&s);
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
+        let prev_ranks: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
         terminal
             .draw(|f| {
                 super::draw(
@@ -2802,6 +2858,7 @@ mod tests {
                     Duration::from_secs(42),
                     &strategies,
                     None,
+                    &prev_ranks,
                 )
             })
             .unwrap();
@@ -3503,6 +3560,125 @@ mod tests {
         assert!(dump.contains("#1"), "expected #1 rank in dump:\n{dump}");
         assert!(dump.contains("#2"), "expected #2 rank in dump:\n{dump}");
         assert!(dump.contains("#3"), "expected #3 rank in dump:\n{dump}");
+    }
+
+    /// Helper that renders the dashboard with explicit
+    /// `prev_ranks` so rank-change indicator behavior can be
+    /// exercised without simulating two full refreshes.
+    fn render_test_dashboard_with_prev_ranks(
+        pnl_breakdown_window: Vec<super::PnlBreakdown>,
+        prev_ranks: std::collections::HashMap<String, usize>,
+    ) -> String {
+        use crate::coredb::types::BtcTick;
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        use std::time::Duration;
+        let mut s = super::Snapshot::default();
+        s.btc = Some(BtcTick {
+            bucket_hour_ms: 0,
+            symbol: "BTCUSDT".into(),
+            ts_ms: 1700000000000,
+            price: 79123.45,
+            volume: 0.0,
+            bid: 79123.40,
+            ask: 79123.50,
+        });
+        s.pnl_breakdown_window = pnl_breakdown_window;
+        let strategies = super::strategies_in_view(&s);
+        let backend = TestBackend::new(140, 50);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                super::draw(
+                    f,
+                    &s,
+                    Duration::from_millis(0),
+                    Duration::from_secs(42),
+                    &strategies,
+                    None,
+                    &prev_ranks,
+                )
+            })
+            .unwrap();
+        render_buffer(terminal.backend().buffer())
+    }
+
+    /// Rank-change indicator: per-strategy comparison of current
+    /// rank vs `prev_ranks` produces ↑ / ↓ / = / blank. Pin each
+    /// branch with a single-frame fixture.
+    #[test]
+    fn panel_strategy_comparison_rank_change_indicator() {
+        // Current ranks (by window_pnl desc):
+        //   #1 deepseek ($100)
+        //   #2 anthropic ($50)
+        //   #3 baseline (-$10)
+        let window = vec![
+            super::PnlBreakdown {
+                bucket_day_ms: 0,
+                strategy: "deepseek".into(),
+                exec: "paper".into(),
+                realized_pnl: 100.0,
+                n_settled: 1,
+            },
+            super::PnlBreakdown {
+                bucket_day_ms: 0,
+                strategy: "anthropic".into(),
+                exec: "paper".into(),
+                realized_pnl: 50.0,
+                n_settled: 1,
+            },
+            super::PnlBreakdown {
+                bucket_day_ms: 0,
+                strategy: "baseline".into(),
+                exec: "paper".into(),
+                realized_pnl: -10.0,
+                n_settled: 1,
+            },
+        ];
+        // Previous frame:
+        //   #1 anthropic (now #2 → moved DOWN, "↓")
+        //   #2 deepseek  (now #1 → moved UP,   "↑")
+        //   #3 baseline  (now #3 → "=")
+        //   (newcomer: would have blank but all 3 are in prev)
+        let mut prev: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        prev.insert("anthropic".into(), 1);
+        prev.insert("deepseek".into(), 2);
+        prev.insert("baseline".into(), 3);
+
+        let dump = render_test_dashboard_with_prev_ranks(window.clone(), prev);
+        assert!(dump.contains('↑'), "expected ↑ for deepseek (#2→#1):\n{dump}");
+        assert!(dump.contains('↓'), "expected ↓ for anthropic (#1→#2):\n{dump}");
+        assert!(dump.contains('='), "expected = for baseline (#3→#3):\n{dump}");
+
+        // Empty prev_ranks → no indicators emitted at all (a fresh
+        // dashboard start has no baseline to compare against).
+        let dump_empty = render_test_dashboard_with_prev_ranks(
+            window.clone(),
+            std::collections::HashMap::new(),
+        );
+        assert!(
+            !dump_empty.contains('↑') && !dump_empty.contains('↓'),
+            "fresh dashboard (no prev) should emit no Δ arrows:\n{dump_empty}"
+        );
+    }
+
+    /// Δ column header is just the symbol "Δ" — pin so the
+    /// header layout doesn't drift silently.
+    #[test]
+    fn panel_strategy_comparison_delta_column_header_present() {
+        let window = vec![super::PnlBreakdown {
+            bucket_day_ms: 0,
+            strategy: "baseline".into(),
+            exec: "paper".into(),
+            realized_pnl: 1.0,
+            n_settled: 1,
+        }];
+        let dump = render_test_dashboard_with_prev_ranks(
+            window,
+            std::collections::HashMap::new(),
+        );
+        assert!(dump.contains('Δ'), "Δ column header missing in dump:\n{dump}");
     }
 
     /// Spread column: leader row reads "(leader)" in gold; tied
