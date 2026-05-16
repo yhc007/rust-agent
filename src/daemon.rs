@@ -1116,6 +1116,25 @@ async fn metrics_handler(State(s): State<HealthAppState>) -> impl IntoResponse {
                         p.avg_price,
                     ));
                 }
+                // Pre-computed notional ($). Same series shape as
+                // `size * avg_price` would give in PromQL, but
+                // emitted as its own named gauge so Grafana panels
+                // can render it without the on(market,side)
+                // label-matching incantation. Cheap to compute
+                // (one f64 multiply per row) and the wire payload
+                // stays linear in position count.
+                out.push_str(
+                    "# HELP agent_open_positions_notional_usd Notional value of the open position in USD — pre-computed `size * avg_price` so single-query panels don't need label-matching.\n",
+                );
+                out.push_str("# TYPE agent_open_positions_notional_usd gauge\n");
+                for p in &cache.rows {
+                    out.push_str(&format!(
+                        "agent_open_positions_notional_usd{{market=\"{}\",side=\"{}\"}} {}\n",
+                        escape_label(&p.market_slug),
+                        escape_label(&p.side),
+                        p.size * p.avg_price,
+                    ));
+                }
             }
         }
     }
