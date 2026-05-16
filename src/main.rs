@@ -218,6 +218,28 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Dump per-(strategy, exec) realized PnL from CoreDB. Mirrors
+    /// pnl-history but reads `polymarket_btc.pnl_breakdown` (the
+    /// table settle-pnl writes alongside pnl_daily). Same `--days`
+    /// / `--strategies` / `--json` knobs as the sibling commands;
+    /// adds `--execs paper,live` for the new dimension.
+    PnlBreakdownHistory {
+        #[arg(long, default_value = "127.0.0.1:9042")]
+        coredb_uri: String,
+        /// Comma-separated subset of strategy labels.
+        #[arg(long, value_delimiter = ',')]
+        strategies: Vec<String>,
+        /// Comma-separated subset of exec labels (`paper` / `live`).
+        #[arg(long, value_delimiter = ',')]
+        execs: Vec<String>,
+        /// Number of UTC days back from "today" to include.
+        #[arg(long, default_value_t = 1)]
+        days: u32,
+        /// Emit one JSON object to stdout instead of the human-
+        /// readable table.
+        #[arg(long)]
+        json: bool,
+    },
     /// Settle today's orders against Polymarket's resolved markets.
     /// Computes realized PnL per order, aggregates per strategy, and
     /// upserts the day's total into `polymarket_btc.pnl_daily`.
@@ -417,6 +439,24 @@ async fn main() -> Result<()> {
         Some(Commands::AgreementHistory { coredb_uri, strategies, days, json }) => {
             let filter = if strategies.is_empty() { None } else { Some(strategies) };
             backtest::agreement_history::run(&coredb_uri, filter.as_deref(), days, json).await?;
+        }
+        Some(Commands::PnlBreakdownHistory {
+            coredb_uri,
+            strategies,
+            execs,
+            days,
+            json,
+        }) => {
+            let strat_filter = if strategies.is_empty() { None } else { Some(strategies) };
+            let exec_filter = if execs.is_empty() { None } else { Some(execs) };
+            backtest::pnl_breakdown_history::run(
+                &coredb_uri,
+                strat_filter.as_deref(),
+                exec_filter.as_deref(),
+                days,
+                json,
+            )
+            .await?;
         }
         Some(Commands::SettlePnl { coredb_uri, json }) => {
             backtest::settle::run(&coredb_uri, json).await?;

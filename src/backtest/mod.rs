@@ -14,6 +14,7 @@ pub mod baseline;
 pub mod compare;
 pub mod history;
 pub mod llm;
+pub mod pnl_breakdown_history;
 pub mod run;
 pub mod settle;
 
