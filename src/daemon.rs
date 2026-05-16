@@ -604,22 +604,43 @@ fn spawn_watchdog(
     }))
 }
 
-/// TTL on the cached decisions-per-(strategy,side) tally that
-/// `/metrics` emits. Prometheus default scrape is every 15s, so
-/// 10s keeps the daemon's CoreDB hit rate at most ~1/10s under
+/// Default TTL on the cached decisions-per-(strategy,side) tally
+/// that `/metrics` emits. Prometheus default scrape is every 15s,
+/// so 10s keeps the daemon's CoreDB hit rate at most ~1/10s under
 /// whatever scrape concurrency. Tuning higher trades freshness for
 /// load; tuning lower hits CoreDB more aggressively for marginal
 /// benefit since the underlying data only ticks on backtest runs
-/// (every 30 min in the default daemon config).
-const METRICS_DECISIONS_CACHE_TTL_MS: i64 = 10_000;
+/// (every 30 min in the default daemon config). Operator-tunable
+/// via `METRICS_DECISIONS_CACHE_TTL_S` env. The orders cache
+/// shares this TTL — same data-churn cadence.
+pub const METRICS_DECISIONS_CACHE_TTL_MS_DEFAULT: i64 = 10_000;
 
-/// TTL on the cached ingest-staleness probes. Shorter than the
-/// decisions cache because the underlying data ticks every ~500ms
-/// (Binance WS) and every 30s (Polymarket Gamma) — a 5s ceiling
-/// preserves real staleness signal while still saving CoreDB the
-/// per-scrape btc.latest + markets.list_open round-trips that
-/// /health and /metrics each used to issue independently.
-const INGEST_CACHE_TTL_MS: i64 = 5_000;
+/// Read `METRICS_DECISIONS_CACHE_TTL_S` env (seconds), fall back
+/// to the const default when unset or malformed.
+pub fn metrics_decisions_cache_ttl_ms() -> i64 {
+    std::env::var("METRICS_DECISIONS_CACHE_TTL_S")
+        .ok()
+        .and_then(|s| s.parse::<i64>().ok())
+        .map(|s| s.saturating_mul(1000))
+        .unwrap_or(METRICS_DECISIONS_CACHE_TTL_MS_DEFAULT)
+}
+
+/// Default TTL on the cached ingest-staleness probes. Shorter than
+/// the decisions cache because the underlying data ticks every
+/// ~500ms (Binance WS) and every 30s (Polymarket Gamma) — a 5s
+/// ceiling preserves real staleness signal while still saving
+/// CoreDB the per-scrape btc.latest + markets.list_open round-
+/// trips that /health and /metrics each used to issue
+/// independently. Operator-tunable via `INGEST_CACHE_TTL_S`.
+pub const INGEST_CACHE_TTL_MS_DEFAULT: i64 = 5_000;
+
+pub fn ingest_cache_ttl_ms() -> i64 {
+    std::env::var("INGEST_CACHE_TTL_S")
+        .ok()
+        .and_then(|s| s.parse::<i64>().ok())
+        .map(|s| s.saturating_mul(1000))
+        .unwrap_or(INGEST_CACHE_TTL_MS_DEFAULT)
+}
 
 /// Default threshold for the ingest watchdog. When the newest btc
 /// tick (or polymarket market) is older than this, the supervisor
@@ -667,10 +688,21 @@ struct PnlDailyCacheEntry {
     row: Option<crate::coredb::types::PnlDaily>,
 }
 
-/// TTL for the pnl_daily cache. Longer than the decisions cache
-/// because realized PnL only ticks when settle-pnl runs (default
-/// 1h cadence in the daemon).
-const METRICS_PNL_DAILY_CACHE_TTL_MS: i64 = 60_000;
+/// Default TTL for the pnl_daily cache. Longer than the decisions
+/// cache because realized PnL only ticks when settle-pnl runs
+/// (default 1h cadence in the daemon). Same TTL is used for the
+/// pnl_breakdown today / yesterday / window caches — all written
+/// by the same settle-pnl call. Operator-tunable via
+/// `METRICS_PNL_DAILY_CACHE_TTL_S` env.
+pub const METRICS_PNL_DAILY_CACHE_TTL_MS_DEFAULT: i64 = 60_000;
+
+pub fn metrics_pnl_daily_cache_ttl_ms() -> i64 {
+    std::env::var("METRICS_PNL_DAILY_CACHE_TTL_S")
+        .ok()
+        .and_then(|s| s.parse::<i64>().ok())
+        .map(|s| s.saturating_mul(1000))
+        .unwrap_or(METRICS_PNL_DAILY_CACHE_TTL_MS_DEFAULT)
+}
 
 /// Width of the rolling pnl_breakdown window metric, in days.
 /// Hard-coded — exposed to Grafana as the literal label `days="7"`
@@ -1299,7 +1331,7 @@ pub fn render_metrics(s: &MetricsSnapshot) -> String {
     if let Some(cache) = s.decisions.as_ref() {
         let cache_age_secs = (now - cache.fetched_at_ms).max(0) / 1000;
         out.push_str(
-            "# HELP agent_decisions_today_cache_age_seconds Age of the cached decisions tally in seconds. Bounded by METRICS_DECISIONS_CACHE_TTL_MS.\n",
+            "# HELP agent_decisions_today_cache_age_seconds Age of the cached decisions tally in seconds. Bounded by METRICS_DECISIONS_CACHE_TTL_S env (default 10s).\n",
         );
         out.push_str("# TYPE agent_decisions_today_cache_age_seconds gauge\n");
         out.push_str(&format!(
@@ -1587,7 +1619,7 @@ async fn gather_metrics_snapshot(s: &HealthAppState, now: i64) -> MetricsSnapsho
         let mut cache_guard = s.decisions_cache.write().await;
         let need_refresh = cache_guard
             .as_ref()
-            .map(|c| now - c.fetched_at_ms > METRICS_DECISIONS_CACHE_TTL_MS)
+            .map(|c| now - c.fetched_at_ms > metrics_decisions_cache_ttl_ms())
             .unwrap_or(true);
         if need_refresh {
             match dec_repo.list_day(bucket_day(now)).await {
@@ -1629,7 +1661,7 @@ async fn gather_metrics_snapshot(s: &HealthAppState, now: i64) -> MetricsSnapsho
         let mut cache_guard = s.orders_cache.write().await;
         let need_refresh = cache_guard
             .as_ref()
-            .map(|c| now - c.fetched_at_ms > METRICS_DECISIONS_CACHE_TTL_MS)
+            .map(|c| now - c.fetched_at_ms > metrics_decisions_cache_ttl_ms())
             .unwrap_or(true);
         if need_refresh {
             let bd = bucket_day(now);
@@ -1688,7 +1720,7 @@ async fn gather_metrics_snapshot(s: &HealthAppState, now: i64) -> MetricsSnapsho
         let mut cache_guard = s.pnl_daily_cache.write().await;
         let need_refresh = cache_guard
             .as_ref()
-            .map(|c| now - c.fetched_at_ms > METRICS_PNL_DAILY_CACHE_TTL_MS)
+            .map(|c| now - c.fetched_at_ms > metrics_pnl_daily_cache_ttl_ms())
             .unwrap_or(true);
         if need_refresh {
             let bd = bucket_day(now);
@@ -1723,7 +1755,7 @@ async fn gather_metrics_snapshot(s: &HealthAppState, now: i64) -> MetricsSnapsho
             let mut cache_guard = s.pnl_breakdown_cache.write().await;
             let need_refresh = cache_guard
                 .as_ref()
-                .map(|c| now - c.fetched_at_ms > METRICS_PNL_DAILY_CACHE_TTL_MS)
+                .map(|c| now - c.fetched_at_ms > metrics_pnl_daily_cache_ttl_ms())
                 .unwrap_or(true);
             if need_refresh {
                 match breakdown_repo.list_day(bucket_day(now)).await {
@@ -1767,7 +1799,7 @@ async fn gather_metrics_snapshot(s: &HealthAppState, now: i64) -> MetricsSnapsho
             let need_refresh = day_rolled
                 || cache_guard
                     .as_ref()
-                    .map(|c| now - c.fetched_at_ms > METRICS_PNL_DAILY_CACHE_TTL_MS)
+                    .map(|c| now - c.fetched_at_ms > metrics_pnl_daily_cache_ttl_ms())
                     .unwrap_or(true);
             if need_refresh {
                 match breakdown_repo.list_day(yesterday_bd).await {
@@ -1809,7 +1841,7 @@ async fn gather_metrics_snapshot(s: &HealthAppState, now: i64) -> MetricsSnapsho
             let need_refresh = day_rolled
                 || cache_guard
                     .as_ref()
-                    .map(|c| now - c.fetched_at_ms > METRICS_PNL_DAILY_CACHE_TTL_MS)
+                    .map(|c| now - c.fetched_at_ms > metrics_pnl_daily_cache_ttl_ms())
                     .unwrap_or(true);
             if need_refresh {
                 // Fan out the N day reads and aggregate by (strategy,
@@ -1871,7 +1903,7 @@ async fn gather_metrics_snapshot(s: &HealthAppState, now: i64) -> MetricsSnapsho
             let mut cache_guard = s.positions_cache.write().await;
             let need_refresh = cache_guard
                 .as_ref()
-                .map(|c| now - c.fetched_at_ms > METRICS_DECISIONS_CACHE_TTL_MS)
+                .map(|c| now - c.fetched_at_ms > metrics_decisions_cache_ttl_ms())
                 .unwrap_or(true);
             if need_refresh {
                 match position_repo.list_all().await {
@@ -1950,8 +1982,8 @@ async fn gather_metrics_snapshot(s: &HealthAppState, now: i64) -> MetricsSnapsho
 /// caching, two concurrent scrapes round-trip CoreDB four times for
 /// data that ticks every ~500ms (Binance WS) and 30s (Polymarket
 /// REST) anyway. The cache reduces that to at most one btc + one
-/// markets read per `INGEST_CACHE_TTL_MS` window across both
-/// endpoints.
+/// markets read per `INGEST_CACHE_TTL_S` env window across both
+/// endpoints (default 5s; see `ingest_cache_ttl_ms`).
 ///
 /// Stored as a unit (no per-source stale-while-revalidate): if a
 /// source goes down we want the next scrape's gauge to drop the
@@ -1963,7 +1995,7 @@ async fn ingest_ages_cached(
     let mut guard = s.ingest_cache.write().await;
     let need_refresh = guard
         .as_ref()
-        .map(|c| now - c.fetched_at_ms > INGEST_CACHE_TTL_MS)
+        .map(|c| now - c.fetched_at_ms > ingest_cache_ttl_ms())
         .unwrap_or(true);
 
     if need_refresh {
@@ -2998,6 +3030,60 @@ mod tests {
                  EXPECTED_FAMILIES — please add it (and update CLAUDE.md)",
             );
         }
+    }
+
+    /// Env-parsing for the per-cache metrics TTLs. Default,
+    /// explicit override, and malformed value all round-trip
+    /// through the same accessors gather_metrics_snapshot uses.
+    #[test]
+    fn metrics_decisions_cache_ttl_ms_env_parsing() {
+        std::env::remove_var("METRICS_DECISIONS_CACHE_TTL_S");
+        assert_eq!(
+            super::metrics_decisions_cache_ttl_ms(),
+            super::METRICS_DECISIONS_CACHE_TTL_MS_DEFAULT,
+        );
+        std::env::set_var("METRICS_DECISIONS_CACHE_TTL_S", "30");
+        assert_eq!(super::metrics_decisions_cache_ttl_ms(), 30_000);
+        std::env::set_var("METRICS_DECISIONS_CACHE_TTL_S", "bogus");
+        assert_eq!(
+            super::metrics_decisions_cache_ttl_ms(),
+            super::METRICS_DECISIONS_CACHE_TTL_MS_DEFAULT,
+        );
+        std::env::remove_var("METRICS_DECISIONS_CACHE_TTL_S");
+    }
+
+    #[test]
+    fn metrics_pnl_daily_cache_ttl_ms_env_parsing() {
+        std::env::remove_var("METRICS_PNL_DAILY_CACHE_TTL_S");
+        assert_eq!(
+            super::metrics_pnl_daily_cache_ttl_ms(),
+            super::METRICS_PNL_DAILY_CACHE_TTL_MS_DEFAULT,
+        );
+        std::env::set_var("METRICS_PNL_DAILY_CACHE_TTL_S", "180");
+        assert_eq!(super::metrics_pnl_daily_cache_ttl_ms(), 180_000);
+        std::env::set_var("METRICS_PNL_DAILY_CACHE_TTL_S", "bogus");
+        assert_eq!(
+            super::metrics_pnl_daily_cache_ttl_ms(),
+            super::METRICS_PNL_DAILY_CACHE_TTL_MS_DEFAULT,
+        );
+        std::env::remove_var("METRICS_PNL_DAILY_CACHE_TTL_S");
+    }
+
+    #[test]
+    fn ingest_cache_ttl_ms_env_parsing() {
+        std::env::remove_var("INGEST_CACHE_TTL_S");
+        assert_eq!(
+            super::ingest_cache_ttl_ms(),
+            super::INGEST_CACHE_TTL_MS_DEFAULT,
+        );
+        std::env::set_var("INGEST_CACHE_TTL_S", "2");
+        assert_eq!(super::ingest_cache_ttl_ms(), 2_000);
+        std::env::set_var("INGEST_CACHE_TTL_S", "bogus");
+        assert_eq!(
+            super::ingest_cache_ttl_ms(),
+            super::INGEST_CACHE_TTL_MS_DEFAULT,
+        );
+        std::env::remove_var("INGEST_CACHE_TTL_S");
     }
 
     /// Env-parsing for the cache-staleness threshold. Default,
