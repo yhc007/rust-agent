@@ -732,6 +732,32 @@ fn short_err(s: &str) -> String {
     }
 }
 
+/// Truncate `s` to at most `max` characters, appending "…" when
+/// trimmed so the operator can tell the line was clipped vs.
+/// genuinely fit. `max == 0` returns an empty string;
+/// `max == 1` returns just "…" for any non-empty input.
+///
+/// Used to keep the header chip's second line readable on narrow
+/// terminals: the detail stack (worst-subtask · stale-cache ·
+/// restart-delta · ingest-age summary) can easily exceed 100
+/// chars; without a budget the line wraps and the panel layout
+/// breaks. Earlier-added hints (most important first) survive
+/// the trim.
+fn truncate_with_ellipsis(s: &str, max: usize) -> String {
+    if max == 0 {
+        return String::new();
+    }
+    let len = s.chars().count();
+    if len <= max {
+        return s.to_string();
+    }
+    // Reserve one char for the ellipsis itself.
+    let take = max.saturating_sub(1);
+    let mut out: String = s.chars().take(take).collect();
+    out.push('…');
+    out
+}
+
 /// Human-readable description of the time span covered by a snapshot
 /// rowset. Used in the strategy-pnl panel title so the operator
 /// knows whether the sparkline reflects today only or a wider
@@ -1241,6 +1267,13 @@ fn draw_header(
             meta.push_str(detail);
         }
     }
+    // Truncate to the inner content width (area minus 2 border
+    // chars) so a long detail-hint chain doesn't wrap onto the
+    // next row and break the panel layout. Ratatui clips
+    // automatically, but the clip happens silently; the explicit
+    // "…" tells the operator content was dropped.
+    let inner_width = area.width.saturating_sub(2) as usize;
+    let meta = truncate_with_ellipsis(&meta, inner_width);
     let para = Paragraph::new(vec![Line::from(first_line), Line::from(meta)])
         .block(Block::default().borders(Borders::ALL).title(" rust-agent dashboard "));
     f.render_widget(para, area);
@@ -2138,6 +2171,51 @@ mod tests {
         assert_eq!(super::short_err("hello"), "hello");
     }
 
+    #[test]
+    fn truncate_with_ellipsis_passthrough_when_under_budget() {
+        assert_eq!(super::truncate_with_ellipsis("hello", 10), "hello");
+    }
+
+    #[test]
+    fn truncate_with_ellipsis_passthrough_at_exact_budget() {
+        // No clipping when budget == length.
+        assert_eq!(super::truncate_with_ellipsis("hello", 5), "hello");
+    }
+
+    #[test]
+    fn truncate_with_ellipsis_clips_with_indicator() {
+        // 5 budget, 10-char input: keep 4 chars + "…".
+        let s = "abcdefghij";
+        let out = super::truncate_with_ellipsis(s, 5);
+        assert_eq!(out, "abcd…");
+        assert_eq!(out.chars().count(), 5);
+    }
+
+    #[test]
+    fn truncate_with_ellipsis_zero_budget_returns_empty() {
+        // Operator deliberately allocated no space — render
+        // nothing, not even "…".
+        assert_eq!(super::truncate_with_ellipsis("anything", 0), "");
+    }
+
+    #[test]
+    fn truncate_with_ellipsis_one_budget_returns_ellipsis() {
+        // Edge: budget = 1 → just emit "…" rather than the first
+        // char. The ellipsis is the more informative single char
+        // because it announces "something was here".
+        assert_eq!(super::truncate_with_ellipsis("anything", 1), "…");
+    }
+
+    #[test]
+    fn truncate_with_ellipsis_handles_unicode_correctly() {
+        // Counts CHARS not bytes; "▶" is one char (3 bytes UTF-8).
+        // Budget 3 on a 5-char input: 2 chars + "…".
+        let s = "▶abcd";
+        let out = super::truncate_with_ellipsis(s, 3);
+        assert_eq!(out, "▶a…");
+        assert_eq!(out.chars().count(), 3);
+    }
+
     fn snap(ts_ms: i64) -> crate::coredb::types::StrategyPnlSnapshot {
         crate::coredb::types::StrategyPnlSnapshot {
             bucket_day_ms: 0,
@@ -2423,6 +2501,104 @@ mod tests {
     /// Backwards-compat shim — `health` defaults to `None`.
     fn render_test_dashboard(filter: Option<&str>) -> String {
         render_test_dashboard_with(filter, None)
+    }
+
+    /// Render the full dashboard onto a custom-width TestBackend so
+    /// truncation/clipping behavior on narrow terminals can be
+    /// pinned. Same fixture as `render_test_dashboard_with` for
+    /// every other field; only `health.detail` is parameterized to
+    /// the test's needs.
+    fn render_test_dashboard_at_width(
+        width: u16,
+        height: u16,
+        chip: super::HealthChip,
+    ) -> String {
+        use crate::coredb::types::BtcTick;
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        use std::time::Duration;
+        let mut s = super::Snapshot::default();
+        s.btc = Some(BtcTick {
+            bucket_hour_ms: 0,
+            symbol: "BTCUSDT".into(),
+            ts_ms: 1700000000000,
+            price: 79123.45,
+            volume: 0.0,
+            bid: 79123.40,
+            ask: 79123.50,
+        });
+        s.health = Some(chip);
+        let strategies = super::strategies_in_view(&s);
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                super::draw(
+                    f,
+                    &s,
+                    Duration::from_millis(0),
+                    Duration::from_secs(42),
+                    &strategies,
+                    None,
+                )
+            })
+            .unwrap();
+        render_buffer(terminal.backend().buffer())
+    }
+
+    /// On a 60-col terminal a maxed-out chip detail (worst-subtask
+    /// + stale-cache + restart-delta + ingest-age summary) must
+    /// truncate with "…" rather than wrap onto the next line. The
+    /// "…" character is the explicit signal that content was
+    /// clipped; without truncation ratatui silently clips and the
+    /// operator can't tell.
+    #[test]
+    fn header_chip_detail_truncates_on_narrow_terminal() {
+        let chip = super::HealthChip {
+            status: super::HealthStatus::Degraded,
+            daemon_uptime_secs: Some(3_600),
+            detail: Some(
+                "backtest: 5× — connection refused to 127.0.0.1:9042 · \
+                 stale: pnl_breakdown_window 720s · binance restarted 3× · \
+                 polymarket restarted 2× · btc 412ms / poly 1234ms"
+                    .into(),
+            ),
+            ingest_restarts: Some((0, 0)),
+        };
+        // Height 35 matches the production dashboard's typical
+        // terminal — gives all layout chunks room without testing
+        // any "shrinkage" edge cases that aren't this commit's
+        // concern.
+        let dump = render_test_dashboard_at_width(60, 35, chip);
+        // Header is the top 4 rows of the dashboard; restrict to
+        // those to avoid false positives from other panels.
+        let header: String = dump.lines().take(4).collect::<Vec<_>>().join("\n");
+        assert!(
+            header.contains('…'),
+            "expected ellipsis in clipped header detail; got:\n{header}",
+        );
+    }
+
+    /// Wide terminal (140 cols) keeps the same detail intact —
+    /// confirms truncation isn't over-eager.
+    #[test]
+    fn header_chip_detail_intact_on_wide_terminal() {
+        let chip = super::HealthChip {
+            status: super::HealthStatus::Degraded,
+            daemon_uptime_secs: Some(3_600),
+            detail: Some("backtest: 2× — connection refused".into()),
+            ingest_restarts: Some((0, 0)),
+        };
+        let dump = render_test_dashboard_at_width(140, 35, chip);
+        let header: String = dump.lines().take(4).collect::<Vec<_>>().join("\n");
+        assert!(
+            header.contains("backtest: 2× — connection refused"),
+            "expected full detail when budget is generous; got:\n{header}",
+        );
+        assert!(
+            !header.contains('…'),
+            "should NOT clip when content fits; got:\n{header}",
+        );
     }
 
     #[test]
