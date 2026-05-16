@@ -148,7 +148,13 @@ async fn main_loop(
     let state_path = dashboard_state_path();
     let state_ttl_ms = dashboard_state_ttl_ms();
     let persisted = load_persisted_dashboard_state(&state_path, now_ms(), state_ttl_ms);
-    let mut prev_ranks: std::collections::HashMap<String, usize> = persisted
+    // Restore ranks from disk, then prune entries for strategies
+    // no longer in the live snapshot. Stale keys would auto-evict
+    // on the first refresh anyway (prev_ranks is fully rebuilt
+    // each tick), but pruning now keeps the in-memory state
+    // clean from frame zero — defensive cleanup, not a
+    // correctness fix.
+    let initial_prev_ranks: std::collections::HashMap<String, usize> = persisted
         .as_ref()
         .map(|p| p.ranks.clone())
         .unwrap_or_default();
@@ -185,8 +191,11 @@ async fn main_loop(
     // header pointing at a strategy that doesn't exist anymore)
     // until they press `0` to clear. The check only runs once at
     // startup; mid-session filter changes are unaffected.
+    let live_strategies = strategies_in_view(&snapshot);
     let mut strategy_filter: Option<String> =
-        validate_restored_filter(restored_filter, &strategies_in_view(&snapshot));
+        validate_restored_filter(restored_filter, &live_strategies);
+    let mut prev_ranks: std::collections::HashMap<String, usize> =
+        prune_stale_ranks(initial_prev_ranks, &live_strategies);
 
     loop {
         let uptime = started_at.elapsed();
@@ -1033,6 +1042,26 @@ fn validate_restored_filter(
         Some(name) if strategies.iter().any(|s| s == &name) => Some(name),
         _ => None,
     }
+}
+
+/// At dashboard startup, prune the restored `prev_ranks` map to
+/// just the strategies present in the first frame's
+/// strategies-in-view. Stale keys would naturally fall off on the
+/// next refresh (since prev_ranks is fully rebuilt then), but
+/// carrying ghost entries between startup and the first refresh
+/// is sloppy — and the Δ column never reads them anyway since
+/// the lookup is keyed by current-frame strategy name. This
+/// keeps the in-memory state clean from the first frame onward.
+fn prune_stale_ranks(
+    ranks: std::collections::HashMap<String, usize>,
+    strategies: &[String],
+) -> std::collections::HashMap<String, usize> {
+    use std::collections::HashSet;
+    let live: HashSet<&str> = strategies.iter().map(|s| s.as_str()).collect();
+    ranks
+        .into_iter()
+        .filter(|(k, _)| live.contains(k.as_str()))
+        .collect()
 }
 
 /// dropped out between refreshes) is treated as if `None` was
@@ -4197,6 +4226,36 @@ mod tests {
     fn validate_restored_filter_none_stays_none() {
         let strats = vec!["baseline".to_string()];
         assert_eq!(super::validate_restored_filter(None, &strats), None);
+    }
+
+    #[test]
+    fn prune_stale_ranks_keeps_present_entries() {
+        let mut ranks = std::collections::HashMap::new();
+        ranks.insert("baseline".to_string(), 1);
+        ranks.insert("deepseek".to_string(), 2);
+        ranks.insert("anthropic".to_string(), 3);
+        let strats = vec!["baseline".to_string(), "deepseek".to_string()];
+        let pruned = super::prune_stale_ranks(ranks, &strats);
+        assert_eq!(pruned.len(), 2);
+        assert_eq!(pruned.get("baseline"), Some(&1));
+        assert_eq!(pruned.get("deepseek"), Some(&2));
+        assert!(!pruned.contains_key("anthropic"));
+    }
+
+    #[test]
+    fn prune_stale_ranks_empty_strategies_clears_everything() {
+        let mut ranks = std::collections::HashMap::new();
+        ranks.insert("baseline".to_string(), 1);
+        let pruned = super::prune_stale_ranks(ranks, &[]);
+        assert!(pruned.is_empty(), "no live strategies → empty ranks");
+    }
+
+    #[test]
+    fn prune_stale_ranks_empty_input_stays_empty() {
+        let ranks: std::collections::HashMap<String, usize> = Default::default();
+        let strats = vec!["baseline".to_string()];
+        let pruned = super::prune_stale_ranks(ranks, &strats);
+        assert!(pruned.is_empty());
     }
 
     #[test]
