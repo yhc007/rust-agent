@@ -812,11 +812,24 @@ pub struct IngestRestartCounters {
 }
 
 /// Window during which a restart event keeps daemon status
-/// degraded. 5 min is long enough that a single transient flap
-/// stays visible to a Prometheus scrape but short enough that a
-/// recovered worker reports green on the next sustained 5-min
-/// healthy stretch.
-pub const RECENT_RESTART_MS: i64 = 5 * 60 * 1000;
+/// degraded (default). 5 min is long enough that a single
+/// transient flap stays visible to a Prometheus scrape but short
+/// enough that a recovered worker reports green on the next
+/// sustained healthy stretch. Operator-tunable via the
+/// `RECENT_RESTART_S` env var.
+pub const RECENT_RESTART_MS_DEFAULT: i64 = 5 * 60 * 1000;
+
+/// Read `RECENT_RESTART_S` env (seconds), fall back to
+/// [`RECENT_RESTART_MS_DEFAULT`] when unset or malformed. Set 0
+/// to disable the recent-restart contribution to status (the
+/// counters still increment; just don't downgrade).
+pub fn recent_restart_ms() -> i64 {
+    std::env::var("RECENT_RESTART_S")
+        .ok()
+        .and_then(|s| s.parse::<i64>().ok())
+        .map(|s| s.saturating_mul(1000))
+        .unwrap_or(RECENT_RESTART_MS_DEFAULT)
+}
 
 async fn health_handler(State(s): State<HealthAppState>) -> Json<HealthResponse> {
     let now = now_ms();
@@ -841,8 +854,18 @@ pub struct HealthInputs {
     /// restart, across both ingest sources. `None` when no
     /// restart has happened in this process's lifetime. Fed into
     /// the status check so a recent flap downgrades to "degraded"
-    /// for [`RECENT_RESTART_MS`] after the event.
+    /// for `recent_restart_ms` after the event.
     pub last_restart_at_ms: Option<i64>,
+    /// Operator-tuned threshold above which any cache age
+    /// downgrades status to "degraded". Resolved once at gather
+    /// time (from `STALE_CACHE_HEALTH_S` env, with the const
+    /// default) so `compute_health_response` stays a pure
+    /// function of its input.
+    pub stale_cache_health_ms: i64,
+    /// Operator-tuned window during which a recent ingest restart
+    /// keeps status "degraded". Resolved from `RECENT_RESTART_S`
+    /// env at gather time, same purity rationale as above.
+    pub recent_restart_ms: i64,
 }
 
 async fn gather_health_inputs(s: &HealthAppState, now: i64) -> HealthInputs {
@@ -942,6 +965,8 @@ async fn gather_health_inputs(s: &HealthAppState, now: i64) -> HealthInputs {
         cache_ages,
         ingest_restarts,
         last_restart_at_ms,
+        stale_cache_health_ms: stale_cache_health_ms(),
+        recent_restart_ms: recent_restart_ms(),
     }
 }
 
@@ -950,11 +975,28 @@ async fn gather_health_inputs(s: &HealthAppState, now: i64) -> HealthInputs {
 /// both ingest sources have an age below `INGEST_STALE_MS`. Any
 /// `None` ingest age (probe failed entirely) counts as stale —
 /// operators want the bad state to fire, not be masked by a
-/// missing measurement. A cache that has been sitting past
-/// [`STALE_CACHE_HEALTH_MS`] also downgrades to "degraded" so
-/// reverse-proxy probes grep'ing `status` surface a stuck cache
-/// without consulting `cache_ages_ms` directly.
-pub const STALE_CACHE_HEALTH_MS: i64 = 10 * 60 * 1000;
+/// missing measurement. A cache that has been sitting past the
+/// configured `stale_cache_health_ms` also downgrades to
+/// "degraded" so reverse-proxy probes grep'ing `status` surface a
+/// stuck cache without consulting `cache_ages_ms` directly.
+///
+/// 10-minute default chosen to mirror the dashboard's
+/// stalest_cache_hint threshold so the chip + status field stay
+/// in sync without operator coordination.
+pub const STALE_CACHE_HEALTH_MS_DEFAULT: i64 = 10 * 60 * 1000;
+
+/// Read `STALE_CACHE_HEALTH_S` env (seconds), fall back to
+/// [`STALE_CACHE_HEALTH_MS_DEFAULT`] when unset or malformed.
+/// Operators set 0 to disable the cache-staleness contribution
+/// to status entirely (caches still report their ages on
+/// /health.cache_ages_ms; just none of them downgrades status).
+pub fn stale_cache_health_ms() -> i64 {
+    std::env::var("STALE_CACHE_HEALTH_S")
+        .ok()
+        .and_then(|s| s.parse::<i64>().ok())
+        .map(|s| s.saturating_mul(1000))
+        .unwrap_or(STALE_CACHE_HEALTH_MS_DEFAULT)
+}
 
 /// Returns true when ANY cache age exceeds `threshold_ms`. A
 /// `None` slot means "never populated" — that's expected on a
@@ -985,20 +1027,26 @@ pub fn compute_health_response(inp: &HealthInputs) -> HealthResponse {
     let periodic_ok = inp.health.backtest.consecutive_errors < UNHEALTHY_AFTER_ERRORS
         && inp.health.compare.consecutive_errors < UNHEALTHY_AFTER_ERRORS
         && inp.health.settle.consecutive_errors < UNHEALTHY_AFTER_ERRORS;
-    let cache_ok = !any_cache_stale(&inp.cache_ages, STALE_CACHE_HEALTH_MS);
+    // Cache staleness disabled when threshold == 0 (operator opt-out).
+    let cache_ok =
+        inp.stale_cache_health_ms <= 0 || !any_cache_stale(&inp.cache_ages, inp.stale_cache_health_ms);
     // Recent ingest restart: any supervisor restart within the
-    // last RECENT_RESTART_MS keeps daemon "degraded" so a
-    // reverse-proxy probe surfaces a flapping worker without
-    // having to diff the counters itself. Clock skew tolerated
-    // by clamping the diff to non-negative; a far-future
-    // `last_restart_at_ms` (would mean a corrupt timestamp) is
-    // treated as "ok" since reading "from the future" makes
-    // less operational sense than reading "old enough to be safe".
-    let restart_ok = match inp.last_restart_at_ms {
-        None => true,
-        Some(t) => {
-            let age = inp.now_ms.saturating_sub(t);
-            age < 0 || age > RECENT_RESTART_MS
+    // configured window keeps daemon "degraded" so a reverse-
+    // proxy probe surfaces a flapping worker without having to
+    // diff the counters itself. Clock skew tolerated by clamping
+    // the diff to non-negative; a far-future `last_restart_at_ms`
+    // (would mean a corrupt timestamp) is treated as "ok" since
+    // reading "from the future" makes less operational sense than
+    // reading "old enough to be safe". Threshold <= 0 disables.
+    let restart_ok = if inp.recent_restart_ms <= 0 {
+        true
+    } else {
+        match inp.last_restart_at_ms {
+            None => true,
+            Some(t) => {
+                let age = inp.now_ms.saturating_sub(t);
+                age < 0 || age > inp.recent_restart_ms
+            }
         }
     };
     let status = if ingest_ok && periodic_ok && cache_ok && restart_ok {
@@ -2218,6 +2266,8 @@ mod tests {
             cache_ages: super::HealthCacheAges::default(),
             ingest_restarts: super::IngestRestartsWire::default(),
             last_restart_at_ms: None,
+            stale_cache_health_ms: super::STALE_CACHE_HEALTH_MS_DEFAULT,
+            recent_restart_ms: super::RECENT_RESTART_MS_DEFAULT,
         }
     }
 
@@ -2948,6 +2998,88 @@ mod tests {
                  EXPECTED_FAMILIES — please add it (and update CLAUDE.md)",
             );
         }
+    }
+
+    /// Env-parsing for the cache-staleness threshold. Default,
+    /// explicit override, "0 = disabled", and malformed value all
+    /// round-trip through the same accessor compute_health_response
+    /// uses indirectly via gather_health_inputs.
+    #[test]
+    fn stale_cache_health_ms_env_parsing() {
+        std::env::remove_var("STALE_CACHE_HEALTH_S");
+        assert_eq!(
+            super::stale_cache_health_ms(),
+            super::STALE_CACHE_HEALTH_MS_DEFAULT,
+        );
+        std::env::set_var("STALE_CACHE_HEALTH_S", "60");
+        assert_eq!(super::stale_cache_health_ms(), 60_000);
+        std::env::set_var("STALE_CACHE_HEALTH_S", "0");
+        assert_eq!(super::stale_cache_health_ms(), 0);
+        std::env::set_var("STALE_CACHE_HEALTH_S", "bogus");
+        assert_eq!(
+            super::stale_cache_health_ms(),
+            super::STALE_CACHE_HEALTH_MS_DEFAULT,
+        );
+        std::env::remove_var("STALE_CACHE_HEALTH_S");
+    }
+
+    /// Same parsing contract for the recent-restart window.
+    #[test]
+    fn recent_restart_ms_env_parsing() {
+        std::env::remove_var("RECENT_RESTART_S");
+        assert_eq!(
+            super::recent_restart_ms(),
+            super::RECENT_RESTART_MS_DEFAULT,
+        );
+        std::env::set_var("RECENT_RESTART_S", "30");
+        assert_eq!(super::recent_restart_ms(), 30_000);
+        std::env::set_var("RECENT_RESTART_S", "0");
+        assert_eq!(super::recent_restart_ms(), 0);
+        std::env::set_var("RECENT_RESTART_S", "bogus");
+        assert_eq!(
+            super::recent_restart_ms(),
+            super::RECENT_RESTART_MS_DEFAULT,
+        );
+        std::env::remove_var("RECENT_RESTART_S");
+    }
+
+    /// `stale_cache_health_ms = 0` opts out: every cache stays
+    /// "fresh enough" for status purposes regardless of age. The
+    /// cache_ages_ms response field still reports the underlying
+    /// ages so operators can see them.
+    #[test]
+    fn health_ok_when_cache_threshold_disabled() {
+        let mut inp = happy_inputs();
+        inp.stale_cache_health_ms = 0;
+        inp.cache_ages.pnl_breakdown = Some(60 * 60 * 1000); // 1h
+        let r = super::compute_health_response(&inp);
+        assert_eq!(r.status, "ok");
+    }
+
+    /// `recent_restart_ms = 0` opts out: a fresh restart doesn't
+    /// downgrade status. Counters still increment via the metrics
+    /// pipeline; this just suppresses the auto-downgrade.
+    #[test]
+    fn health_ok_when_recent_restart_window_disabled() {
+        let mut inp = happy_inputs();
+        inp.recent_restart_ms = 0;
+        inp.last_restart_at_ms = Some(inp.now_ms - 1_000); // 1s ago
+        let r = super::compute_health_response(&inp);
+        assert_eq!(r.status, "ok");
+    }
+
+    /// Custom thresholds work end-to-end: a 60s window with a 90s-
+    /// old restart is "ok"; the same restart against a 120s window
+    /// would have flipped to "degraded".
+    #[test]
+    fn health_respects_custom_recent_restart_window() {
+        let mut inp = happy_inputs();
+        inp.recent_restart_ms = 60_000;
+        inp.last_restart_at_ms = Some(inp.now_ms - 90_000); // 90s ago
+        assert_eq!(super::compute_health_response(&inp).status, "ok");
+
+        inp.recent_restart_ms = 120_000;
+        assert_eq!(super::compute_health_response(&inp).status, "degraded");
     }
 
     /// Env-parsing for the ingest watchdog threshold. Default,
