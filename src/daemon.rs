@@ -894,7 +894,33 @@ async fn gather_health_inputs(s: &HealthAppState, now: i64) -> HealthInputs {
 /// both ingest sources have an age below `INGEST_STALE_MS`. Any
 /// `None` ingest age (probe failed entirely) counts as stale —
 /// operators want the bad state to fire, not be masked by a
-/// missing measurement.
+/// missing measurement. A cache that has been sitting past
+/// [`STALE_CACHE_HEALTH_MS`] also downgrades to "degraded" so
+/// reverse-proxy probes grep'ing `status` surface a stuck cache
+/// without consulting `cache_ages_ms` directly.
+pub const STALE_CACHE_HEALTH_MS: i64 = 10 * 60 * 1000;
+
+/// Returns true when ANY cache age exceeds `threshold_ms`. A
+/// `None` slot means "never populated" — that's expected on a
+/// fresh daemon and does NOT count as stale (operator already
+/// sees this via the dashboard's empty-row state). Same convention
+/// as the dashboard's `stalest_cache_hint` helper.
+fn any_cache_stale(ages: &HealthCacheAges, threshold_ms: i64) -> bool {
+    [
+        ages.decisions,
+        ages.orders,
+        ages.pnl_daily,
+        ages.pnl_breakdown,
+        ages.pnl_breakdown_yesterday,
+        ages.pnl_breakdown_window,
+        ages.positions,
+        ages.ingest_probe,
+    ]
+    .into_iter()
+    .filter_map(|a| a)
+    .any(|a| a > threshold_ms)
+}
+
 pub fn compute_health_response(inp: &HealthInputs) -> HealthResponse {
     let ingest_ok = match (inp.btc_age_ms, inp.polymarket_age_ms) {
         (Some(b), Some(p)) => b < INGEST_STALE_MS && p < INGEST_STALE_MS,
@@ -903,7 +929,12 @@ pub fn compute_health_response(inp: &HealthInputs) -> HealthResponse {
     let periodic_ok = inp.health.backtest.consecutive_errors < UNHEALTHY_AFTER_ERRORS
         && inp.health.compare.consecutive_errors < UNHEALTHY_AFTER_ERRORS
         && inp.health.settle.consecutive_errors < UNHEALTHY_AFTER_ERRORS;
-    let status = if ingest_ok && periodic_ok { "ok" } else { "degraded" };
+    let cache_ok = !any_cache_stale(&inp.cache_ages, STALE_CACHE_HEALTH_MS);
+    let status = if ingest_ok && periodic_ok && cache_ok {
+        "ok"
+    } else {
+        "degraded"
+    };
     HealthResponse {
         status,
         started_at_ms: inp.health.started_at_ms,
@@ -2161,6 +2192,42 @@ mod tests {
     /// the missing-cache case serializes as `null` so the chip
     /// renderer can tell "cache never populated" from "cache
     /// freshly refreshed at 0ms".
+    /// A cache slot whose age exceeds [`STALE_CACHE_HEALTH_MS`]
+    /// (10 min) flips status from "ok" to "degraded" — that
+    /// surfaces to reverse-proxy probes grep'ing the status field
+    /// without them having to inspect `cache_ages_ms` directly.
+    /// Mirrors the dashboard's stalest_cache_hint threshold so the
+    /// chip + status field stay in sync.
+    #[test]
+    fn health_degraded_when_any_cache_stale_past_threshold() {
+        let mut inp = happy_inputs();
+        // 11 min — just past the 10-min threshold.
+        inp.cache_ages.pnl_breakdown = Some(11 * 60 * 1000);
+        let r = super::compute_health_response(&inp);
+        assert_eq!(r.status, "degraded");
+    }
+
+    #[test]
+    fn health_ok_when_all_caches_under_threshold() {
+        let mut inp = happy_inputs();
+        // 9 min — under the 10-min threshold.
+        inp.cache_ages.pnl_breakdown = Some(9 * 60 * 1000);
+        inp.cache_ages.orders = Some(30_000);
+        inp.cache_ages.decisions = Some(0);
+        let r = super::compute_health_response(&inp);
+        assert_eq!(r.status, "ok");
+    }
+
+    #[test]
+    fn health_ok_ignores_unpopulated_cache_slots() {
+        // All-None ages = "never refreshed yet" = fresh daemon,
+        // not stale. Status must stay "ok".
+        let mut inp = happy_inputs();
+        inp.cache_ages = super::HealthCacheAges::default();
+        let r = super::compute_health_response(&inp);
+        assert_eq!(r.status, "ok");
+    }
+
     #[test]
     fn health_response_carries_cache_ages_per_slot() {
         let mut inp = happy_inputs();
@@ -2196,20 +2263,22 @@ mod tests {
         assert_eq!(ages["ingest_probe"], 100);
     }
 
-    /// All-None cache_ages is the default state on a brand-new
-    /// daemon (no /metrics scrape yet). Status must still be "ok"
-    /// based on ingest + subtask signals — cache ages aren't
-    /// factored into the overall status by design (each cache has
-    /// its own TTL and "stuck" means different things for different
-    /// sources).
+    /// Status does NOT factor in cache_ages that are within the
+    /// freshness threshold. A populated-but-fresh cache must keep
+    /// the daemon "ok" — the response still surfaces the ages, but
+    /// they don't down-grade status until one crosses
+    /// STALE_CACHE_HEALTH_MS. See
+    /// `health_degraded_when_any_cache_stale_past_threshold` for
+    /// the inverse direction.
     #[test]
-    fn health_status_independent_of_cache_freshness() {
-        let inp = happy_inputs();
-        // cache_ages all None via Default in happy_inputs.
+    fn health_ok_with_fresh_cache_ages_populated() {
+        let mut inp = happy_inputs();
+        inp.cache_ages.decisions = Some(1_234);
+        inp.cache_ages.orders = Some(5_678);
         let r = super::compute_health_response(&inp);
         assert_eq!(r.status, "ok");
-        assert_eq!(r.cache_ages_ms.decisions, None);
-        assert_eq!(r.cache_ages_ms.orders, None);
+        assert_eq!(r.cache_ages_ms.decisions, Some(1_234));
+        assert_eq!(r.cache_ages_ms.orders, Some(5_678));
     }
 
     /// Drive `render_metrics` with a fully-populated synthetic

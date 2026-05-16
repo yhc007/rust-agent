@@ -600,18 +600,46 @@ async fn fetch_health(
         body.ingest_restarts.binance,
         body.ingest_restarts.polymarket,
     );
-    if let Some(hint) = restart_delta_hint(prev_restarts, current_restarts) {
+    let mut status = status;
+    let delta_hint = restart_delta_hint(prev_restarts, current_restarts);
+    if let Some(hint) = delta_hint.as_ref() {
         let combined = match detail {
             Some(existing) => format!("{existing} · {hint}"),
-            None => hint,
+            None => hint.clone(),
         };
         detail = Some(combined);
     }
+    // Restart events are dashboard-detected (the daemon is
+    // stateless across probes). Downgrade the chip status locally
+    // so the operator's glance-level signal — green vs yellow —
+    // reflects the incident the same way the detail line does.
+    // Doesn't affect the daemon's /health.status field (that's
+    // still grep'd by reverse proxies based on the daemon's own
+    // view).
+    status = chip_status_with_local_downgrade(status, delta_hint.is_some());
     HealthChip {
         status,
         daemon_uptime_secs: Some(body.uptime_secs),
         detail,
         ingest_restarts: Some(current_restarts),
+    }
+}
+
+/// Apply a dashboard-local downgrade rule on top of the daemon's
+/// reported status. Currently: if any local signal (only the
+/// restart-delta hint for now) fired AND the daemon's status was
+/// `Ok`, bump to `Degraded` so the chip color matches the detail
+/// line's hint. Leaves Degraded / Unreachable untouched — the
+/// daemon already flagged the problem; downgrading further would
+/// just hide the original signal.
+fn chip_status_with_local_downgrade(
+    daemon_status: HealthStatus,
+    local_signal_fired: bool,
+) -> HealthStatus {
+    if local_signal_fired && daemon_status == HealthStatus::Ok {
+        HealthStatus::Degraded
+    } else {
+        daemon_status
     }
 }
 
@@ -2010,6 +2038,37 @@ mod tests {
             "polymarket chip missing, got: {h}"
         );
         assert!(h.contains(" · "), "expected separator, got: {h}");
+    }
+
+    #[test]
+    fn chip_local_downgrade_promotes_ok_to_degraded_when_signal_fires() {
+        assert_eq!(
+            super::chip_status_with_local_downgrade(super::HealthStatus::Ok, true),
+            super::HealthStatus::Degraded,
+        );
+    }
+
+    #[test]
+    fn chip_local_downgrade_is_noop_when_signal_quiet() {
+        assert_eq!(
+            super::chip_status_with_local_downgrade(super::HealthStatus::Ok, false),
+            super::HealthStatus::Ok,
+        );
+    }
+
+    #[test]
+    fn chip_local_downgrade_does_not_recolor_already_degraded() {
+        // Don't promote Degraded → some-other state. Daemon
+        // already flagged the problem; clobbering its status
+        // would lose information.
+        assert_eq!(
+            super::chip_status_with_local_downgrade(super::HealthStatus::Degraded, true),
+            super::HealthStatus::Degraded,
+        );
+        assert_eq!(
+            super::chip_status_with_local_downgrade(super::HealthStatus::Unreachable, true),
+            super::HealthStatus::Unreachable,
+        );
     }
 
     #[test]
