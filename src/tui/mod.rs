@@ -1548,18 +1548,36 @@ fn draw_strategy_comparison(
         Cell::from("#"),
         Cell::from("strategy"),
         Cell::from("today Σpnl"),
+        Cell::from("today gap"),
         Cell::from("yesterday"),
         Cell::from("7d total"),
-        Cell::from("vs leader"),
+        Cell::from("7d gap"),
         Cell::from(agree_header),
     ])
     .style(Style::default().add_modifier(Modifier::BOLD));
 
-    // Leader's 7d total drives the `vs leader` spread column.
-    // After sort, rows_data[0] is the leader (largest window_pnl
-    // with alphabetical tiebreak). `None` when there are no rows
-    // yet — the spread column is unused in that case.
+    // Leader's 7d total drives the `7d gap` spread column. After
+    // sort, rows_data[0] is the 7d leader (largest window_pnl with
+    // alphabetical tiebreak). `None` when there are no rows yet —
+    // the spread column is unused in that case.
     let leader_pnl: Option<f64> = rows_data.first().map(|r| r.window_pnl);
+    // Today's leader: max today_pnl across all rows. This may be
+    // a different strategy than the 7d leader (rank-1 row), so a
+    // mid-table row might still show "(leader)" in the today
+    // column. Tied today_pnl values resolve by `partial_cmp` first
+    // match wins — alphabetical iteration order from
+    // build_strategy_comparison_rows means an alphabetical
+    // tiebreak naturally.
+    let today_leader_pnl: Option<f64> = rows_data
+        .iter()
+        .map(|r| r.today_pnl)
+        .reduce(|a, b| if a >= b { a } else { b });
+    let today_leader_strategy: Option<String> = today_leader_pnl.and_then(|lp| {
+        rows_data
+            .iter()
+            .find(|r| (r.today_pnl - lp).abs() < f64::EPSILON)
+            .map(|r| r.strategy.clone())
+    });
 
     let mut rows: Vec<Row> = Vec::new();
     for (i, r) in rows_data.iter().enumerate() {
@@ -1625,7 +1643,7 @@ fn draw_strategy_comparison(
                 Style::default().fg(Color::DarkGray),
             )),
         };
-        // `vs leader`: gap to the #1's 7d total. Leader row reads
+        // `7d gap`: gap to the #1's 7d total. Leader row reads
         // "(leader)" in gold; tied non-leader rows read "(tied)"
         // in cyan; behind rows read "$-N.NN" in red (the value is
         // always ≤ 0 by the desc-sort invariant). When there are
@@ -1652,11 +1670,45 @@ fn draw_strategy_comparison(
             }
             None => Cell::from(""),
         };
+        // `today gap`: parallel spread for today_pnl. Today's
+        // leader may be a different strategy than the 7d leader,
+        // so this cell can read "(leader)" on a row that's
+        // mid-table by 7d rank. Same render branches as
+        // `7d gap` above.
+        let today_gap_cell = match today_leader_pnl {
+            Some(lp) => {
+                let is_today_leader = today_leader_strategy
+                    .as_deref()
+                    .map(|s| s == r.strategy.as_str())
+                    .unwrap_or(false);
+                if is_today_leader {
+                    Cell::from(Span::styled(
+                        "(leader)",
+                        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                    ))
+                } else {
+                    let spread = r.today_pnl - lp;
+                    if spread.abs() < f64::EPSILON {
+                        Cell::from(Span::styled(
+                            "(tied)",
+                            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                        ))
+                    } else {
+                        Cell::from(Span::styled(
+                            format!("${:+.2}", spread),
+                            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                        ))
+                    }
+                }
+            }
+            None => Cell::from(""),
+        };
         rows.push(Row::new(vec![
             delta_cell,
             rank_cell,
             strategy_cell,
             cell_money(r.today_pnl),
+            today_gap_cell,
             cell_money(r.yesterday_pnl),
             cell_money(r.window_pnl),
             spread_cell,
@@ -1674,9 +1726,10 @@ fn draw_strategy_comparison(
         Constraint::Length(3),  // rank "#NN"
         Constraint::Length(12), // strategy
         Constraint::Length(12), // today
+        Constraint::Length(12), // today gap
         Constraint::Length(12), // yesterday
         Constraint::Length(12), // 7d total
-        Constraint::Length(12), // vs leader
+        Constraint::Length(12), // 7d gap
         Constraint::Length(15), // agree
     ];
     let table = Table::new(rows, widths)
@@ -3718,7 +3771,104 @@ mod tests {
         assert!(dump.contains("$-50.00"), "rank-2 spread missing:\n{dump}");
         assert!(dump.contains("$-110.00"), "rank-3 spread missing:\n{dump}");
         // Header label visible.
-        assert!(dump.contains("vs leader"), "spread header missing:\n{dump}");
+        assert!(dump.contains("7d gap"), "7d gap header missing:\n{dump}");
+    }
+
+    /// `today gap` column independently leaderboards by today's
+    /// Σpnl, not the 7d total. A strategy that's mid-table by 7d
+    /// rank can still show "(leader)" in this column if it had
+    /// the best session today. Pin both columns coexisting on the
+    /// same row set.
+    #[test]
+    fn panel_strategy_comparison_today_gap_column_branches() {
+        // Fixture: snapshots give today_pnl per strategy; window
+        // gives 7d. Today's order differs from 7d's:
+        //   today:  baseline=+30 > anthropic=+10 > deepseek=-5
+        //   7d:     deepseek=+100 > anthropic=+50 > baseline=-10
+        use crate::coredb::types::StrategyPnlSnapshot;
+        let mut s = super::Snapshot::default();
+        s.snapshots = vec![
+            StrategyPnlSnapshot {
+                bucket_day_ms: 0, ts_ms: 1, strategy: "baseline".into(),
+                n_decisions: 0, sum_size_usd: 0.0, sum_pnl: 30.0,
+                n_yes: 0, n_no: 0, n_pass: 0,
+            },
+            StrategyPnlSnapshot {
+                bucket_day_ms: 0, ts_ms: 1, strategy: "anthropic".into(),
+                n_decisions: 0, sum_size_usd: 0.0, sum_pnl: 10.0,
+                n_yes: 0, n_no: 0, n_pass: 0,
+            },
+            StrategyPnlSnapshot {
+                bucket_day_ms: 0, ts_ms: 1, strategy: "deepseek".into(),
+                n_decisions: 0, sum_size_usd: 0.0, sum_pnl: -5.0,
+                n_yes: 0, n_no: 0, n_pass: 0,
+            },
+        ];
+        s.pnl_breakdown_window = vec![
+            super::PnlBreakdown {
+                bucket_day_ms: 0, strategy: "deepseek".into(),
+                exec: "paper".into(), realized_pnl: 100.0, n_settled: 1,
+            },
+            super::PnlBreakdown {
+                bucket_day_ms: 0, strategy: "anthropic".into(),
+                exec: "paper".into(), realized_pnl: 50.0, n_settled: 1,
+            },
+            super::PnlBreakdown {
+                bucket_day_ms: 0, strategy: "baseline".into(),
+                exec: "paper".into(), realized_pnl: -10.0, n_settled: 1,
+            },
+        ];
+        let strategies = super::strategies_in_view(&s);
+        let prev_ranks: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        let backend = ratatui::backend::TestBackend::new(140, 50);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                super::draw(
+                    f,
+                    &s,
+                    std::time::Duration::from_millis(0),
+                    std::time::Duration::from_secs(42),
+                    &strategies,
+                    None,
+                    &prev_ranks,
+                )
+            })
+            .unwrap();
+        let dump = render_buffer(terminal.backend().buffer());
+
+        // today gap header is rendered.
+        assert!(dump.contains("today gap"), "today gap header missing:\n{dump}");
+        // Each strategy is renderable AND distinct from 7d gap
+        // direction. baseline is BOTH 7d-last AND today-first;
+        // we expect to see "$-110.00" (its 7d gap) AND "(leader)"
+        // somewhere on the same row.
+        //
+        // anthropic: today $-20 vs leader baseline; 7d $-50 vs leader deepseek.
+        //   So row has "$-20.00" (today gap) AND "$-50.00" (7d gap).
+        // deepseek:  today $-35 vs leader baseline; 7d (leader).
+        // baseline:  today (leader); 7d $-110 vs leader deepseek.
+        assert!(
+            dump.contains("$-20.00"),
+            "anthropic's today-gap $-20.00 missing:\n{dump}"
+        );
+        assert!(
+            dump.contains("$-35.00"),
+            "deepseek's today-gap $-35.00 missing:\n{dump}"
+        );
+        assert!(
+            dump.contains("$-110.00"),
+            "baseline's 7d-gap $-110.00 missing:\n{dump}"
+        );
+        // Both leader markers in the same dump — they're on
+        // different rows because today's leader (baseline) ≠ 7d
+        // leader (deepseek). Substring count ≥ 2.
+        let leader_count = dump.matches("(leader)").count();
+        assert!(
+            leader_count >= 2,
+            "expected ≥2 (leader) markers (one per column), got {leader_count}:\n{dump}"
+        );
     }
 
     /// Tied non-leader rows read "(tied)" instead of "$+0.00" —
