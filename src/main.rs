@@ -160,8 +160,17 @@ enum Commands {
         /// Multi-day runs are analysis-only — they skip the
         /// strategy_pnl_snapshots persistence to avoid corrupting
         /// the daily-resolution time series.
-        #[arg(long, default_value_t = 1)]
+        #[arg(long, default_value_t = 1, conflicts_with = "since")]
         days: u32,
+        /// Anchor the window at a precise start instead of rounded
+        /// UTC days. Accepts RFC3339 (`2026-05-16T10:00:00Z`) or a
+        /// relative duration `N{s,m,h,d}` (`6h`, `2d`, `30m`).
+        /// Mutually exclusive with `--days`. Like multi-day mode,
+        /// `--since` skips strategy_pnl_snapshots persistence —
+        /// the rows would write a mid-day-start window into
+        /// today's bucket and corrupt the daily-resolution series.
+        #[arg(long)]
+        since: Option<String>,
         /// Emit one JSON object to stdout instead of the human-
         /// readable tables. Same data, machine-shaped — pipe into
         /// `jq`, a spreadsheet, or a Prometheus exporter. Snapshot
@@ -435,9 +444,16 @@ async fn main() -> Result<()> {
             };
             backtest::run::run(&coredb_uri, plan, execute, live).await?;
         }
-        Some(Commands::ComparePnl { coredb_uri, strategies, days, json }) => {
+        Some(Commands::ComparePnl { coredb_uri, strategies, days, since, json }) => {
             let filter = if strategies.is_empty() { None } else { Some(strategies) };
-            backtest::compare::run(&coredb_uri, filter.as_deref(), days, json).await?;
+            let since_ms = match since {
+                Some(s) => Some(
+                    backtest::compare::parse_since(&s, crate::coredb::types::now_ms())
+                        .map_err(|e| anyhow::anyhow!("parse --since: {e}"))?,
+                ),
+                None => None,
+            };
+            backtest::compare::run(&coredb_uri, filter.as_deref(), days, since_ms, json).await?;
         }
         Some(Commands::PnlHistory { coredb_uri, strategies, days, json }) => {
             let filter = if strategies.is_empty() { None } else { Some(strategies) };

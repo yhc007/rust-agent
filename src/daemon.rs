@@ -452,7 +452,7 @@ pub async fn run(cfg: DaemonConfig) -> Result<()> {
             let uri = coredb_uri.clone();
             move || {
                 let uri = uri.clone();
-                Box::pin(async move { backtest::compare::run(&uri, None, 1, false).await })
+                Box::pin(async move { backtest::compare::run(&uri, None, 1, None, false).await })
                     as std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>>
             }
         },

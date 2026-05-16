@@ -29,6 +29,48 @@ use crate::coredb::CoreDb;
 
 const DAY_MS: Millis = 86_400_000;
 
+/// Parse a `--since` value into an absolute `ms`-since-epoch
+/// timestamp. Accepts two forms, in order:
+///
+/// 1. RFC3339, e.g. `2026-05-16T10:00:00Z` or
+///    `2026-05-16T03:00:00-07:00`. Parsed by `chrono::DateTime`.
+/// 2. Relative duration `N{s|m|h|d}` — e.g. `6h`, `30m`, `2d`,
+///    `90s`. Subtracted from `now_ms` to get the start.
+///
+/// Pure function on `(s, now_ms)` so it's testable without any
+/// runtime context — operators get sharp error messages for
+/// typos at CLI-parse time rather than getting an empty window.
+pub fn parse_since(s: &str, now_ms: i64) -> Result<i64> {
+    let s = s.trim();
+    if s.is_empty() {
+        anyhow::bail!("--since is empty");
+    }
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+        return Ok(dt.timestamp_millis());
+    }
+    // Relative form: last char is the unit, rest is the number.
+    // `s.chars().last()` is safe because we just rejected the
+    // empty-string case above.
+    let last = s.chars().last().unwrap();
+    let unit_ms: i64 = match last {
+        's' => 1_000,
+        'm' => 60_000,
+        'h' => 3_600_000,
+        'd' => 86_400_000,
+        _ => anyhow::bail!(
+            "--since must be RFC3339 or N{{s,m,h,d}} (got `{s}`)"
+        ),
+    };
+    let num = &s[..s.len() - 1];
+    let n: i64 = num
+        .parse()
+        .with_context(|| format!("--since: invalid number `{num}` (expected non-negative integer)"))?;
+    if n < 0 {
+        anyhow::bail!("--since count must be non-negative (got `{n}`)");
+    }
+    Ok(now_ms - n.saturating_mul(unit_ms))
+}
+
 /// One marked-to-market decision row.
 struct Marked<'a> {
     decision: &'a Decision,
@@ -41,6 +83,7 @@ pub async fn run(
     coredb_uri: &str,
     strategies_filter: Option<&[String]>,
     days: u32,
+    since_ms: Option<i64>,
     json: bool,
 ) -> Result<()> {
     let days = days.max(1);
@@ -60,6 +103,22 @@ pub async fn run(
     let snapshot_ts = now_ms();
     let bd = bucket_day(snapshot_ts);
 
+    // When --since is set it overrides --days: the effective
+    // window is [since_ms, now], anchored to a precise ts rather
+    // than rounded to UTC midnight. We compute the bucket_days
+    // spanned (potentially partial on both ends) and then
+    // post-filter rows by `ts_ms >= since_ms` so the start
+    // boundary is honored exactly.
+    let effective_days: u32 = match since_ms {
+        Some(since) => {
+            let start_bd = bucket_day(since);
+            // +1 because both endpoints are inclusive.
+            let span = ((bd - start_bd) / DAY_MS).max(0) as u32 + 1;
+            span.max(1)
+        }
+        None => days,
+    };
+
     // Read N day-partitions of decisions. The aggregates / matrix /
     // disagreement output spans the whole window, but the snapshot
     // persistence below stays bucketed to "today" — writing
@@ -67,8 +126,8 @@ pub async fn run(
     // would corrupt the time series that pnl-history feeds on.
     let mut decisions: Vec<Decision> = Vec::new();
     let mut empty_days = 0u32;
-    for i in 0..days as i64 {
-        let day_bd = bd - (days as i64 - 1 - i) * DAY_MS;
+    for i in 0..effective_days as i64 {
+        let day_bd = bd - (effective_days as i64 - 1 - i) * DAY_MS;
         match repo.list_day(day_bd).await {
             Ok(rows) => {
                 if rows.is_empty() {
@@ -83,15 +142,28 @@ pub async fn run(
             }
         }
     }
-    if days > 1 {
+    // Precise post-filter on the start boundary so a `--since 6h`
+    // run doesn't pull in rows from earlier in the same UTC day.
+    if let Some(since) = since_ms {
+        decisions.retain(|d| d.ts_ms >= since);
+        say!(
+            "   --since {} → {} ms-window (post-filtered {} rows from {} bucket_day(s))",
+            since,
+            snapshot_ts - since,
+            decisions.len(),
+            effective_days,
+        );
+    } else if effective_days > 1 {
         say!(
             "   spanning {} UTC days: {} → {} (today)",
-            days,
-            bd - (days as i64 - 1) * DAY_MS,
+            effective_days,
+            bd - (effective_days as i64 - 1) * DAY_MS,
             bd,
         );
         if empty_days > 0 {
-            say!("   {empty_days} of {days} days had no decisions");
+            say!(
+                "   {empty_days} of {effective_days} days had no decisions",
+            );
         }
     }
 
@@ -114,7 +186,7 @@ pub async fn run(
         );
     }
 
-    if days == 1 {
+    if since_ms.is_none() && effective_days == 1 {
         say!(
             "   {} decisions for bucket_day = {} (UTC ms)",
             decisions.len(),
@@ -134,7 +206,8 @@ pub async fn run(
                 ts_ms: snapshot_ts,
                 filter: JsonFilter {
                     strategies: strategies_filter.map(|s| s.to_vec()),
-                    days,
+                    days: effective_days,
+                    since_ms,
                 },
                 n_decisions_total: pre_filter_count,
                 n_decisions_after_filter: 0,
@@ -213,7 +286,8 @@ pub async fn run(
             ts_ms: snapshot_ts,
             filter: JsonFilter {
                 strategies: strategies_filter.map(|s| s.to_vec()),
-                days,
+                days: effective_days,
+                since_ms,
             },
             n_decisions_total: pre_filter_count,
             n_decisions_after_filter: decisions.len(),
@@ -234,16 +308,22 @@ pub async fn run(
     // are logged but don't bail the run since the human-readable output
     // already landed.
     //
-    // Skip persistence when `days > 1`: those rows would conflate
-    // multi-day decisions into a single "today" snapshot and break
-    // the daily-resolution time series pnl-history reads. Multi-day
-    // mode is an ad-hoc analysis tool, not a heartbeat call — the
-    // daemon's periodic compare always passes days=1.
-    if days > 1 {
-        say!(
-            "\n💾 snapshot persistence skipped (--days {days} is analysis-only; \
-             would conflate multi-day data into a single 'today' bucket)"
-        );
+    // Skip persistence when the operator-chosen window doesn't
+    // line up with today's UTC bucket. The daily-resolution
+    // strategy_pnl_snapshots time series that pnl-history feeds
+    // on expects every row to summarise exactly one (strategy,
+    // bucket_day) pair — writing a multi-day or mid-day-start
+    // window into a single "today" snapshot would silently
+    // corrupt that contract. Multi-day / since-windowed modes
+    // are analysis-only; the daemon's periodic compare always
+    // passes days=1 / since=None.
+    if effective_days > 1 || since_ms.is_some() {
+        let reason = if let Some(since) = since_ms {
+            format!("--since {since} is analysis-only; would write a mid-day-start window into today's snapshot")
+        } else {
+            format!("--days {effective_days} is analysis-only; would conflate multi-day data into a single 'today' bucket")
+        };
+        say!("\n💾 snapshot persistence skipped ({reason})");
         return Ok(());
     }
     for (strategy, rows) in &by_strategy {
@@ -354,6 +434,13 @@ struct JsonFilter {
     /// "was this dataset restricted?" signal.
     strategies: Option<Vec<String>>,
     days: u32,
+    /// When `--since <ts>` was set, the resolved start in
+    /// ms-since-epoch. `None` when --days governed the window
+    /// (its UTC-midnight semantics are still encoded in `days`).
+    /// Downstream scripts can use this to pin the exact window
+    /// they got, regardless of which flag the operator passed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    since_ms: Option<i64>,
 }
 
 #[derive(Serialize)]
@@ -822,6 +909,72 @@ async fn fetch_current_yes_prices(http: &Client) -> Result<HashMap<String, f64>>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_since_rfc3339() {
+        // Z (UTC) form.
+        let now = 1_700_000_000_000_i64;
+        let t = parse_since("2023-11-14T22:13:20Z", now).unwrap();
+        assert_eq!(t, 1_700_000_000_000);
+    }
+
+    #[test]
+    fn parse_since_rfc3339_with_offset() {
+        // -07:00 offset → same absolute instant as 17:13:20Z.
+        let now = 1_700_000_000_000_i64;
+        let t = parse_since("2023-11-14T15:13:20-07:00", now).unwrap();
+        assert_eq!(t, 1_700_000_000_000);
+    }
+
+    #[test]
+    fn parse_since_relative_hours() {
+        let now = 1_700_000_000_000_i64;
+        let six_h_ms = 6 * 60 * 60 * 1000_i64;
+        let t = parse_since("6h", now).unwrap();
+        assert_eq!(t, now - six_h_ms);
+    }
+
+    #[test]
+    fn parse_since_relative_minutes_seconds_days() {
+        let now = 0_i64;
+        assert_eq!(parse_since("30m", now).unwrap(), -(30 * 60 * 1000));
+        assert_eq!(parse_since("90s", now).unwrap(), -(90 * 1000));
+        assert_eq!(parse_since("2d", now).unwrap(), -(2 * 86_400_000));
+    }
+
+    #[test]
+    fn parse_since_zero_is_now() {
+        let now = 1_700_000_000_000_i64;
+        assert_eq!(parse_since("0h", now).unwrap(), now);
+    }
+
+    #[test]
+    fn parse_since_empty_errors() {
+        assert!(parse_since("", 0).is_err());
+        assert!(parse_since("   ", 0).is_err());
+    }
+
+    #[test]
+    fn parse_since_bad_unit_errors() {
+        // 'y' (years) is unsupported.
+        let err = parse_since("1y", 0).unwrap_err().to_string();
+        assert!(
+            err.contains("N{s,m,h,d}"),
+            "expected useful error mentioning supported units, got: {err}",
+        );
+    }
+
+    #[test]
+    fn parse_since_bad_number_errors() {
+        assert!(parse_since("xh", 0).is_err());
+    }
+
+    #[test]
+    fn parse_since_negative_errors() {
+        // -6h would resolve to the future; reject so operators
+        // don't get an empty window with no signal.
+        assert!(parse_since("-6h", 0).is_err());
+    }
 
     #[test]
     fn pass_pnl_is_zero() {
