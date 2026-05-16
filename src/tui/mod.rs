@@ -1216,35 +1216,6 @@ fn ts_span_label(snapshots: &[StrategyPnlSnapshot]) -> String {
     }
 }
 
-/// Compute the change in `sum_pnl` over the trailing 24h for one
-/// strategy's ascending-by-ts_ms snapshot series. Returns `None`
-/// when no baseline snapshot lands within ±6h of `latest.ts_ms -
-/// 24h` (e.g. the daemon has been running for less than ~18h, or
-/// snapshots are sparse around that mark) — better to render an
-/// empty cell than to compute a delta against an arbitrary point.
-///
-/// The reference clock is the latest snapshot's `ts_ms`, not
-/// `Utc::now()`: that way a halted `compare-pnl` shows the most
-/// recent valid 24h delta instead of going blank, matching the
-/// "trend" sparkline's own latest-row semantics.
-///
-/// Pure function on the input slice so it's trivially testable.
-fn pnl_delta_24h(series: &[&StrategyPnlSnapshot]) -> Option<f64> {
-    let latest = series.last()?;
-    let target = latest.ts_ms - 24 * 60 * 60 * 1000;
-    let tolerance = 6 * 60 * 60 * 1000;
-    let baseline = *series
-        .iter()
-        .min_by_key(|s| (s.ts_ms - target).abs())?;
-    if (baseline.ts_ms - target).abs() > tolerance {
-        return None;
-    }
-    if baseline.ts_ms >= latest.ts_ms {
-        return None;
-    }
-    Some(latest.sum_pnl - baseline.sum_pnl)
-}
-
 /// Group today's decisions per market and classify cross-strategy
 /// agreement. Latest decision per (market, strategy) wins so a
 /// periodic daemon that emitted multiple rows doesn't double-vote.
@@ -1804,7 +1775,7 @@ fn draw_strategy_pnl(
         // a profitable yesterday and a losing today, and that
         // distinction matters for the "who's winning right now"
         // call.
-        let delta_24h = pnl_delta_24h(series);
+        let delta_24h = crate::coredb::strategy_pnl::pnl_delta_24h(series);
         let delta_text = match delta_24h {
             Some(v) => format!("${:+.2}", v),
             None => "—".to_string(),
@@ -3263,7 +3234,7 @@ mod tests {
         let mut b = snap(day_ms);
         b.sum_pnl = 30.0;
         let series = vec![&a, &b];
-        let d = super::pnl_delta_24h(&series).expect("should compute");
+        let d = crate::coredb::strategy_pnl::pnl_delta_24h(&series).expect("should compute");
         assert!((d - 20.0).abs() < 1e-9, "expected +20.0, got {d}");
     }
 
@@ -3275,7 +3246,7 @@ mod tests {
         let mut b = snap(day_ms);
         b.sum_pnl = 12.0;
         let series = vec![&a, &b];
-        let d = super::pnl_delta_24h(&series).expect("should compute");
+        let d = crate::coredb::strategy_pnl::pnl_delta_24h(&series).expect("should compute");
         assert!((d - -38.0).abs() < 1e-9, "expected -38.0, got {d}");
     }
 
@@ -3287,12 +3258,12 @@ mod tests {
         let mut b = snap(3_600_000);
         b.sum_pnl = 30.0;
         let series = vec![&a, &b];
-        assert_eq!(super::pnl_delta_24h(&series), None);
+        assert_eq!(crate::coredb::strategy_pnl::pnl_delta_24h(&series), None);
     }
 
     #[test]
     fn pnl_delta_24h_none_when_empty() {
-        assert_eq!(super::pnl_delta_24h(&[]), None);
+        assert_eq!(crate::coredb::strategy_pnl::pnl_delta_24h(&[]), None);
     }
 
     #[test]
@@ -3307,7 +3278,7 @@ mod tests {
         let mut p24 = snap(24 * hour);
         p24.sum_pnl = 40.0;
         let series = vec![&p0, &p22, &p24];
-        let d = super::pnl_delta_24h(&series).expect("should compute");
+        let d = crate::coredb::strategy_pnl::pnl_delta_24h(&series).expect("should compute");
         // latest 40.0 - closest-to-target (p0 sum 5.0) = 35.0
         assert!((d - 35.0).abs() < 1e-9, "expected +35.0, got {d}");
     }

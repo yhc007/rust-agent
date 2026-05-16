@@ -485,6 +485,10 @@ pub async fn run(cfg: DaemonConfig) -> Result<()> {
             .map(Arc::new);
         let position_repo_for_metrics = PositionRepo::new(db.session()).await.ok().map(Arc::new);
         let agreement_repo = AgreementRepo::new(db.session()).await.ok().map(Arc::new);
+        let strategy_pnl_repo = crate::coredb::strategy_pnl::StrategyPnlRepo::new(db.session())
+            .await
+            .ok()
+            .map(Arc::new);
         let app_state = HealthAppState {
             health: health.clone(),
             btc_repo: btc_repo_for_health,
@@ -506,6 +510,8 @@ pub async fn run(cfg: DaemonConfig) -> Result<()> {
             agreement_repo,
             agreement_cache: Arc::new(RwLock::new(None)),
             agreement_window_cache: Arc::new(RwLock::new(None)),
+            strategy_pnl_repo,
+            strategy_pnl_cache: Arc::new(RwLock::new(None)),
         };
         let app = Router::new()
             .route("/health", get(health_handler))
@@ -765,6 +771,23 @@ struct PnlBreakdownWindowCacheEntry {
     rows: Vec<crate::coredb::types::PnlBreakdown>,
 }
 
+/// Cached strategy_pnl_snapshots rows spanning today + yesterday's
+/// bucket_days. The Δ24h delta needs ~24h of data on each refresh,
+/// so two list_day calls fan out per refresh — much cheaper than
+/// re-fetching per scrape. Stored raw so the renderer can call
+/// `pnl_delta_24h` per strategy without re-grouping in the gather
+/// path.
+///
+/// `anchor_bucket_day_ms` is today's bucket at refresh time — on
+/// day-roll the cache is invalidated so a daemon up across midnight
+/// doesn't keep returning the day-before-yesterday's data.
+#[derive(Debug, Clone)]
+struct StrategyPnlCacheEntry {
+    fetched_at_ms: i64,
+    anchor_bucket_day_ms: i64,
+    rows: Vec<crate::coredb::types::StrategyPnlSnapshot>,
+}
+
 /// Cached open-positions snapshot. Positions only change on fill
 /// events (paper fills land synchronously; live fills land
 /// through the user-channel WS listener), so a 10s TTL is plenty
@@ -829,6 +852,14 @@ struct HealthAppState {
     /// out 7 list_day calls per scrape; invalidated on day-roll so
     /// the window stays anchored to "today".
     pnl_breakdown_window_cache: Arc<RwLock<Option<PnlBreakdownWindowCacheEntry>>>,
+    /// Repo + cache for strategy_pnl_snapshots, used by the
+    /// `agent_pnl_delta_24h_usd{strategy=...}` gauge. Each refresh
+    /// fans out 2 list_day calls (today + yesterday) so the helper
+    /// has at least 24h of data to compute the delta. Same TTL
+    /// (60s) as the other pnl caches since the underlying data
+    /// only ticks when `compare-pnl` runs (~15min).
+    strategy_pnl_repo: Option<Arc<crate::coredb::strategy_pnl::StrategyPnlRepo>>,
+    strategy_pnl_cache: Arc<RwLock<Option<StrategyPnlCacheEntry>>>,
     /// Open positions read from positions_v2 for the
     /// agent_open_positions_* gauges. 10s scrape cache.
     position_repo_for_metrics: Option<Arc<PositionRepo>>,
@@ -1204,6 +1235,12 @@ pub struct MetricsSnapshot {
     /// `agreement` but spans `AGREEMENT_WINDOW_DAYS` of
     /// bucket_days, anchored on today.
     pub agreement_window: Option<AgreementWindowCacheEntry>,
+    /// Today + yesterday strategy_pnl_snapshots, used by the
+    /// `agent_pnl_delta_24h_usd{strategy=...}` gauge family. Two
+    /// list_day calls per refresh (today + yesterday's bucket_day)
+    /// so the helper has at least 24h of data; `None` when the
+    /// `strategy_pnl_repo` couldn't be built at startup.
+    pub strategy_pnl: Option<StrategyPnlCacheEntry>,
     pub risk: RiskLimits,
     /// Operator-facing comment lines to prepend at the top of the
     /// output (e.g. "# decisions_today refresh failed; serving
@@ -1516,6 +1553,55 @@ pub fn render_metrics(s: &MetricsSnapshot) -> String {
                     escape_label(&row.exec),
                     row.n_settled,
                 ));
+            }
+        }
+    }
+
+    // Per-strategy Δ24h: change in mark-to-market sum_pnl over the
+    // trailing 24h. Baseline is the snapshot closest to (latest_ts
+    // - 24h) within ±6h — strategies with no usable baseline emit
+    // no series (rather than emitting 0, which would alias to "no
+    // movement" in alerting). Same `pnl_delta_24h` helper as the
+    // strategy-pnl dashboard column, so the metric and the TUI
+    // can't disagree.
+    if let Some(cache) = s.strategy_pnl.as_ref() {
+        if !cache.rows.is_empty() {
+            use std::collections::BTreeMap;
+            // Group + sort by ts_ms so pnl_delta_24h's "last is
+            // latest, target = latest - 24h" contract holds. BTreeMap
+            // keeps strategy order deterministic for stable output.
+            let mut by_strategy: BTreeMap<&str, Vec<&crate::coredb::types::StrategyPnlSnapshot>> =
+                BTreeMap::new();
+            for snap in &cache.rows {
+                by_strategy
+                    .entry(snap.strategy.as_str())
+                    .or_default()
+                    .push(snap);
+            }
+            for v in by_strategy.values_mut() {
+                v.sort_by_key(|s| s.ts_ms);
+            }
+            // Two-pass so the HELP / TYPE preamble only emits when
+            // ≥1 strategy has a real delta — otherwise an empty
+            // family clutters /metrics without conveying info.
+            let mut deltas: Vec<(&str, f64)> = Vec::new();
+            for (strategy, series) in &by_strategy {
+                if let Some(d) = crate::coredb::strategy_pnl::pnl_delta_24h(series) {
+                    deltas.push((strategy, d));
+                }
+            }
+            if !deltas.is_empty() {
+                out.push_str(
+                    "# HELP agent_pnl_delta_24h_usd Change in sum_pnl over the trailing 24h per strategy. Sourced from strategy_pnl_snapshots; baseline is the snapshot closest to (latest_ts - 24h) within \u{00B1}6h. No series for strategies with no usable baseline.\n",
+                );
+                out.push_str("# TYPE agent_pnl_delta_24h_usd gauge\n");
+                for (strategy, d) in deltas {
+                    out.push_str(&format!(
+                        "agent_pnl_delta_24h_usd{{strategy=\"{}\"}} {}\n",
+                        escape_label(strategy),
+                        d
+                    ));
+                }
             }
         }
     }
@@ -2107,6 +2193,54 @@ async fn gather_metrics_snapshot(s: &HealthAppState, now: i64) -> MetricsSnapsho
             None
         };
 
+    // strategy_pnl cache: today + yesterday's bucket_days. Two
+    // list_day calls per refresh so the helper has at least 24h
+    // of data to compute the per-strategy Δ24h. Invalidated on
+    // day-roll (anchor_bucket_day_ms tracks today at refresh time)
+    // so a daemon across midnight doesn't keep returning
+    // day-before-yesterday's data.
+    let strategy_pnl: Option<StrategyPnlCacheEntry> =
+        if let Some(repo) = s.strategy_pnl_repo.as_ref() {
+            let mut cache_guard = s.strategy_pnl_cache.write().await;
+            let today_bd = bucket_day(now);
+            let yesterday_bd = today_bd - 86_400_000;
+            let cached_anchor = cache_guard.as_ref().map(|c| c.anchor_bucket_day_ms);
+            let day_rolled = cached_anchor.map(|d| d != today_bd).unwrap_or(false);
+            let need_refresh = day_rolled
+                || cache_guard
+                    .as_ref()
+                    .map(|c| now - c.fetched_at_ms > metrics_pnl_daily_cache_ttl_ms())
+                    .unwrap_or(true);
+            if need_refresh {
+                let mut all_rows: Vec<crate::coredb::types::StrategyPnlSnapshot> = Vec::new();
+                let mut any_err = false;
+                for bd in [yesterday_bd, today_bd] {
+                    match repo.list_day(bd).await {
+                        Ok(rows) => all_rows.extend(rows),
+                        Err(e) => {
+                            any_err = true;
+                            notes.push(format!(
+                                "# strategy_pnl day {bd} read failed: {e}"
+                            ));
+                        }
+                    }
+                }
+                // Same stale-while-revalidate rule as the agreement
+                // window cache: don't blow away a known-good entry on
+                // a partial failure that returned nothing.
+                if !(any_err && all_rows.is_empty() && cache_guard.is_some()) {
+                    *cache_guard = Some(StrategyPnlCacheEntry {
+                        fetched_at_ms: now,
+                        anchor_bucket_day_ms: today_bd,
+                        rows: all_rows,
+                    });
+                }
+            }
+            cache_guard.clone()
+        } else {
+            None
+        };
+
     // Positions cache refresh.
     let positions: Option<PositionsCacheEntry> =
         if let Some(position_repo) = s.position_repo_for_metrics.as_ref() {
@@ -2181,6 +2315,7 @@ async fn gather_metrics_snapshot(s: &HealthAppState, now: i64) -> MetricsSnapsho
         ingest_restarts_polymarket,
         agreement,
         agreement_window,
+        strategy_pnl,
         risk: RiskLimits::default(),
         notes,
     }
@@ -2847,6 +2982,37 @@ mod tests {
                     matches: 4,
                 }],
             }),
+            // Two snapshots ~24h apart for one strategy so the
+            // Δ24h helper produces a real delta in the metrics
+            // body — exercises the "every-family" assertion below.
+            strategy_pnl: Some(super::StrategyPnlCacheEntry {
+                fetched_at_ms: 1_700_000_009_000,
+                anchor_bucket_day_ms: 1_700_000_000_000,
+                rows: vec![
+                    crate::coredb::types::StrategyPnlSnapshot {
+                        bucket_day_ms: 1_699_913_600_000,
+                        ts_ms: 1_700_000_010_000 - 86_400_000,
+                        strategy: "baseline".into(),
+                        n_decisions: 50,
+                        sum_size_usd: 250.0,
+                        sum_pnl: 5.00,
+                        n_yes: 20,
+                        n_no: 20,
+                        n_pass: 10,
+                    },
+                    crate::coredb::types::StrategyPnlSnapshot {
+                        bucket_day_ms: 1_700_000_000_000,
+                        ts_ms: 1_700_000_010_000,
+                        strategy: "baseline".into(),
+                        n_decisions: 100,
+                        sum_size_usd: 500.0,
+                        sum_pnl: 18.50,
+                        n_yes: 30,
+                        n_no: 30,
+                        n_pass: 40,
+                    },
+                ],
+            }),
             risk: super::RiskLimits {
                 max_order_usd: 25.0,
                 kill_switch_path: PathBuf::from("/tmp/__definitely_nonexistent__"),
@@ -2883,6 +3049,7 @@ mod tests {
             "agent_pnl_breakdown_yesterday_trades_count",
             "agent_pnl_daily_realized_usd",
             "agent_pnl_daily_trades_count",
+            "agent_pnl_delta_24h_usd",
             "agent_risk_kill_switch_active",
             "agent_risk_max_order_usd",
             "agent_subtask_consecutive_errors",
@@ -2955,6 +3122,7 @@ mod tests {
             ingest_restarts_polymarket: 0,
             agreement: None,
             agreement_window: None,
+            strategy_pnl: None,
             risk: super::RiskLimits {
                 max_order_usd: 50.0,
                 kill_switch_path: PathBuf::from("/tmp/__definitely_nonexistent__"),
@@ -3034,6 +3202,7 @@ mod tests {
             ingest_restarts_polymarket: 0,
             agreement: None,
             agreement_window: None,
+            strategy_pnl: None,
             risk: super::RiskLimits {
                 max_order_usd: 50.0,
                 kill_switch_path: PathBuf::from("/tmp/__definitely_nonexistent__"),
@@ -3150,6 +3319,7 @@ mod tests {
                     matches: 1, // rate 0.25 → disagreement 0.75
                 }],
             }),
+            strategy_pnl: None,
             risk: super::RiskLimits {
                 max_order_usd: 50.0,
                 kill_switch_path: PathBuf::from("/tmp/__definitely_nonexistent__"),
@@ -3204,6 +3374,7 @@ mod tests {
                 rows: Vec::new(),
             }),
             agreement_window: None,
+            strategy_pnl: None,
             risk: super::RiskLimits {
                 max_order_usd: 50.0,
                 kill_switch_path: PathBuf::from("/tmp/__definitely_nonexistent__"),
@@ -3214,6 +3385,154 @@ mod tests {
         assert!(
             !out.contains("agent_disagreement_rate"),
             "empty agreement cache should not emit series:\n{out}",
+        );
+    }
+
+    /// Pin the exact label shape + value of the Δ24h gauge.
+    /// "baseline" gets a real ~24h-spanning series → delta should
+    /// fire; "deepseek" gets one snapshot only → no usable
+    /// baseline → no series. Both invariants matter: the first
+    /// proves the metric works at all; the second proves we don't
+    /// silently book 0 for strategies with insufficient history
+    /// (which would alias to "no movement" in alerting).
+    #[test]
+    fn render_metrics_pnl_delta_24h_emits_per_strategy_with_baseline() {
+        use std::path::PathBuf;
+        let day = 86_400_000_i64;
+        let now = 1_700_000_010_000_i64;
+        let snap = super::MetricsSnapshot {
+            now_ms: now,
+            health: super::HealthState {
+                started_at_ms: 1_700_000_000_000,
+                backtest: super::SubtaskHealth::default(),
+                compare: super::SubtaskHealth::default(),
+                settle: super::SubtaskHealth::default(),
+                user_channel_present: false,
+            },
+            btc_age_ms: None,
+            polymarket_age_ms: None,
+            decisions: None,
+            orders: None,
+            pnl_daily: None,
+            pnl_breakdown: None,
+            pnl_breakdown_yesterday: None,
+            pnl_breakdown_window: None,
+            positions: None,
+            ingest_probe_age_ms: None,
+            ingest_restarts_binance: 0,
+            ingest_restarts_polymarket: 0,
+            agreement: None,
+            agreement_window: None,
+            strategy_pnl: Some(super::StrategyPnlCacheEntry {
+                fetched_at_ms: now,
+                anchor_bucket_day_ms: 1_700_000_000_000,
+                rows: vec![
+                    crate::coredb::types::StrategyPnlSnapshot {
+                        bucket_day_ms: 1_699_913_600_000,
+                        ts_ms: now - day,
+                        strategy: "baseline".into(),
+                        n_decisions: 0,
+                        sum_size_usd: 0.0,
+                        sum_pnl: 5.0,
+                        n_yes: 0,
+                        n_no: 0,
+                        n_pass: 0,
+                    },
+                    crate::coredb::types::StrategyPnlSnapshot {
+                        bucket_day_ms: 1_700_000_000_000,
+                        ts_ms: now,
+                        strategy: "baseline".into(),
+                        n_decisions: 0,
+                        sum_size_usd: 0.0,
+                        sum_pnl: 18.5,
+                        n_yes: 0,
+                        n_no: 0,
+                        n_pass: 0,
+                    },
+                    // deepseek has only one snapshot — pnl_delta_24h
+                    // returns None, no series should be emitted.
+                    crate::coredb::types::StrategyPnlSnapshot {
+                        bucket_day_ms: 1_700_000_000_000,
+                        ts_ms: now,
+                        strategy: "deepseek".into(),
+                        n_decisions: 0,
+                        sum_size_usd: 0.0,
+                        sum_pnl: -2.5,
+                        n_yes: 0,
+                        n_no: 0,
+                        n_pass: 0,
+                    },
+                ],
+            }),
+            risk: super::RiskLimits {
+                max_order_usd: 50.0,
+                kill_switch_path: PathBuf::from("/tmp/__definitely_nonexistent__"),
+            },
+            notes: Vec::new(),
+        };
+        let out = super::render_metrics(&snap);
+        assert!(
+            out.contains("# TYPE agent_pnl_delta_24h_usd gauge\n"),
+            "missing TYPE line for Δ24h gauge:\n{out}",
+        );
+        // 18.5 - 5.0 = 13.5 — pinned exact string so a refactor
+        // that changes the formula (or the formatter) fails loud.
+        assert!(
+            out.contains("agent_pnl_delta_24h_usd{strategy=\"baseline\"} 13.5\n"),
+            "expected baseline delta of 13.5; got:\n{out}",
+        );
+        // No series for deepseek — single snapshot can't anchor a
+        // 24h baseline.
+        assert!(
+            !out.contains("agent_pnl_delta_24h_usd{strategy=\"deepseek\""),
+            "deepseek had no baseline; series must not be emitted:\n{out}",
+        );
+    }
+
+    /// Empty strategy_pnl cache (e.g. compare-pnl hasn't run yet)
+    /// emits no HELP/TYPE preamble and no samples — no point in
+    /// an empty family on every scrape.
+    #[test]
+    fn render_metrics_pnl_delta_24h_empty_emits_no_series() {
+        use std::path::PathBuf;
+        let snap = super::MetricsSnapshot {
+            now_ms: 1_700_000_010_000,
+            health: super::HealthState {
+                started_at_ms: 1_700_000_000_000,
+                backtest: super::SubtaskHealth::default(),
+                compare: super::SubtaskHealth::default(),
+                settle: super::SubtaskHealth::default(),
+                user_channel_present: false,
+            },
+            btc_age_ms: None,
+            polymarket_age_ms: None,
+            decisions: None,
+            orders: None,
+            pnl_daily: None,
+            pnl_breakdown: None,
+            pnl_breakdown_yesterday: None,
+            pnl_breakdown_window: None,
+            positions: None,
+            ingest_probe_age_ms: None,
+            ingest_restarts_binance: 0,
+            ingest_restarts_polymarket: 0,
+            agreement: None,
+            agreement_window: None,
+            strategy_pnl: Some(super::StrategyPnlCacheEntry {
+                fetched_at_ms: 1_700_000_009_000,
+                anchor_bucket_day_ms: 1_700_000_000_000,
+                rows: Vec::new(),
+            }),
+            risk: super::RiskLimits {
+                max_order_usd: 50.0,
+                kill_switch_path: PathBuf::from("/tmp/__definitely_nonexistent__"),
+            },
+            notes: Vec::new(),
+        };
+        let out = super::render_metrics(&snap);
+        assert!(
+            !out.contains("agent_pnl_delta_24h_usd"),
+            "empty strategy_pnl cache should not emit series:\n{out}",
         );
     }
 
@@ -3247,6 +3566,7 @@ mod tests {
             ingest_restarts_polymarket: 2,
             agreement: None,
             agreement_window: None,
+            strategy_pnl: None,
             risk: super::RiskLimits {
                 max_order_usd: 50.0,
                 kill_switch_path: PathBuf::from("/tmp/__definitely_nonexistent__"),
@@ -3299,6 +3619,7 @@ mod tests {
             ingest_restarts_polymarket: 0,
             agreement: None,
             agreement_window: None,
+            strategy_pnl: None,
             risk: super::RiskLimits {
                 max_order_usd: 50.0,
                 kill_switch_path: PathBuf::from("/tmp/__definitely_nonexistent__"),
@@ -3346,6 +3667,7 @@ mod tests {
             ingest_restarts_polymarket: 0,
             agreement: None,
             agreement_window: None,
+            strategy_pnl: None,
             risk: super::RiskLimits {
                 max_order_usd: 50.0,
                 kill_switch_path: PathBuf::from("/tmp/__definitely_nonexistent__"),
@@ -3403,6 +3725,7 @@ mod tests {
             "agent_pnl_breakdown_yesterday_trades_count",
             "agent_pnl_daily_realized_usd",
             "agent_pnl_daily_trades_count",
+            "agent_pnl_delta_24h_usd",
             "agent_risk_kill_switch_active",
             "agent_risk_max_order_usd",
             "agent_subtask_consecutive_errors",

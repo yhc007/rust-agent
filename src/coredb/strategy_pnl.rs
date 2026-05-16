@@ -92,6 +92,44 @@ impl StrategyPnlRepo {
     }
 }
 
+/// Compute the change in `sum_pnl` over the trailing 24h window for
+/// one strategy's snapshot series. Returns `None` when no baseline
+/// snapshot lands within ±6h of `latest.ts_ms - 24h` — e.g. the
+/// daemon has been running for less than ~18h, or snapshots are
+/// sparse around that mark — so callers render an empty cell /
+/// emit no series rather than booking a delta against an arbitrary
+/// older point.
+///
+/// The reference clock is the latest snapshot's `ts_ms`, not
+/// `Utc::now()`: a halted `compare-pnl` then shows the most recent
+/// valid 24h delta instead of going blank, which matches the trend
+/// sparkline's own latest-row semantics.
+///
+/// Pure function on the input slice so it's testable without any
+/// runtime context. Series is expected ascending by `ts_ms` but the
+/// algorithm only cares about `(.last(), .min_by_key)`, so passing
+/// an unsorted slice still produces a valid result.
+///
+/// Slice type is `&[&StrategyPnlSnapshot]` rather than
+/// `&[StrategyPnlSnapshot]` because the natural shape on the caller
+/// side is "per-strategy grouped refs into a larger Vec" — owned
+/// callers can adapt with `iter().collect::<Vec<_>>()`.
+pub fn pnl_delta_24h(series: &[&StrategyPnlSnapshot]) -> Option<f64> {
+    let latest = series.last()?;
+    let target = latest.ts_ms - 24 * 60 * 60 * 1000;
+    let tolerance = 6 * 60 * 60 * 1000;
+    let baseline = *series
+        .iter()
+        .min_by_key(|s| (s.ts_ms - target).abs())?;
+    if (baseline.ts_ms - target).abs() > tolerance {
+        return None;
+    }
+    if baseline.ts_ms >= latest.ts_ms {
+        return None;
+    }
+    Some(latest.sum_pnl - baseline.sum_pnl)
+}
+
 /// Name-keyed projection matching the SELECT above. Same shape as the
 /// trick used in `decisions.list_day` to dodge CoreDB's HashMap-order
 /// column reshuffling.
