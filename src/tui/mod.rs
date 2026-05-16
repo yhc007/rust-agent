@@ -125,11 +125,19 @@ async fn main_loop(
     health_client: Option<&reqwest::Client>,
     pnl_days: u32,
 ) -> Result<()> {
+    // Restart counts seen on the most recent /health probe. Stashed
+    // here (not in the Snapshot) because it must survive the
+    // assignment that rebuilds `snapshot` on each refresh — the
+    // whole point is comparing across consecutive snapshots.
+    let mut prev_ingest_restarts: Option<(u64, u64)> = None;
     let mut snapshot = fetch_snapshot(
         btc_repo, dec_repo, pos_repo, pnl_repo, agree_repo, breakdown_repo, health_url,
-        health_client, pnl_days,
+        health_client, pnl_days, prev_ingest_restarts,
     )
     .await;
+    if let Some(chip) = &snapshot.health {
+        prev_ingest_restarts = chip.ingest_restarts;
+    }
     let mut last_refresh = Instant::now();
     // Strategy currently focused in the decisions panel. `None` = show
     // every strategy. Set by digit-key hotkeys; cleared by `0` or `c`.
@@ -158,9 +166,14 @@ async fn main_loop(
                     KeyCode::Char('r') => {
                         snapshot = fetch_snapshot(
                             btc_repo, dec_repo, pos_repo, pnl_repo, agree_repo, breakdown_repo,
-                            health_url, health_client, pnl_days,
+                            health_url, health_client, pnl_days, prev_ingest_restarts,
                         )
                         .await;
+                        if let Some(chip) = &snapshot.health {
+                            if let Some(r) = chip.ingest_restarts {
+                                prev_ingest_restarts = Some(r);
+                            }
+                        }
                         last_refresh = Instant::now();
                     }
                     // Digit hotkeys: focus the Nth strategy currently
@@ -195,9 +208,14 @@ async fn main_loop(
         if last_refresh.elapsed() >= REFRESH_EVERY {
             snapshot = fetch_snapshot(
                 btc_repo, dec_repo, pos_repo, pnl_repo, agree_repo, breakdown_repo, health_url,
-                health_client, pnl_days,
+                health_client, pnl_days, prev_ingest_restarts,
             )
             .await;
+            if let Some(chip) = &snapshot.health {
+                if let Some(r) = chip.ingest_restarts {
+                    prev_ingest_restarts = Some(r);
+                }
+            }
             last_refresh = Instant::now();
         }
     }
@@ -245,6 +263,14 @@ struct HealthChip {
     /// Free-form one-liner used in the secondary header row. Captures
     /// either the worst subtask's error or the unreachable reason.
     detail: Option<String>,
+    /// Restart counts seen on this probe. Carried on the chip so
+    /// the main_loop can stash them and compare on the next
+    /// refresh — that's how "binance restarted 3x" surfaces in
+    /// the chip detail line.
+    ///
+    /// `None` when the probe failed (no payload). `Some((0, 0))`
+    /// on a fresh daemon where nothing has ever restarted.
+    ingest_restarts: Option<(u64, u64)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -296,6 +322,20 @@ struct HealthWire {
     /// `#[serde(default)]` keeps backward compat.
     #[serde(default)]
     cache_ages_ms: HealthCacheAgesWire,
+    /// Per-source lifetime restart count. The dashboard compares
+    /// these across refreshes to surface flapping workers in the
+    /// chip detail line. Missing on pre-2026-05-16 daemons; default
+    /// to zeros so old responses parse cleanly.
+    #[serde(default)]
+    ingest_restarts: IngestRestartsWire,
+}
+
+#[derive(Debug, Default, Clone, Copy, serde::Deserialize)]
+struct IngestRestartsWire {
+    #[serde(default)]
+    binance: u64,
+    #[serde(default)]
+    polymarket: u64,
 }
 
 #[derive(Debug, Default, serde::Deserialize)]
@@ -389,6 +429,7 @@ async fn fetch_snapshot(
     health_url: Option<&str>,
     health_client: Option<&reqwest::Client>,
     pnl_days: u32,
+    prev_ingest_restarts: Option<(u64, u64)>,
 ) -> Snapshot {
     let mut s = Snapshot::default();
     match btc.latest("BTCUSDT").await {
@@ -465,7 +506,7 @@ async fn fetch_snapshot(
         }
     }
     if let (Some(url), Some(client)) = (health_url, health_client) {
-        s.health = Some(fetch_health(client, url).await);
+        s.health = Some(fetch_health(client, url, prev_ingest_restarts).await);
     }
     s
 }
@@ -475,7 +516,11 @@ async fn fetch_snapshot(
 /// parse error collapses into an Unreachable chip with the reason in
 /// `detail` — the operator should be able to tell *why* the dashboard
 /// can't reach the daemon without dropping to a terminal.
-async fn fetch_health(client: &reqwest::Client, url: &str) -> HealthChip {
+async fn fetch_health(
+    client: &reqwest::Client,
+    url: &str,
+    prev_restarts: Option<(u64, u64)>,
+) -> HealthChip {
     let resp = match client.get(url).send().await {
         Ok(r) => r,
         Err(e) => {
@@ -483,6 +528,7 @@ async fn fetch_health(client: &reqwest::Client, url: &str) -> HealthChip {
                 status: HealthStatus::Unreachable,
                 daemon_uptime_secs: None,
                 detail: Some(format!("GET failed: {}", short_err(&e.to_string()))),
+                ingest_restarts: None,
             };
         }
     };
@@ -491,6 +537,7 @@ async fn fetch_health(client: &reqwest::Client, url: &str) -> HealthChip {
             status: HealthStatus::Unreachable,
             daemon_uptime_secs: None,
             detail: Some(format!("HTTP {}", resp.status().as_u16())),
+            ingest_restarts: None,
         };
     }
     let body: HealthWire = match resp.json().await {
@@ -500,6 +547,7 @@ async fn fetch_health(client: &reqwest::Client, url: &str) -> HealthChip {
                 status: HealthStatus::Unreachable,
                 daemon_uptime_secs: None,
                 detail: Some(format!("bad JSON: {}", short_err(&e.to_string()))),
+                ingest_restarts: None,
             };
         }
     };
@@ -539,11 +587,57 @@ async fn fetch_health(client: &reqwest::Client, url: &str) -> HealthChip {
         };
         detail = Some(combined);
     }
+    // Restart-rate hint: when the daemon's per-source restart
+    // count has ticked up since our last successful probe, surface
+    // it so the operator sees a flapping worker even when the
+    // staleness probe is transiently healthy (the supervisor's
+    // restart unsticks the worker → next /health shows fresh
+    // ingest → without this hint, the dashboard never flags the
+    // event). Only fires when we have a `prev` to compare against
+    // — the first poll after dashboard startup just stashes a
+    // baseline.
+    let current_restarts = (
+        body.ingest_restarts.binance,
+        body.ingest_restarts.polymarket,
+    );
+    if let Some(hint) = restart_delta_hint(prev_restarts, current_restarts) {
+        let combined = match detail {
+            Some(existing) => format!("{existing} · {hint}"),
+            None => hint,
+        };
+        detail = Some(combined);
+    }
     HealthChip {
         status,
         daemon_uptime_secs: Some(body.uptime_secs),
         detail,
+        ingest_restarts: Some(current_restarts),
     }
+}
+
+/// Render a chip hint like "binance restarted 2×" when the daemon's
+/// per-source restart count has increased since the previous probe.
+/// `prev == None` means "first poll" — no baseline yet, no hint.
+/// Both sources can fire in the same string ("binance 1× · poly 3×")
+/// so the operator sees a multi-source incident at a glance.
+fn restart_delta_hint(
+    prev: Option<(u64, u64)>,
+    current: (u64, u64),
+) -> Option<String> {
+    let (prev_b, prev_p) = prev?;
+    let d_b = current.0.saturating_sub(prev_b);
+    let d_p = current.1.saturating_sub(prev_p);
+    if d_b == 0 && d_p == 0 {
+        return None;
+    }
+    let mut parts: Vec<String> = Vec::new();
+    if d_b > 0 {
+        parts.push(format!("binance restarted {d_b}×"));
+    }
+    if d_p > 0 {
+        parts.push(format!("polymarket restarted {d_p}×"));
+    }
+    Some(parts.join(" · "))
 }
 
 /// Threshold above which a cache is flagged as "stale" in the chip
@@ -1854,6 +1948,7 @@ mod tests {
             ingest_btc_age_ms: Some(100),
             ingest_polymarket_age_ms: Some(200),
             cache_ages_ms: super::HealthCacheAgesWire::default(),
+            ingest_restarts: super::IngestRestartsWire::default(),
         };
         let msg = super::worst_subtask_error(&body).unwrap();
         assert!(msg.starts_with("compare: 5×"), "got: {msg}");
@@ -1871,8 +1966,58 @@ mod tests {
             ingest_btc_age_ms: Some(100),
             ingest_polymarket_age_ms: Some(200),
             cache_ages_ms: super::HealthCacheAgesWire::default(),
+            ingest_restarts: super::IngestRestartsWire::default(),
         };
         assert!(super::worst_subtask_error(&body).is_none());
+    }
+
+    #[test]
+    fn restart_delta_hint_none_on_first_poll() {
+        // prev=None means we have no baseline yet — first poll
+        // after dashboard startup just stashes the baseline.
+        assert!(super::restart_delta_hint(None, (0, 0)).is_none());
+        assert!(super::restart_delta_hint(None, (7, 3)).is_none());
+    }
+
+    #[test]
+    fn restart_delta_hint_none_when_no_delta() {
+        // Same counts on consecutive probes → no hint.
+        assert!(super::restart_delta_hint(Some((5, 2)), (5, 2)).is_none());
+    }
+
+    #[test]
+    fn restart_delta_hint_reports_binance_only_delta() {
+        let h = super::restart_delta_hint(Some((1, 7)), (3, 7)).unwrap();
+        assert!(
+            h.contains("binance restarted 2×"),
+            "expected binance-only delta, got: {h}",
+        );
+        assert!(
+            !h.contains("polymarket"),
+            "polymarket shouldn't show when delta is 0, got: {h}",
+        );
+    }
+
+    #[test]
+    fn restart_delta_hint_reports_both_sources_with_separator() {
+        let h = super::restart_delta_hint(Some((0, 0)), (2, 3)).unwrap();
+        assert!(
+            h.contains("binance restarted 2×"),
+            "binance chip missing, got: {h}"
+        );
+        assert!(
+            h.contains("polymarket restarted 3×"),
+            "polymarket chip missing, got: {h}"
+        );
+        assert!(h.contains(" · "), "expected separator, got: {h}");
+    }
+
+    #[test]
+    fn restart_delta_hint_safe_when_counters_reset_below_prev() {
+        // Process restart drops the counters to 0. saturating_sub
+        // makes us emit no hint rather than panicking on negative
+        // delta or reporting a giant pretend-delta.
+        assert!(super::restart_delta_hint(Some((10, 5)), (0, 0)).is_none());
     }
 
     #[test]
@@ -2632,6 +2777,7 @@ mod tests {
             status: super::HealthStatus::Ok,
             daemon_uptime_secs: Some(125),
             detail: Some("btc 412ms / poly 1234ms".into()),
+            ingest_restarts: Some((0, 0)),
         };
         let dump = render_test_dashboard_with(None, Some(chip));
         assert!(dump.contains("daemon:"), "chip prefix missing");
@@ -2653,6 +2799,7 @@ mod tests {
             status: super::HealthStatus::Degraded,
             daemon_uptime_secs: Some(3600),
             detail: Some("backtest: 5× — connection refused".into()),
+            ingest_restarts: Some((0, 0)),
         };
         let dump = render_test_dashboard_with(None, Some(chip));
         assert!(dump.contains("degraded"), "degraded status label missing");
@@ -2673,6 +2820,7 @@ mod tests {
             status: super::HealthStatus::Unreachable,
             daemon_uptime_secs: None,
             detail: Some("GET failed: connection refused".into()),
+            ingest_restarts: None,
         };
         let dump = render_test_dashboard_with(None, Some(chip));
         assert!(dump.contains("unreachable"), "unreachable label missing");

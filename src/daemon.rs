@@ -173,6 +173,18 @@ struct HealthResponse {
     /// when settle-pnl runs; the orders cache refreshes when CQL
     /// writes land).
     cache_ages_ms: HealthCacheAges,
+    /// Lifetime restart counts per ingest source. Monotonic across
+    /// the daemon's lifetime; resets on process restart. Same
+    /// source as the `agent_ingest_restarts_total{source=...}`
+    /// counter — exposed on /health too so the dashboard can spot
+    /// a flapping worker by comparing consecutive snapshots.
+    ingest_restarts: IngestRestartsWire,
+}
+
+#[derive(Debug, Default, Clone, Serialize)]
+pub struct IngestRestartsWire {
+    pub binance: u64,
+    pub polymarket: u64,
 }
 
 #[derive(Debug, Default, Clone, Serialize)]
@@ -802,6 +814,7 @@ pub struct HealthInputs {
     pub btc_age_ms: Option<i64>,
     pub polymarket_age_ms: Option<i64>,
     pub cache_ages: HealthCacheAges,
+    pub ingest_restarts: IngestRestartsWire,
 }
 
 async fn gather_health_inputs(s: &HealthAppState, now: i64) -> HealthInputs {
@@ -862,12 +875,17 @@ async fn gather_health_inputs(s: &HealthAppState, now: i64) -> HealthInputs {
             .as_ref()
             .map(|c| (now - c.fetched_at_ms).max(0)),
     };
+    let ingest_restarts = IngestRestartsWire {
+        binance: s.ingest_restarts.binance.load(std::sync::atomic::Ordering::Relaxed),
+        polymarket: s.ingest_restarts.polymarket.load(std::sync::atomic::Ordering::Relaxed),
+    };
     HealthInputs {
         now_ms: now,
         health,
         btc_age_ms,
         polymarket_age_ms,
         cache_ages,
+        ingest_restarts,
     }
 }
 
@@ -898,6 +916,7 @@ pub fn compute_health_response(inp: &HealthInputs) -> HealthResponse {
         ingest_btc_age_ms: inp.btc_age_ms,
         ingest_polymarket_age_ms: inp.polymarket_age_ms,
         cache_ages_ms: inp.cache_ages.clone(),
+        ingest_restarts: inp.ingest_restarts.clone(),
     }
 }
 
@@ -2091,6 +2110,7 @@ mod tests {
             btc_age_ms: Some(500),
             polymarket_age_ms: Some(12_000),
             cache_ages: super::HealthCacheAges::default(),
+            ingest_restarts: super::IngestRestartsWire::default(),
         }
     }
 
