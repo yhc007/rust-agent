@@ -80,19 +80,19 @@ enum Commands {
     /// Apply CoreDB schema migrations for the polymarket_btc keyspace.
     Migrate {
         /// CoreDB native-protocol endpoint (host:port). Defaults to 127.0.0.1:9042.
-        #[arg(long, default_value = "127.0.0.1:9042")]
+        #[arg(long, env = "COREDB_URI", default_value = "127.0.0.1:9042")]
         coredb_uri: String,
     },
     /// Run Binance + Polymarket ingestion daemons that populate CoreDB.
     /// Stays in the foreground; Ctrl+C for a clean shutdown.
     Ingest {
         /// CoreDB endpoint. Defaults to 127.0.0.1:9042.
-        #[arg(long, default_value = "127.0.0.1:9042")]
+        #[arg(long, env = "COREDB_URI", default_value = "127.0.0.1:9042")]
         coredb_uri: String,
     },
     /// Print row counts for each polymarket_btc table.
     Stats {
-        #[arg(long, default_value = "127.0.0.1:9042")]
+        #[arg(long, env = "COREDB_URI", default_value = "127.0.0.1:9042")]
         coredb_uri: String,
         /// Emit one JSON object to stdout instead of the human-
         /// readable list. Same data, jq-friendly — round out the
@@ -110,7 +110,7 @@ enum Commands {
     /// With `--execute`, every non-PASS decision is also routed through
     /// the risk gate + paper executor, writing Order + Position rows.
     Backtest {
-        #[arg(long, default_value = "127.0.0.1:9042")]
+        #[arg(long, env = "COREDB_URI", default_value = "127.0.0.1:9042")]
         coredb_uri: String,
         /// Use the LLM-driven decision path instead of the baseline rule.
         #[arg(long)]
@@ -145,7 +145,7 @@ enum Commands {
     /// per-strategy snapshot into `polymarket_btc.strategy_pnl_snapshots`
     /// so the run can be replayed as a time series via `pnl-history`.
     ComparePnl {
-        #[arg(long, default_value = "127.0.0.1:9042")]
+        #[arg(long, env = "COREDB_URI", default_value = "127.0.0.1:9042")]
         coredb_uri: String,
         /// Restrict the comparison to a comma-separated subset of
         /// strategy labels (e.g. `--strategies baseline,deepseek`).
@@ -175,7 +175,7 @@ enum Commands {
     /// series. Pairs with `pnl-history` — same --days / --strategies
     /// knobs, populated by the same cron-driven `compare-pnl` writes.
     AgreementHistory {
-        #[arg(long, default_value = "127.0.0.1:9042")]
+        #[arg(long, env = "COREDB_URI", default_value = "127.0.0.1:9042")]
         coredb_uri: String,
         /// Restrict to snapshots whose *both* endpoints are in the
         /// allow-list — keeps the displayed series self-consistent
@@ -198,7 +198,7 @@ enum Commands {
     /// to the last N UTC days. Intended consumer of the cron-driven
     /// `compare-pnl` writes.
     PnlHistory {
-        #[arg(long, default_value = "127.0.0.1:9042")]
+        #[arg(long, env = "COREDB_URI", default_value = "127.0.0.1:9042")]
         coredb_uri: String,
         /// Restrict the dump to a comma-separated subset of strategy
         /// labels (e.g. `--strategies baseline,deepseek`). Empty =
@@ -224,7 +224,7 @@ enum Commands {
     /// / `--strategies` / `--json` knobs as the sibling commands;
     /// adds `--execs paper,live` for the new dimension.
     PnlBreakdownHistory {
-        #[arg(long, default_value = "127.0.0.1:9042")]
+        #[arg(long, env = "COREDB_URI", default_value = "127.0.0.1:9042")]
         coredb_uri: String,
         /// Comma-separated subset of strategy labels.
         #[arg(long, value_delimiter = ',')]
@@ -244,7 +244,7 @@ enum Commands {
     /// Computes realized PnL per order, aggregates per strategy, and
     /// upserts the day's total into `polymarket_btc.pnl_daily`.
     SettlePnl {
-        #[arg(long, default_value = "127.0.0.1:9042")]
+        #[arg(long, env = "COREDB_URI", default_value = "127.0.0.1:9042")]
         coredb_uri: String,
         /// Emit one JSON object to stdout instead of the human-
         /// readable table. Same data, jq-friendly. The
@@ -257,7 +257,7 @@ enum Commands {
     /// Dump every row in `polymarket_btc.positions_v2`, newest first.
     /// The headless analogue of the dashboard's positions panel.
     Positions {
-        #[arg(long, default_value = "127.0.0.1:9042")]
+        #[arg(long, env = "COREDB_URI", default_value = "127.0.0.1:9042")]
         coredb_uri: String,
     },
     /// One-shot helper to DROP the pre-v2 `polymarket_btc.positions`
@@ -266,7 +266,7 @@ enum Commands {
     /// how many rows it has, but does NOT mutate. Pass `--execute`
     /// to actually issue the DROP TABLE.
     DropLegacyPositions {
-        #[arg(long, default_value = "127.0.0.1:9042")]
+        #[arg(long, env = "COREDB_URI", default_value = "127.0.0.1:9042")]
         coredb_uri: String,
         /// Actually issue `DROP TABLE polymarket_btc.positions`.
         /// Without this flag the helper only inspects the table.
@@ -279,13 +279,13 @@ enum Commands {
     /// APPLY_FILLS=1 to also write trade events back into the
     /// `orders` table (default off — observation only).
     UserChannel {
-        #[arg(long, default_value = "127.0.0.1:9042")]
+        #[arg(long, env = "COREDB_URI", default_value = "127.0.0.1:9042")]
         coredb_uri: String,
     },
     /// Live operator dashboard. Polls CoreDB every 5 s and shows
     /// strategy PnL, open positions, and recent decisions. `q` to quit.
     Dashboard {
-        #[arg(long, default_value = "127.0.0.1:9042")]
+        #[arg(long, env = "COREDB_URI", default_value = "127.0.0.1:9042")]
         coredb_uri: String,
         /// Optional daemon /health URL to probe each refresh. When
         /// set, the header gains a colored chip (ok/degraded/
@@ -339,7 +339,7 @@ enum Commands {
     /// process. The "do everything" mode — replaces a cron stack for
     /// day-to-day paper trading. Ctrl+C tears the whole pipeline down.
     Daemon {
-        #[arg(long, default_value = "127.0.0.1:9042")]
+        #[arg(long, env = "COREDB_URI", default_value = "127.0.0.1:9042")]
         coredb_uri: String,
         /// Seconds between backtest --both --execute runs.
         #[arg(long, default_value_t = 1800)]
