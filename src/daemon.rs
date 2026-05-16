@@ -378,6 +378,7 @@ pub async fn run(cfg: DaemonConfig) -> Result<()> {
             pnl_breakdown_repo,
             pnl_breakdown_cache: Arc::new(RwLock::new(None)),
             pnl_breakdown_yesterday_cache: Arc::new(RwLock::new(None)),
+            pnl_breakdown_window_cache: Arc::new(RwLock::new(None)),
             position_repo_for_metrics,
             positions_cache: Arc::new(RwLock::new(None)),
             ingest_cache: Arc::new(RwLock::new(None)),
@@ -535,12 +536,33 @@ struct PnlDailyCacheEntry {
 /// 1h cadence in the daemon).
 const METRICS_PNL_DAILY_CACHE_TTL_MS: i64 = 60_000;
 
+/// Width of the rolling pnl_breakdown window metric, in days.
+/// Hard-coded — exposed to Grafana as the literal label `days="7"`
+/// in `agent_pnl_breakdown_window_*` so the panel query is
+/// trivially `sum by (strategy)(agent_pnl_breakdown_window_realized_usd)`.
+/// One UTC bucket_day per offset, anchored on `now`.
+const PNL_BREAKDOWN_WINDOW_DAYS: i64 = 7;
+
 /// Cached today's pnl_breakdown rows (per strategy × exec).
 /// Same TTL as pnl_daily — both are written by the same
 /// settle-pnl call.
 #[derive(Debug, Clone)]
 struct PnlBreakdownCacheEntry {
     fetched_at_ms: i64,
+    rows: Vec<crate::coredb::types::PnlBreakdown>,
+}
+
+/// Cached aggregate over the last N=`PNL_BREAKDOWN_WINDOW_DAYS`
+/// UTC days. The rows here are already summed per (strategy, exec)
+/// across the window, so the renderer emits one series per pair
+/// without touching CoreDB on the hot path. `anchor_bucket_day_ms`
+/// is today's bucket at refresh time — when `bucket_day(now)` no
+/// longer matches it (i.e. the day rolled), the cache is invalidated
+/// even if the TTL hasn't expired.
+#[derive(Debug, Clone)]
+struct PnlBreakdownWindowCacheEntry {
+    fetched_at_ms: i64,
+    anchor_bucket_day_ms: i64,
     rows: Vec<crate::coredb::types::PnlBreakdown>,
 }
 
@@ -601,6 +623,13 @@ struct HealthAppState {
     /// realized PnL. Same 60s TTL since the underlying data only
     /// changes when settle-pnl runs.
     pnl_breakdown_yesterday_cache: Arc<RwLock<Option<PnlBreakdownCacheEntry>>>,
+    /// Rolling N-day window over pnl_breakdown — same repo as the
+    /// today/yesterday caches above, but each refresh sums the last
+    /// PNL_BREAKDOWN_WINDOW_DAYS UTC days into a single rowset per
+    /// (strategy, exec). Cached so the metrics handler doesn't fan
+    /// out 7 list_day calls per scrape; invalidated on day-roll so
+    /// the window stays anchored to "today".
+    pnl_breakdown_window_cache: Arc<RwLock<Option<PnlBreakdownWindowCacheEntry>>>,
     /// Open positions read from positions_v2 for the
     /// agent_open_positions_* gauges. 10s scrape cache.
     position_repo_for_metrics: Option<Arc<PositionRepo>>,
@@ -687,6 +716,7 @@ pub struct MetricsSnapshot {
     pub pnl_daily: Option<PnlDailyCacheEntry>,
     pub pnl_breakdown: Option<PnlBreakdownCacheEntry>,
     pub pnl_breakdown_yesterday: Option<PnlBreakdownCacheEntry>,
+    pub pnl_breakdown_window: Option<PnlBreakdownWindowCacheEntry>,
     pub positions: Option<PositionsCacheEntry>,
     pub risk: RiskLimits,
     /// Operator-facing comment lines to prepend at the top of the
@@ -959,6 +989,44 @@ pub fn render_metrics(s: &MetricsSnapshot) -> String {
                     "agent_pnl_breakdown_yesterday_trades_count{{strategy=\"{}\",exec=\"{}\"}} {}\n",
                     escape_label(&row.strategy),
                     escape_label(&row.exec),
+                    row.n_settled,
+                ));
+            }
+        }
+    }
+
+    // Rolling N-day window. Same per-(strategy, exec) shape as the
+    // today/yesterday gauges above, with an extra `days` label so a
+    // single Grafana panel can keep all three time horizons side by
+    // side. The constant is baked into the label rather than read
+    // from the snapshot because all rows share the same window —
+    // any operator who wants a different horizon should add a
+    // sibling metric (cheaper than turning this one into a histogram).
+    if let Some(cache) = s.pnl_breakdown_window.as_ref() {
+        if !cache.rows.is_empty() {
+            out.push_str(
+                "# HELP agent_pnl_breakdown_window_realized_usd Realized PnL in USD summed over the last `days` UTC days per (strategy, exec). Anchored on today's UTC bucket.\n",
+            );
+            out.push_str("# TYPE agent_pnl_breakdown_window_realized_usd gauge\n");
+            for row in &cache.rows {
+                out.push_str(&format!(
+                    "agent_pnl_breakdown_window_realized_usd{{strategy=\"{}\",exec=\"{}\",days=\"{}\"}} {}\n",
+                    escape_label(&row.strategy),
+                    escape_label(&row.exec),
+                    PNL_BREAKDOWN_WINDOW_DAYS,
+                    row.realized_pnl,
+                ));
+            }
+            out.push_str(
+                "# HELP agent_pnl_breakdown_window_trades_count Number of settled trades summed over the last `days` UTC days per (strategy, exec).\n",
+            );
+            out.push_str("# TYPE agent_pnl_breakdown_window_trades_count gauge\n");
+            for row in &cache.rows {
+                out.push_str(&format!(
+                    "agent_pnl_breakdown_window_trades_count{{strategy=\"{}\",exec=\"{}\",days=\"{}\"}} {}\n",
+                    escape_label(&row.strategy),
+                    escape_label(&row.exec),
+                    PNL_BREAKDOWN_WINDOW_DAYS,
                     row.n_settled,
                 ));
             }
@@ -1272,6 +1340,76 @@ async fn gather_metrics_snapshot(s: &HealthAppState, now: i64) -> MetricsSnapsho
             None
         };
 
+    // Rolling N-day window over pnl_breakdown. One refresh fans
+    // out PNL_BREAKDOWN_WINDOW_DAYS list_day calls; the cache holds
+    // the already-aggregated rows so the metrics renderer doesn't
+    // re-do the sum on the hot path. Invalidated on day-roll so the
+    // window keeps anchoring on "today" across midnight.
+    let pnl_breakdown_window: Option<PnlBreakdownWindowCacheEntry> =
+        if let Some(breakdown_repo) = s.pnl_breakdown_repo.as_ref() {
+            let mut cache_guard = s.pnl_breakdown_window_cache.write().await;
+            let today_bd = bucket_day(now);
+            let cached_anchor = cache_guard.as_ref().map(|c| c.anchor_bucket_day_ms);
+            let day_rolled = cached_anchor.map(|d| d != today_bd).unwrap_or(false);
+            let need_refresh = day_rolled
+                || cache_guard
+                    .as_ref()
+                    .map(|c| now - c.fetched_at_ms > METRICS_PNL_DAILY_CACHE_TTL_MS)
+                    .unwrap_or(true);
+            if need_refresh {
+                // Fan out the N day reads and aggregate by (strategy,
+                // exec). One failed day doesn't poison the whole
+                // window — it's recorded as a note and the surviving
+                // days still feed the cache.
+                let day_ms = 86_400_000_i64;
+                let mut agg: std::collections::BTreeMap<(String, String), (f64, i32)> =
+                    std::collections::BTreeMap::new();
+                let mut any_err = false;
+                for i in 0..PNL_BREAKDOWN_WINDOW_DAYS {
+                    let bd = today_bd - i * day_ms;
+                    match breakdown_repo.list_day(bd).await {
+                        Ok(rows) => {
+                            for r in rows {
+                                let key = (r.strategy.clone(), r.exec.clone());
+                                let entry = agg.entry(key).or_insert((0.0, 0));
+                                entry.0 += r.realized_pnl;
+                                entry.1 += r.n_settled;
+                            }
+                        }
+                        Err(e) => {
+                            any_err = true;
+                            notes.push(format!(
+                                "# pnl_breakdown_window day {bd} read failed: {e}"
+                            ));
+                        }
+                    }
+                }
+                // Only update cache when *something* came back — if
+                // every read failed, fall back to the previously
+                // cached aggregate rather than blanking the panel.
+                if !(any_err && agg.is_empty() && cache_guard.is_some()) {
+                    let rows: Vec<crate::coredb::types::PnlBreakdown> = agg
+                        .into_iter()
+                        .map(|((strategy, exec), (pnl, n))| crate::coredb::types::PnlBreakdown {
+                            bucket_day_ms: today_bd,
+                            strategy,
+                            exec,
+                            realized_pnl: pnl,
+                            n_settled: n,
+                        })
+                        .collect();
+                    *cache_guard = Some(PnlBreakdownWindowCacheEntry {
+                        fetched_at_ms: now,
+                        anchor_bucket_day_ms: today_bd,
+                        rows,
+                    });
+                }
+            }
+            cache_guard.clone()
+        } else {
+            None
+        };
+
     // Positions cache refresh.
     let positions: Option<PositionsCacheEntry> =
         if let Some(position_repo) = s.position_repo_for_metrics.as_ref() {
@@ -1316,6 +1454,7 @@ async fn gather_metrics_snapshot(s: &HealthAppState, now: i64) -> MetricsSnapsho
         pnl_daily,
         pnl_breakdown,
         pnl_breakdown_yesterday,
+        pnl_breakdown_window,
         positions,
         risk: RiskLimits::default(),
         notes,
@@ -1673,6 +1812,17 @@ mod tests {
                     n_settled: 20,
                 }],
             }),
+            pnl_breakdown_window: Some(super::PnlBreakdownWindowCacheEntry {
+                fetched_at_ms: 1_700_000_009_000,
+                anchor_bucket_day_ms: 1_700_000_000_000,
+                rows: vec![PnlBreakdown {
+                    bucket_day_ms: 1_700_000_000_000,
+                    strategy: "baseline".into(),
+                    exec: "paper".into(),
+                    realized_pnl: 250.75,
+                    n_settled: 42,
+                }],
+            }),
             positions: Some(super::PositionsCacheEntry {
                 fetched_at_ms: 1_700_000_009_000,
                 rows: vec![Position {
@@ -1709,6 +1859,8 @@ mod tests {
             "agent_orders_today_total",
             "agent_pnl_breakdown_realized_usd",
             "agent_pnl_breakdown_trades_count",
+            "agent_pnl_breakdown_window_realized_usd",
+            "agent_pnl_breakdown_window_trades_count",
             "agent_pnl_breakdown_yesterday_realized_usd",
             "agent_pnl_breakdown_yesterday_trades_count",
             "agent_pnl_daily_realized_usd",
@@ -1741,6 +1893,118 @@ mod tests {
         );
     }
 
+    /// Pin the exact label shape of the rolling-window pnl_breakdown
+    /// metric — `days="7"` is part of the Grafana dashboard query
+    /// (`sum by (strategy)(agent_pnl_breakdown_window_realized_usd{days="7"})`),
+    /// so a refactor that drops or renames that label silently
+    /// breaks downstream panels. Catches the regression at
+    /// `cargo test` time.
+    #[test]
+    fn render_metrics_pnl_breakdown_window_includes_days_label() {
+        use crate::coredb::types::PnlBreakdown;
+        use std::path::PathBuf;
+
+        let snap = super::MetricsSnapshot {
+            now_ms: 1_700_000_010_000,
+            health: super::HealthState {
+                started_at_ms: 1_700_000_000_000,
+                backtest: super::SubtaskHealth::default(),
+                compare: super::SubtaskHealth::default(),
+                settle: super::SubtaskHealth::default(),
+                user_channel_present: false,
+            },
+            btc_age_ms: None,
+            polymarket_age_ms: None,
+            decisions: None,
+            orders: None,
+            pnl_daily: None,
+            pnl_breakdown: None,
+            pnl_breakdown_yesterday: None,
+            pnl_breakdown_window: Some(super::PnlBreakdownWindowCacheEntry {
+                fetched_at_ms: 1_700_000_009_000,
+                anchor_bucket_day_ms: 1_700_000_000_000,
+                rows: vec![PnlBreakdown {
+                    bucket_day_ms: 1_700_000_000_000,
+                    strategy: "deepseek".into(),
+                    exec: "live".into(),
+                    realized_pnl: -3.5,
+                    n_settled: 7,
+                }],
+            }),
+            positions: None,
+            risk: super::RiskLimits {
+                max_order_usd: 50.0,
+                kill_switch_path: PathBuf::from("/tmp/__definitely_nonexistent__"),
+            },
+            notes: Vec::new(),
+        };
+
+        let out = super::render_metrics(&snap);
+        let expected_realized = format!(
+            "agent_pnl_breakdown_window_realized_usd{{strategy=\"deepseek\",exec=\"live\",days=\"{}\"}} -3.5",
+            super::PNL_BREAKDOWN_WINDOW_DAYS,
+        );
+        let expected_count = format!(
+            "agent_pnl_breakdown_window_trades_count{{strategy=\"deepseek\",exec=\"live\",days=\"{}\"}} 7",
+            super::PNL_BREAKDOWN_WINDOW_DAYS,
+        );
+        assert!(
+            out.contains(&expected_realized),
+            "window realized line missing or mis-labelled. Got:\n{out}",
+        );
+        assert!(
+            out.contains(&expected_count),
+            "window count line missing or mis-labelled. Got:\n{out}",
+        );
+    }
+
+    /// Empty rowset → no series. Same contract as the today /
+    /// yesterday gauges: "missing = no data yet", not a zero-row
+    /// emission that Grafana would chart as a constant 0.
+    #[test]
+    fn render_metrics_pnl_breakdown_window_empty_emits_no_series() {
+        use std::path::PathBuf;
+
+        let snap = super::MetricsSnapshot {
+            now_ms: 1_700_000_010_000,
+            health: super::HealthState {
+                started_at_ms: 1_700_000_000_000,
+                backtest: super::SubtaskHealth::default(),
+                compare: super::SubtaskHealth::default(),
+                settle: super::SubtaskHealth::default(),
+                user_channel_present: false,
+            },
+            btc_age_ms: None,
+            polymarket_age_ms: None,
+            decisions: None,
+            orders: None,
+            pnl_daily: None,
+            pnl_breakdown: None,
+            pnl_breakdown_yesterday: None,
+            pnl_breakdown_window: Some(super::PnlBreakdownWindowCacheEntry {
+                fetched_at_ms: 1_700_000_009_000,
+                anchor_bucket_day_ms: 1_700_000_000_000,
+                rows: Vec::new(),
+            }),
+            positions: None,
+            risk: super::RiskLimits {
+                max_order_usd: 50.0,
+                kill_switch_path: PathBuf::from("/tmp/__definitely_nonexistent__"),
+            },
+            notes: Vec::new(),
+        };
+
+        let out = super::render_metrics(&snap);
+        assert!(
+            !out.contains("agent_pnl_breakdown_window_realized_usd"),
+            "empty window cache should not emit realized series"
+        );
+        assert!(
+            !out.contains("agent_pnl_breakdown_window_trades_count"),
+            "empty window cache should not emit count series"
+        );
+    }
+
     /// Pin the set of metric family names the daemon's /metrics
     /// endpoint emits. Catches accidental rename / removal at
     /// `cargo test` time instead of waiting for a Grafana panel
@@ -1770,6 +2034,8 @@ mod tests {
             "agent_orders_today_total",
             "agent_pnl_breakdown_realized_usd",
             "agent_pnl_breakdown_trades_count",
+            "agent_pnl_breakdown_window_realized_usd",
+            "agent_pnl_breakdown_window_trades_count",
             "agent_pnl_breakdown_yesterday_realized_usd",
             "agent_pnl_breakdown_yesterday_trades_count",
             "agent_pnl_daily_realized_usd",
