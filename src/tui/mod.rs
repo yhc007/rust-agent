@@ -1664,6 +1664,18 @@ fn build_strategy_comparison_rows(
             strategy,
         });
     }
+    // Rank order: highest 7d PnL first so the operator's eye lands
+    // on the winning strategy. Alphabetical tiebreak keeps the
+    // rendering deterministic when two strategies happen to be
+    // tied (e.g. both at $0.00 on a fresh deployment). NaN
+    // window_pnls — shouldn't happen in practice, but be defensive
+    // — sort last so they don't poison the top of the list.
+    out.sort_by(|a, b| {
+        b.window_pnl
+            .partial_cmp(&a.window_pnl)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.strategy.cmp(&b.strategy))
+    });
     out
 }
 
@@ -3254,9 +3266,96 @@ mod tests {
         assert_eq!(anthropic.yesterday_pnl, 0.0);
         assert!((anthropic.window_pnl - 10.0).abs() < 1e-9);
 
-        // Universe is unioned + sorted alphabetically.
+        // Universe is unioned. Order is 7d-desc with alphabetical
+        // tiebreak — in this fixture: anthropic (10.0) > baseline
+        // (5.0) > deepseek (0.0). Happens to coincide with
+        // alphabetical here; see `build_strategy_comparison_sorts_
+        // by_window_pnl_desc` for a fixture where the two
+        // orderings differ.
         let names: Vec<_> = rows.iter().map(|r| r.strategy.as_str()).collect();
         assert_eq!(names, vec!["anthropic", "baseline", "deepseek"]);
+    }
+
+    /// Rank order on the comparison panel is "winning strategy
+    /// first" — sort by 7d PnL descending, with alphabetical
+    /// tiebreak for determinism on ties. Pin this with a fixture
+    /// where alphabetical ordering would diverge from 7d-desc.
+    #[test]
+    fn build_strategy_comparison_sorts_by_window_pnl_desc() {
+        let mut s = super::Snapshot::default();
+        // 7d ranks: deepseek=$+100 → anthropic=$+50 → baseline=$-10
+        // Alphabetical would give: anthropic, baseline, deepseek
+        // — three distinct orderings depending on the sort key.
+        s.pnl_breakdown_window = vec![
+            super::PnlBreakdown {
+                bucket_day_ms: 0,
+                strategy: "baseline".into(),
+                exec: "paper".into(),
+                realized_pnl: -10.0,
+                n_settled: 1,
+            },
+            super::PnlBreakdown {
+                bucket_day_ms: 0,
+                strategy: "deepseek".into(),
+                exec: "paper".into(),
+                realized_pnl: 100.0,
+                n_settled: 1,
+            },
+            super::PnlBreakdown {
+                bucket_day_ms: 0,
+                strategy: "anthropic".into(),
+                exec: "paper".into(),
+                realized_pnl: 50.0,
+                n_settled: 1,
+            },
+        ];
+        let rows = super::build_strategy_comparison_rows(&s, None);
+        let names: Vec<_> = rows.iter().map(|r| r.strategy.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["deepseek", "anthropic", "baseline"],
+            "expected 7d-desc ranking; got {names:?}",
+        );
+    }
+
+    /// Tiebreak on equal 7d PnL: alphabetical. A fresh deployment
+    /// where every strategy is at $0.00 must still render
+    /// deterministically across frames (no churn from non-stable
+    /// f64 ordering).
+    #[test]
+    fn build_strategy_comparison_alphabetical_tiebreak_on_equal_window_pnl() {
+        let mut s = super::Snapshot::default();
+        // Same 7d PnL for all three; alphabetical wins the tie.
+        s.pnl_breakdown_window = vec![
+            super::PnlBreakdown {
+                bucket_day_ms: 0,
+                strategy: "deepseek".into(),
+                exec: "paper".into(),
+                realized_pnl: 5.0,
+                n_settled: 1,
+            },
+            super::PnlBreakdown {
+                bucket_day_ms: 0,
+                strategy: "anthropic".into(),
+                exec: "paper".into(),
+                realized_pnl: 5.0,
+                n_settled: 1,
+            },
+            super::PnlBreakdown {
+                bucket_day_ms: 0,
+                strategy: "baseline".into(),
+                exec: "paper".into(),
+                realized_pnl: 5.0,
+                n_settled: 1,
+            },
+        ];
+        let rows = super::build_strategy_comparison_rows(&s, None);
+        let names: Vec<_> = rows.iter().map(|r| r.strategy.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["anthropic", "baseline", "deepseek"],
+            "expected alphabetical tiebreak; got {names:?}",
+        );
     }
 
     /// End-to-end snapshot test: the panel renders with its title
