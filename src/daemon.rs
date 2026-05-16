@@ -273,9 +273,11 @@ pub async fn run(cfg: DaemonConfig) -> Result<()> {
         "daemon: ingest watchdog threshold = {}ms (0 disables)",
         stale_threshold_ms,
     );
+    let ingest_restarts = Arc::new(IngestRestartCounters::default());
     let h_binance = tokio::spawn({
         let btc_repo = btc_repo.clone();
         let shutdown_rx = shutdown_rx.clone();
+        let restart_counter = Arc::clone(&ingest_restarts);
         async move {
             supervised_ingest(
                 "binance",
@@ -301,6 +303,7 @@ pub async fn run(cfg: DaemonConfig) -> Result<()> {
                     }
                 },
                 shutdown_rx,
+                Some(Arc::clone(&restart_counter.binance)),
             )
             .await;
             Ok::<(), anyhow::Error>(())
@@ -309,6 +312,7 @@ pub async fn run(cfg: DaemonConfig) -> Result<()> {
     let h_polymarket = tokio::spawn({
         let market_repo = market_repo.clone();
         let shutdown_rx = shutdown_rx.clone();
+        let restart_counter = Arc::clone(&ingest_restarts);
         async move {
             supervised_ingest(
                 "polymarket",
@@ -336,6 +340,7 @@ pub async fn run(cfg: DaemonConfig) -> Result<()> {
                     }
                 },
                 shutdown_rx,
+                Some(Arc::clone(&restart_counter.polymarket)),
             )
             .await;
             Ok::<(), anyhow::Error>(())
@@ -483,6 +488,7 @@ pub async fn run(cfg: DaemonConfig) -> Result<()> {
             position_repo_for_metrics,
             positions_cache: Arc::new(RwLock::new(None)),
             ingest_cache: Arc::new(RwLock::new(None)),
+            ingest_restarts: Arc::clone(&ingest_restarts),
         };
         let app = Router::new()
             .route("/health", get(health_handler))
@@ -757,6 +763,25 @@ struct HealthAppState {
     /// runs both probes once and stores whatever comes back, so a
     /// concurrent scrape on the *other* endpoint reuses the work.
     ingest_cache: Arc<RwLock<Option<IngestProbeCache>>>,
+    /// Lifetime restart count per ingest source, incremented by the
+    /// `supervised_ingest` task each time it respawns its worker.
+    /// Surfaced via `agent_ingest_restarts_total{source=...}` so a
+    /// flapping worker is visible from Grafana before the next
+    /// /health poll. Counter semantics: monotonic, reset on
+    /// process restart.
+    ingest_restarts: Arc<IngestRestartCounters>,
+}
+
+/// Per-source atomic counters for the ingest supervisor. Holds two
+/// hot fields — one per ingest source — instead of a HashMap so
+/// the supervisor's increment path is one atomic op without lock
+/// contention. Stored as Arc<AtomicU64> so the supervisor can hold
+/// a strong reference for the lifetime of the spawned task while
+/// the metrics handler still reads through the parent Arc.
+#[derive(Debug, Default)]
+pub struct IngestRestartCounters {
+    pub binance: Arc<std::sync::atomic::AtomicU64>,
+    pub polymarket: Arc<std::sync::atomic::AtomicU64>,
 }
 
 async fn health_handler(State(s): State<HealthAppState>) -> Json<HealthResponse> {
@@ -900,6 +925,12 @@ pub struct MetricsSnapshot {
     /// fetched_at_ms. Used by the agent_cache_age_seconds gauge
     /// family so operators see "ingest_probe" alongside the rest.
     pub ingest_probe_age_ms: Option<i64>,
+    /// Lifetime restart counts per ingest source. Read at gather
+    /// time so render_metrics has a snapshot, not a live atomic
+    /// reference. Counter semantics → emitted as a Prometheus
+    /// `counter` (suffix `_total`).
+    pub ingest_restarts_binance: u64,
+    pub ingest_restarts_polymarket: u64,
     pub risk: RiskLimits,
     /// Operator-facing comment lines to prepend at the top of the
     /// output (e.g. "# decisions_today refresh failed; serving
@@ -1013,6 +1044,23 @@ pub fn render_metrics(s: &MetricsSnapshot) -> String {
             age_ms.max(0) / 1000,
         ));
     }
+
+    // Ingest watchdog restart counters. Monotonic across the
+    // process lifetime — Prometheus `rate()` over a window
+    // shows flapping workers. Counter (NOT gauge) so a Grafana
+    // panel using `increase()` works as expected.
+    out.push_str(
+        "# HELP agent_ingest_restarts_total Times the ingest supervisor respawned its worker due to data staleness. Monotonic, resets on process restart.\n",
+    );
+    out.push_str("# TYPE agent_ingest_restarts_total counter\n");
+    out.push_str(&format!(
+        "agent_ingest_restarts_total{{source=\"binance\"}} {}\n",
+        s.ingest_restarts_binance,
+    ));
+    out.push_str(&format!(
+        "agent_ingest_restarts_total{{source=\"polymarket\"}} {}\n",
+        s.ingest_restarts_polymarket,
+    ));
 
     out.push_str(
         "# HELP agent_user_channel_present 1 when the Polymarket user-channel WS listener was spawned at startup.\n",
@@ -1693,6 +1741,16 @@ async fn gather_metrics_snapshot(s: &HealthAppState, now: i64) -> MetricsSnapsho
         .as_ref()
         .map(|c| (now - c.fetched_at_ms).max(0));
 
+    // Restart counts — atomic snapshot. Cheap; no caching needed.
+    let ingest_restarts_binance = s
+        .ingest_restarts
+        .binance
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let ingest_restarts_polymarket = s
+        .ingest_restarts
+        .polymarket
+        .load(std::sync::atomic::Ordering::Relaxed);
+
     MetricsSnapshot {
         now_ms: now,
         health,
@@ -1706,6 +1764,8 @@ async fn gather_metrics_snapshot(s: &HealthAppState, now: i64) -> MetricsSnapsho
         pnl_breakdown_window,
         positions,
         ingest_probe_age_ms,
+        ingest_restarts_binance,
+        ingest_restarts_polymarket,
         risk: RiskLimits::default(),
         notes,
     }
@@ -1825,6 +1885,7 @@ async fn supervised_ingest<P, PFut, S>(
     mut probe: P,
     mut spawn: S,
     mut shutdown: watch::Receiver<bool>,
+    restart_counter: Option<Arc<std::sync::atomic::AtomicU64>>,
 ) where
     P: FnMut() -> PFut + Send + 'static,
     PFut: std::future::Future<Output = Option<i64>> + Send,
@@ -1882,6 +1943,9 @@ async fn supervised_ingest<P, PFut, S>(
                         let (new_tx, new_rx) = watch::channel(false);
                         worker_tx = new_tx;
                         handle = spawn(new_rx);
+                        if let Some(c) = &restart_counter {
+                            c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
                         info!("ingest supervisor {label}: worker respawned");
                     }
                 }
@@ -2226,6 +2290,8 @@ mod tests {
                 }],
             }),
             ingest_probe_age_ms: Some(1_500),
+            ingest_restarts_binance: 3,
+            ingest_restarts_polymarket: 1,
             risk: super::RiskLimits {
                 max_order_usd: 25.0,
                 kill_switch_path: PathBuf::from("/tmp/__definitely_nonexistent__"),
@@ -2244,6 +2310,7 @@ mod tests {
             "agent_decisions_today_cache_age_seconds",
             "agent_decisions_today_total",
             "agent_ingest_age_seconds",
+            "agent_ingest_restarts_total",
             "agent_open_positions_avg_price",
             "agent_open_positions_count",
             "agent_open_positions_notional_usd",
@@ -2327,6 +2394,8 @@ mod tests {
             }),
             positions: None,
             ingest_probe_age_ms: None,
+            ingest_restarts_binance: 0,
+            ingest_restarts_polymarket: 0,
             risk: super::RiskLimits {
                 max_order_usd: 50.0,
                 kill_switch_path: PathBuf::from("/tmp/__definitely_nonexistent__"),
@@ -2400,6 +2469,8 @@ mod tests {
             pnl_breakdown_window: None,
             positions: None,
             ingest_probe_age_ms: Some(2_500),
+            ingest_restarts_binance: 0,
+            ingest_restarts_polymarket: 0,
             risk: super::RiskLimits {
                 max_order_usd: 50.0,
                 kill_switch_path: PathBuf::from("/tmp/__definitely_nonexistent__"),
@@ -2434,6 +2505,55 @@ mod tests {
         );
     }
 
+    /// `agent_ingest_restarts_total` is a *counter*, not a gauge,
+    /// with one series per ingest source. Pin the exact label
+    /// shape + TYPE line so a Grafana panel using `rate()` keeps
+    /// working when the rust-agent binary churns.
+    #[test]
+    fn render_metrics_ingest_restarts_emits_counter_per_source() {
+        use std::path::PathBuf;
+        let snap = super::MetricsSnapshot {
+            now_ms: 1_700_000_010_000,
+            health: super::HealthState {
+                started_at_ms: 1_700_000_000_000,
+                backtest: super::SubtaskHealth::default(),
+                compare: super::SubtaskHealth::default(),
+                settle: super::SubtaskHealth::default(),
+                user_channel_present: false,
+            },
+            btc_age_ms: None,
+            polymarket_age_ms: None,
+            decisions: None,
+            orders: None,
+            pnl_daily: None,
+            pnl_breakdown: None,
+            pnl_breakdown_yesterday: None,
+            pnl_breakdown_window: None,
+            positions: None,
+            ingest_probe_age_ms: None,
+            ingest_restarts_binance: 7,
+            ingest_restarts_polymarket: 2,
+            risk: super::RiskLimits {
+                max_order_usd: 50.0,
+                kill_switch_path: PathBuf::from("/tmp/__definitely_nonexistent__"),
+            },
+            notes: Vec::new(),
+        };
+        let out = super::render_metrics(&snap);
+        assert!(
+            out.contains("# TYPE agent_ingest_restarts_total counter\n"),
+            "expected counter TYPE line. Got:\n{out}",
+        );
+        assert!(
+            out.contains("agent_ingest_restarts_total{source=\"binance\"} 7\n"),
+            "expected binance series with count=7. Got:\n{out}",
+        );
+        assert!(
+            out.contains("agent_ingest_restarts_total{source=\"polymarket\"} 2\n"),
+            "expected polymarket series with count=2. Got:\n{out}",
+        );
+    }
+
     /// All-None caches → no agent_cache_age_seconds series at all.
     /// Pin the TYPE line too — if the renderer ever changes to
     /// emit an empty family header, downstream tooling that grep's
@@ -2461,6 +2581,8 @@ mod tests {
             pnl_breakdown_window: None,
             positions: None,
             ingest_probe_age_ms: None,
+            ingest_restarts_binance: 0,
+            ingest_restarts_polymarket: 0,
             risk: super::RiskLimits {
                 max_order_usd: 50.0,
                 kill_switch_path: PathBuf::from("/tmp/__definitely_nonexistent__"),
@@ -2504,6 +2626,8 @@ mod tests {
             }),
             positions: None,
             ingest_probe_age_ms: None,
+            ingest_restarts_binance: 0,
+            ingest_restarts_polymarket: 0,
             risk: super::RiskLimits {
                 max_order_usd: 50.0,
                 kill_switch_path: PathBuf::from("/tmp/__definitely_nonexistent__"),
@@ -2543,6 +2667,7 @@ mod tests {
             "agent_decisions_today_cache_age_seconds",
             "agent_decisions_today_total",
             "agent_ingest_age_seconds",
+            "agent_ingest_restarts_total",
             "agent_open_positions_avg_price",
             "agent_open_positions_count",
             "agent_open_positions_notional_usd",
@@ -2574,8 +2699,14 @@ mod tests {
         // should fail without an intentional metric change.
         let src = include_str!("daemon.rs");
         for family in EXPECTED_FAMILIES {
+            // Each family declares either a `gauge` or a `counter`
+            // TYPE — accept either so adding a counter doesn't
+            // force renaming the test logic. The narrower form of
+            // this assertion would silently drop counters.
+            let is_gauge = src.contains(&format!("# TYPE {family} gauge"));
+            let is_counter = src.contains(&format!("# TYPE {family} counter"));
             assert!(
-                src.contains(&format!("# TYPE {family} gauge")),
+                is_gauge || is_counter,
                 "metric family `{family}` no longer emits a `# TYPE` line — \
                  either it was renamed (update EXPECTED_FAMILIES) or removed \
                  (audit downstream Grafana panels first)",
@@ -2668,12 +2799,17 @@ mod tests {
         // Probe always reports massive staleness.
         let probe_fn = || async { Some(1_000_000_i64) };
 
+        // Also wire a restart counter so we can assert it
+        // increments on each restart, not just rely on
+        // spawn-counting.
+        let restart_counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let supervisor = tokio::spawn(super::supervised_ingest(
             "test",
             5_000, // 5s threshold (way under the 1Ms reported)
             probe_fn,
             spawn_fn,
             shutdown_rx,
+            Some(Arc::clone(&restart_counter)),
         ));
 
         // Advance the clock past two probe ticks (60s interval +
@@ -2687,6 +2823,19 @@ mod tests {
         assert!(
             n >= 2,
             "expected supervisor to respawn at least once after staleness; got {n} spawn calls",
+        );
+        // The restart counter tracks ONLY restarts, not the initial
+        // spawn — so it should be n-1 or more. The initial spawn
+        // isn't a "restart", confirming the counter has the
+        // monotonic-after-first-spawn semantics the metric needs.
+        let restarts = restart_counter.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            restarts >= 1,
+            "expected restart_counter to fire at least once; got {restarts}",
+        );
+        assert!(
+            restarts <= n as u64,
+            "restart_counter ({restarts}) exceeded total spawn count ({n})",
         );
 
         let _ = shutdown_tx.send(true);
