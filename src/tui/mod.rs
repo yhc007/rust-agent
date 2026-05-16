@@ -1094,6 +1094,13 @@ fn draw(
             // footer + 1-row "7d total:" footer, both rendered
             // below the table's box.
             Constraint::Length(8),                  // strategy pnl + yesterday + 7d footers
+            // 6 = bordered comparison table (1 border + 1 header
+            // + up to 3 data rows + 1 border). One row per
+            // strategy: today / yesterday / 7d / agreement-rate.
+            // Consolidates the per-strategy numbers that were
+            // previously spread across the strategy-pnl trend
+            // sparkline + the two footer chip lines.
+            Constraint::Length(6),                  // strategy comparison
             Constraint::Min(5),                     // market consensus
             Constraint::Min(5),                     // positions
             Constraint::Min(7),                     // recent decisions
@@ -1103,10 +1110,11 @@ fn draw(
 
     draw_header(f, chunks[0], s, snap_age, uptime);
     draw_strategy_pnl(f, chunks[1], s, strategy_filter);
-    draw_consensus(f, chunks[2], s, strategy_filter);
-    draw_positions(f, chunks[3], s);
-    draw_decisions(f, chunks[4], s, strategy_filter);
-    draw_footer(f, chunks[5], s, strategies, strategy_filter);
+    draw_strategy_comparison(f, chunks[2], s, strategy_filter);
+    draw_consensus(f, chunks[3], s, strategy_filter);
+    draw_positions(f, chunks[4], s);
+    draw_decisions(f, chunks[5], s, strategy_filter);
+    draw_footer(f, chunks[6], s, strategies, strategy_filter);
 }
 
 fn draw_consensus(
@@ -1479,6 +1487,184 @@ fn draw_strategy_pnl(
     // the daemon's `agent_pnl_breakdown_window_realized_usd` metric.
     let window_line = render_window_pnl_footer(&s.pnl_breakdown_window, strategy_filter);
     f.render_widget(Paragraph::new(window_line), window_footer_area);
+}
+
+/// One-row-per-strategy table consolidating the per-strategy
+/// numbers that were previously spread across the strategy-pnl
+/// trend sparkline + the two footer chip lines. Columns:
+///   - strategy (with ▶ marker if filter is active)
+///   - today's Σ pnl (latest strategy_pnl_snapshot)
+///   - yesterday final (sum from pnl_breakdown_yesterday)
+///   - 7d window (sum from pnl_breakdown_window)
+///   - agree rate (mean across pairs or vs filter when active)
+///
+/// Same per-strategy aggregation rules as the footer renderers
+/// (paper + live summed within a strategy; alphabetical order for
+/// stable rendering).
+fn draw_strategy_comparison(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    s: &Snapshot,
+    strategy_filter: Option<&str>,
+) {
+    let rows_data = build_strategy_comparison_rows(s, strategy_filter);
+    let agree_header: String = match strategy_filter {
+        None => "agree (mean)".to_string(),
+        Some(name) => format!("vs {name}"),
+    };
+    let header = Row::new(vec![
+        Cell::from("strategy"),
+        Cell::from("today Σpnl"),
+        Cell::from("yesterday"),
+        Cell::from("7d total"),
+        Cell::from(agree_header),
+    ])
+    .style(Style::default().add_modifier(Modifier::BOLD));
+
+    let mut rows: Vec<Row> = Vec::new();
+    for r in &rows_data {
+        let is_active = strategy_filter == Some(r.strategy.as_str());
+        let strategy_cell = if is_active {
+            Cell::from(Span::styled(
+                format!("▶{}", r.strategy),
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ))
+        } else {
+            Cell::from(r.strategy.clone())
+        };
+        let cell_money = |v: f64| -> Cell<'static> {
+            let color = if v >= 0.0 { Color::Green } else { Color::Red };
+            Cell::from(Span::styled(
+                format!("${:+.2}", v),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ))
+        };
+        let agree_cell = match r.agree_rate {
+            Some(rate) => Cell::from(Span::styled(
+                format!("{:.0}%", rate * 100.0),
+                Style::default().fg(Color::Cyan),
+            )),
+            None => Cell::from(Span::styled(
+                "—",
+                Style::default().fg(Color::DarkGray),
+            )),
+        };
+        rows.push(Row::new(vec![
+            strategy_cell,
+            cell_money(r.today_pnl),
+            cell_money(r.yesterday_pnl),
+            cell_money(r.window_pnl),
+            agree_cell,
+        ]));
+    }
+
+    let title = if rows.is_empty() {
+        " strategy comparison (no data yet) ".to_string()
+    } else {
+        " strategy comparison ".to_string()
+    };
+    let widths = [
+        Constraint::Length(12),
+        Constraint::Length(12),
+        Constraint::Length(12),
+        Constraint::Length(12),
+        Constraint::Length(15),
+    ];
+    let table = Table::new(rows, widths)
+        .header(header)
+        .block(Block::default().borders(Borders::ALL).title(title));
+    f.render_widget(table, area);
+}
+
+/// Per-strategy aggregated row that `draw_strategy_comparison`
+/// renders. Pure function output so the table-shape contract
+/// (one row per strategy, sums folded across (paper, live) and
+/// across days, agreement averaged over the configured filter)
+/// can be unit-tested without touching ratatui.
+#[derive(Debug, Clone, PartialEq)]
+struct StrategyComparisonRow {
+    strategy: String,
+    today_pnl: f64,
+    yesterday_pnl: f64,
+    window_pnl: f64,
+    /// `None` when no agreement signal is available for this
+    /// strategy (e.g. a single-strategy run where nothing to
+    /// compare against, OR a strategy that has no rows in the
+    /// agreement window).
+    agree_rate: Option<f64>,
+}
+
+fn build_strategy_comparison_rows(
+    s: &Snapshot,
+    strategy_filter: Option<&str>,
+) -> Vec<StrategyComparisonRow> {
+    use std::collections::BTreeMap;
+
+    // Universe of strategies: union of every source's keys.
+    // Some strategies have today's snapshot but no settled
+    // trades yesterday (or vice versa); the row still shows up
+    // with $0.00 for the missing column.
+    let mut universe: std::collections::BTreeSet<String> =
+        std::collections::BTreeSet::new();
+    for snap in &s.snapshots {
+        universe.insert(snap.strategy.clone());
+    }
+    for r in &s.pnl_breakdown_yesterday {
+        universe.insert(r.strategy.clone());
+    }
+    for r in &s.pnl_breakdown_window {
+        universe.insert(r.strategy.clone());
+    }
+
+    // Today's pnl: pick the latest strategy_pnl_snapshot per
+    // strategy. Matches the strategy-pnl panel's "latest row"
+    // semantics.
+    let mut today: BTreeMap<String, (i64, f64)> = BTreeMap::new();
+    for snap in &s.snapshots {
+        let e = today.entry(snap.strategy.clone()).or_insert((i64::MIN, 0.0));
+        if snap.ts_ms > e.0 {
+            *e = (snap.ts_ms, snap.sum_pnl);
+        }
+    }
+
+    let mut yesterday: BTreeMap<String, f64> = BTreeMap::new();
+    for r in &s.pnl_breakdown_yesterday {
+        *yesterday.entry(r.strategy.clone()).or_insert(0.0) += r.realized_pnl;
+    }
+
+    let mut window: BTreeMap<String, f64> = BTreeMap::new();
+    for r in &s.pnl_breakdown_window {
+        *window.entry(r.strategy.clone()).or_insert(0.0) += r.realized_pnl;
+    }
+
+    // Agreement: mean across the configured filter (see
+    // per_strategy_agree_series_filtered — uses None = all pairs;
+    // Some(name) = pair-with-name).
+    let series = per_strategy_agree_series_filtered(&s.agreements, strategy_filter);
+    let mean_agree = |strat: &str| -> Option<f64> {
+        series.get(strat).and_then(|v| {
+            if v.is_empty() {
+                None
+            } else {
+                Some(v.iter().sum::<f64>() / v.len() as f64)
+            }
+        })
+    };
+
+    let mut out: Vec<StrategyComparisonRow> = Vec::with_capacity(universe.len());
+    for strategy in universe {
+        out.push(StrategyComparisonRow {
+            today_pnl: today.get(&strategy).map(|(_, p)| *p).unwrap_or(0.0),
+            yesterday_pnl: yesterday.get(&strategy).copied().unwrap_or(0.0),
+            window_pnl: window.get(&strategy).copied().unwrap_or(0.0),
+            agree_rate: mean_agree(&strategy),
+            strategy,
+        });
+    }
+    out
 }
 
 /// Build the one-line "Yesterday final: …" footer that lives just under
@@ -2973,6 +3159,178 @@ mod tests {
         assert!(
             dump.contains("deepseek $+5.50"),
             "expected deepseek 7d sum, got dump:\n{dump}"
+        );
+    }
+
+    /// Pure builder for the comparison panel. Universe = union
+    /// of every source's strategies; missing values default to
+    /// $0.00. Today picks the latest snapshot per strategy;
+    /// yesterday + 7d window sum across (paper, live, day) tuples.
+    #[test]
+    fn build_strategy_comparison_unions_sources_and_aggregates() {
+        use crate::coredb::types::StrategyPnlSnapshot;
+        let mut s = super::Snapshot::default();
+        s.snapshots = vec![
+            // baseline: two ts → pick the latest.
+            StrategyPnlSnapshot {
+                bucket_day_ms: 0,
+                ts_ms: 1,
+                strategy: "baseline".into(),
+                n_decisions: 0,
+                sum_size_usd: 0.0,
+                sum_pnl: 1.0,
+                n_yes: 0, n_no: 0, n_pass: 0,
+            },
+            StrategyPnlSnapshot {
+                bucket_day_ms: 0,
+                ts_ms: 5,
+                strategy: "baseline".into(),
+                n_decisions: 0,
+                sum_size_usd: 0.0,
+                sum_pnl: 12.34,
+                n_yes: 0, n_no: 0, n_pass: 0,
+            },
+            // deepseek: only in snapshots (no settled trades).
+            StrategyPnlSnapshot {
+                bucket_day_ms: 0,
+                ts_ms: 1,
+                strategy: "deepseek".into(),
+                n_decisions: 0,
+                sum_size_usd: 0.0,
+                sum_pnl: -5.0,
+                n_yes: 0, n_no: 0, n_pass: 0,
+            },
+        ];
+        s.pnl_breakdown_yesterday = vec![
+            super::PnlBreakdown {
+                bucket_day_ms: 0,
+                strategy: "baseline".into(),
+                exec: "paper".into(),
+                realized_pnl: 1.5,
+                n_settled: 1,
+            },
+            super::PnlBreakdown {
+                bucket_day_ms: 0,
+                strategy: "baseline".into(),
+                exec: "live".into(),
+                realized_pnl: 3.0,
+                n_settled: 1,
+            },
+        ];
+        s.pnl_breakdown_window = vec![
+            // anthropic: only in window (no snapshot, no yesterday).
+            super::PnlBreakdown {
+                bucket_day_ms: 0,
+                strategy: "anthropic".into(),
+                exec: "paper".into(),
+                realized_pnl: 10.0,
+                n_settled: 2,
+            },
+            super::PnlBreakdown {
+                bucket_day_ms: 0,
+                strategy: "baseline".into(),
+                exec: "paper".into(),
+                realized_pnl: 5.0,
+                n_settled: 1,
+            },
+        ];
+
+        let rows = super::build_strategy_comparison_rows(&s, None);
+        let by_name: std::collections::HashMap<_, _> =
+            rows.iter().map(|r| (r.strategy.as_str(), r)).collect();
+
+        let baseline = by_name.get("baseline").unwrap();
+        assert!((baseline.today_pnl - 12.34).abs() < 1e-9, "today picks latest ts");
+        assert!((baseline.yesterday_pnl - 4.5).abs() < 1e-9, "yesterday sums paper+live");
+        assert!((baseline.window_pnl - 5.0).abs() < 1e-9, "7d total from window");
+
+        let deepseek = by_name.get("deepseek").unwrap();
+        assert!((deepseek.today_pnl - (-5.0)).abs() < 1e-9);
+        assert_eq!(deepseek.yesterday_pnl, 0.0, "no yesterday rows → 0");
+        assert_eq!(deepseek.window_pnl, 0.0, "no window rows → 0");
+
+        let anthropic = by_name.get("anthropic").unwrap();
+        assert_eq!(anthropic.today_pnl, 0.0, "no snapshot → 0");
+        assert_eq!(anthropic.yesterday_pnl, 0.0);
+        assert!((anthropic.window_pnl - 10.0).abs() < 1e-9);
+
+        // Universe is unioned + sorted alphabetically.
+        let names: Vec<_> = rows.iter().map(|r| r.strategy.as_str()).collect();
+        assert_eq!(names, vec!["anthropic", "baseline", "deepseek"]);
+    }
+
+    /// End-to-end snapshot test: the panel renders with its title
+    /// and the per-strategy chips show today + yesterday + 7d.
+    #[test]
+    fn panel_strategy_comparison_renders_with_strategy_chips() {
+        // Use the populated yesterday + window fixture from the
+        // existing footer test so the rows have meaningful values.
+        let yesterday = vec![
+            super::PnlBreakdown {
+                bucket_day_ms: 0,
+                strategy: "baseline".into(),
+                exec: "paper".into(),
+                realized_pnl: 1.5,
+                n_settled: 1,
+            },
+            super::PnlBreakdown {
+                bucket_day_ms: 0,
+                strategy: "deepseek".into(),
+                exec: "paper".into(),
+                realized_pnl: -2.25,
+                n_settled: 1,
+            },
+        ];
+        let window = yesterday.clone();
+        let dump = render_test_dashboard_full(None, None, yesterday, window);
+        assert!(
+            dump.contains("strategy comparison"),
+            "expected comparison panel title in dump",
+        );
+        // Header columns visible.
+        for label in ["today Σpnl", "yesterday", "7d total", "agree (mean)"] {
+            assert!(
+                dump.contains(label),
+                "comparison column `{label}` missing"
+            );
+        }
+        // Per-strategy rows: each strategy from the fixture appears
+        // somewhere in the rendered dashboard. Specifically the
+        // yesterday's `baseline $+1.50` shows up in the comparison
+        // panel's `yesterday` column (formatted as `$+1.50`).
+        assert!(
+            dump.contains("$+1.50"),
+            "expected baseline yesterday value $+1.50 in dump"
+        );
+    }
+
+    /// Filter highlight: when a strategy_filter is active, that
+    /// strategy's row gets the `▶<name>` prefix in the comparison
+    /// table, AND the agree-rate column header switches to
+    /// "vs <name>".
+    #[test]
+    fn panel_strategy_comparison_filter_marker_and_header() {
+        let yesterday = vec![super::PnlBreakdown {
+            bucket_day_ms: 0,
+            strategy: "deepseek".into(),
+            exec: "paper".into(),
+            realized_pnl: 1.0,
+            n_settled: 1,
+        }];
+        let window = yesterday.clone();
+        let dump = render_test_dashboard_full(
+            Some("deepseek"),
+            None,
+            yesterday,
+            window,
+        );
+        assert!(
+            dump.contains("vs deepseek"),
+            "expected vs-deepseek header in comparison panel under filter",
+        );
+        assert!(
+            dump.contains("▶deepseek"),
+            "expected ▶deepseek row marker in comparison panel",
         );
     }
 
