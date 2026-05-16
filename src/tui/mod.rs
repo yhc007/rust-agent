@@ -1216,6 +1216,35 @@ fn ts_span_label(snapshots: &[StrategyPnlSnapshot]) -> String {
     }
 }
 
+/// Compute the change in `sum_pnl` over the trailing 24h for one
+/// strategy's ascending-by-ts_ms snapshot series. Returns `None`
+/// when no baseline snapshot lands within ±6h of `latest.ts_ms -
+/// 24h` (e.g. the daemon has been running for less than ~18h, or
+/// snapshots are sparse around that mark) — better to render an
+/// empty cell than to compute a delta against an arbitrary point.
+///
+/// The reference clock is the latest snapshot's `ts_ms`, not
+/// `Utc::now()`: that way a halted `compare-pnl` shows the most
+/// recent valid 24h delta instead of going blank, matching the
+/// "trend" sparkline's own latest-row semantics.
+///
+/// Pure function on the input slice so it's trivially testable.
+fn pnl_delta_24h(series: &[&StrategyPnlSnapshot]) -> Option<f64> {
+    let latest = series.last()?;
+    let target = latest.ts_ms - 24 * 60 * 60 * 1000;
+    let tolerance = 6 * 60 * 60 * 1000;
+    let baseline = *series
+        .iter()
+        .min_by_key(|s| (s.ts_ms - target).abs())?;
+    if (baseline.ts_ms - target).abs() > tolerance {
+        return None;
+    }
+    if baseline.ts_ms >= latest.ts_ms {
+        return None;
+    }
+    Some(latest.sum_pnl - baseline.sum_pnl)
+}
+
 /// Group today's decisions per market and classify cross-strategy
 /// agreement. Latest decision per (market, strategy) wins so a
 /// periodic daemon that emitted multiple rows doesn't double-vote.
@@ -1676,6 +1705,7 @@ fn draw_strategy_pnl(
         Cell::from("PASS"),
         Cell::from("Σ size"),
         Cell::from("Σ pnl"),
+        Cell::from("Δ24h"),
         Cell::from("pnl trend"),
         Cell::from(agree_header),
     ])
@@ -1764,6 +1794,30 @@ fn draw_strategy_pnl(
                 Cell::from(text)
             }
         };
+        // Δ24h: change in sum_pnl over the trailing 24h. Empty
+        // string when no baseline snapshot is within ±6h of
+        // latest_ts - 24h (the daemon hasn't been running long
+        // enough, or the series is too sparse around the mark).
+        // Color tracks delta sign so positives/negatives are
+        // separable from the absolute Σ pnl next to it — a
+        // strategy can have Σ pnl green and Δ24h red if it had
+        // a profitable yesterday and a losing today, and that
+        // distinction matters for the "who's winning right now"
+        // call.
+        let delta_24h = pnl_delta_24h(series);
+        let delta_text = match delta_24h {
+            Some(v) => format!("${:+.2}", v),
+            None => "—".to_string(),
+        };
+        let delta_style = if dim {
+            dim_style
+        } else {
+            match delta_24h {
+                Some(v) if v >= 0.0 => Style::default().fg(Color::Green),
+                Some(_) => Style::default().fg(Color::Red),
+                None => Style::default().fg(Color::DarkGray),
+            }
+        };
         rows.push(Row::new(vec![
             strategy_cell,
             plain(ts),
@@ -1773,6 +1827,7 @@ fn draw_strategy_pnl(
             plain(latest.n_pass.to_string()),
             plain(format!("${:.2}", latest.sum_size_usd)),
             Cell::from(Span::styled(format!("${:+.2}", latest.sum_pnl), pnl_style)),
+            Cell::from(Span::styled(delta_text, delta_style)),
             Cell::from(Span::styled(sparkline(&pnls), pnl_style)),
             Cell::from(Span::styled(sparkline(&agrees), agree_style)),
         ]));
@@ -1814,14 +1869,15 @@ fn draw_strategy_pnl(
         }
     };
     let widths = [
-        Constraint::Length(10),
-        Constraint::Length(10),
-        Constraint::Length(10),
-        Constraint::Length(5),
-        Constraint::Length(5),
-        Constraint::Length(5),
-        Constraint::Length(12),
-        Constraint::Length(12),
+        Constraint::Length(10), // strategy
+        Constraint::Length(10), // ts (UTC)
+        Constraint::Length(10), // decisions
+        Constraint::Length(5),  // YES
+        Constraint::Length(5),  // NO
+        Constraint::Length(5),  // PASS
+        Constraint::Length(12), // Σ size
+        Constraint::Length(12), // Σ pnl
+        Constraint::Length(10), // Δ24h
         Constraint::Length(SPARK_WIDTH as u16),
         Constraint::Length(AGREE_SPARK_WIDTH as u16),
     ];
@@ -3200,6 +3256,63 @@ mod tests {
     }
 
     #[test]
+    fn pnl_delta_24h_returns_change_over_24h() {
+        let day_ms = 86_400_000_i64;
+        let mut a = snap(0);
+        a.sum_pnl = 10.0;
+        let mut b = snap(day_ms);
+        b.sum_pnl = 30.0;
+        let series = vec![&a, &b];
+        let d = super::pnl_delta_24h(&series).expect("should compute");
+        assert!((d - 20.0).abs() < 1e-9, "expected +20.0, got {d}");
+    }
+
+    #[test]
+    fn pnl_delta_24h_negative_delta() {
+        let day_ms = 86_400_000_i64;
+        let mut a = snap(0);
+        a.sum_pnl = 50.0;
+        let mut b = snap(day_ms);
+        b.sum_pnl = 12.0;
+        let series = vec![&a, &b];
+        let d = super::pnl_delta_24h(&series).expect("should compute");
+        assert!((d - -38.0).abs() < 1e-9, "expected -38.0, got {d}");
+    }
+
+    #[test]
+    fn pnl_delta_24h_none_when_window_too_short() {
+        // 1h apart — no snapshot within ±6h of (latest - 24h).
+        let mut a = snap(0);
+        a.sum_pnl = 10.0;
+        let mut b = snap(3_600_000);
+        b.sum_pnl = 30.0;
+        let series = vec![&a, &b];
+        assert_eq!(super::pnl_delta_24h(&series), None);
+    }
+
+    #[test]
+    fn pnl_delta_24h_none_when_empty() {
+        assert_eq!(super::pnl_delta_24h(&[]), None);
+    }
+
+    #[test]
+    fn pnl_delta_24h_picks_closest_snapshot_within_tolerance() {
+        // Three points: 0h, 22h, 24h. Latest = 24h, target = 0h.
+        // 0h matches exactly; 22h is 2h off-target.
+        let hour = 3_600_000_i64;
+        let mut p0 = snap(0);
+        p0.sum_pnl = 5.0;
+        let mut p22 = snap(22 * hour);
+        p22.sum_pnl = 25.0;
+        let mut p24 = snap(24 * hour);
+        p24.sum_pnl = 40.0;
+        let series = vec![&p0, &p22, &p24];
+        let d = super::pnl_delta_24h(&series).expect("should compute");
+        // latest 40.0 - closest-to-target (p0 sum 5.0) = 35.0
+        assert!((d - 35.0).abs() < 1e-9, "expected +35.0, got {d}");
+    }
+
+    #[test]
     fn span_label_subday_collapses_to_today() {
         // 1 hour span — still treated as today's series.
         let rows = vec![snap(0), snap(3_600_000)];
@@ -3599,7 +3712,7 @@ mod tests {
         assert!(dump.contains("strategy pnl"), "strategy-pnl title missing");
         for label in [
             "strategy", "ts (UTC)", "decisions", "YES", "NO", "PASS",
-            "Σ size", "Σ pnl", "pnl trend", "agree",
+            "Σ size", "Σ pnl", "Δ24h", "pnl trend", "agree",
         ] {
             assert!(
                 dump.contains(label),
@@ -3632,6 +3745,74 @@ mod tests {
         assert!(
             !plain_dump.contains("vs deepseek"),
             "`vs deepseek` leaked into no-filter render"
+        );
+    }
+
+    /// Render the strategy-pnl panel in isolation with snapshots
+    /// spanning 24h and confirm Δ24h surfaces the actual delta
+    /// (latest - 24h-baseline) rather than the dash fallback.
+    #[test]
+    fn panel_strategy_pnl_delta_24h_shows_signed_delta() {
+        use crate::coredb::types::StrategyPnlSnapshot;
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let day_ms = 86_400_000_i64;
+        let now_ms = 1_700_000_000_000_i64;
+        let mut s = super::Snapshot::default();
+        s.snapshots = vec![
+            StrategyPnlSnapshot {
+                bucket_day_ms: 0,
+                ts_ms: now_ms - day_ms,
+                strategy: "baseline".into(),
+                n_decisions: 50,
+                sum_size_usd: 250.0,
+                sum_pnl: 5.0,
+                n_yes: 20,
+                n_no: 20,
+                n_pass: 10,
+            },
+            StrategyPnlSnapshot {
+                bucket_day_ms: 0,
+                ts_ms: now_ms,
+                strategy: "baseline".into(),
+                n_decisions: 100,
+                sum_size_usd: 500.0,
+                sum_pnl: 18.50,
+                n_yes: 30,
+                n_no: 30,
+                n_pass: 40,
+            },
+        ];
+        let backend = TestBackend::new(140, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                super::draw_strategy_pnl(f, f.area(), &s, None);
+            })
+            .unwrap();
+        let dump = render_buffer(terminal.backend().buffer());
+        // 18.50 - 5.00 = +13.50
+        assert!(
+            dump.contains("$+13.50"),
+            "expected Δ24h cell to show $+13.50; dump:\n{dump}"
+        );
+    }
+
+    /// With only one snapshot per strategy (the existing render
+    /// fixture), Δ24h has no baseline and falls back to "—".
+    #[test]
+    fn panel_strategy_pnl_delta_24h_dash_when_no_baseline() {
+        let dump = render_test_dashboard(None);
+        // Two strategies in the fixture (baseline + deepseek)
+        // → two Δ24h cells, each "—".
+        let dash_hits = dump.matches("—").count();
+        assert!(
+            dash_hits >= 2,
+            "expected ≥2 `—` dashes for the two Δ24h fallbacks; dump:\n{dump}"
+        );
+        assert!(
+            dump.contains("Δ24h"),
+            "Δ24h header missing"
         );
     }
 
