@@ -2396,7 +2396,15 @@ fn draw_footer(
     // shortcut so the operator can read "[1] baseline  [2] deepseek"
     // and press the matching key. The active filter (if any) is
     // bolded + colored so it's obvious which one is in effect.
+    //
+    // Dim treatment for chips: when a filter is active, unfocused
+    // chips render in DarkGray. Matches the strategy-pnl /
+    // comparison / consensus panels' filter-dim behavior so the
+    // operator's eye keeps landing on the focused chip across the
+    // whole dashboard. Filter inactive → chips render plain.
     if !strategies.is_empty() {
+        let filter_active = strategy_filter.is_some();
+        let dim_style = Style::default().fg(Color::DarkGray);
         let mut spans: Vec<Span> = vec![Span::raw(" filter: ")];
         for (i, name) in strategies.iter().enumerate().take(9) {
             let key = (b'1' + i as u8) as char;
@@ -2409,6 +2417,8 @@ fn draw_footer(
                         .bg(Color::Cyan)
                         .add_modifier(Modifier::BOLD),
                 )
+            } else if filter_active {
+                Span::styled(label, dim_style)
             } else {
                 Span::raw(label)
             };
@@ -2424,7 +2434,10 @@ fn draw_footer(
                     .add_modifier(Modifier::BOLD),
             )
         } else {
-            Span::raw(clear_label)
+            // Filter active → the "all" chip is the off state;
+            // keep it dim too, so the focused chip is the only
+            // bright one in the row.
+            Span::styled(clear_label, dim_style)
         });
         // Compact cycle-key hint at the line end — useful when N
         // strategies > 9 and the digit hotkeys can't reach all of
@@ -4683,6 +4696,112 @@ mod tests {
         assert!(dump.contains("[1] baseline"));
         assert!(dump.contains("[2] deepseek"));
         assert!(dump.contains("[0/c] all"));
+    }
+
+    /// When a filter is active, unfocused hotkey chips render in
+    /// DarkGray; the focused chip keeps its cyan-bg. Filter
+    /// inactive → chips render plain (no dim). Pin via the
+    /// buffer-walker helper introduced for the comparison-panel
+    /// dim tests.
+    #[test]
+    fn panel_footer_dims_unfocused_hotkey_chips() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        use crate::coredb::types::StrategyPnlSnapshot;
+        let mut s = super::Snapshot::default();
+        s.snapshots = vec![
+            StrategyPnlSnapshot {
+                bucket_day_ms: 0, ts_ms: 1, strategy: "baseline".into(),
+                n_decisions: 0, sum_size_usd: 0.0, sum_pnl: 0.0,
+                n_yes: 0, n_no: 0, n_pass: 0,
+            },
+            StrategyPnlSnapshot {
+                bucket_day_ms: 0, ts_ms: 1, strategy: "deepseek".into(),
+                n_decisions: 0, sum_size_usd: 0.0, sum_pnl: 0.0,
+                n_yes: 0, n_no: 0, n_pass: 0,
+            },
+        ];
+        let strategies = super::strategies_in_view(&s);
+        let prev_ranks: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        let backend = TestBackend::new(140, 50);
+        let mut terminal = Terminal::new(backend).unwrap();
+        // Filter on "deepseek" → baseline chip + [0/c] all chip
+        // should both render dim. deepseek chip keeps cyan bg.
+        terminal
+            .draw(|f| {
+                super::draw(
+                    f,
+                    &s,
+                    std::time::Duration::from_millis(0),
+                    std::time::Duration::from_secs(42),
+                    &strategies,
+                    Some("deepseek"),
+                    &prev_ranks,
+                    super::ComparisonSort::DEFAULT,
+                )
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let dump = render_buffer(buf);
+        // Unfocused chip's fg should be DarkGray.
+        let baseline_chip = sample_row_fg(buf, "[1] baseline");
+        assert!(
+            baseline_chip.contains(&Color::DarkGray),
+            "unfocused [1] baseline chip should be dimmed:\n{dump}"
+        );
+        // "[0/c] all" chip is the off-state when a filter is
+        // active; also dim.
+        let all_chip = sample_row_fg(buf, "[0/c] all");
+        assert!(
+            all_chip.contains(&Color::DarkGray),
+            "[0/c] all chip should be dimmed when filter active:\n{dump}"
+        );
+    }
+
+    /// Filter inactive: all chips render plain, no DarkGray.
+    #[test]
+    fn panel_footer_does_not_dim_chips_without_filter() {
+        let dump = render_test_dashboard(None);
+        // The "[0/c] all" chip is the active one here (no
+        // filter); its style is cyan-bg, not DarkGray. The
+        // strategy chips for baseline / deepseek are plain.
+        // Re-render with the buffer-walker to inspect fg
+        // directly.
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        use crate::coredb::types::StrategyPnlSnapshot;
+        let mut s = super::Snapshot::default();
+        s.snapshots = vec![StrategyPnlSnapshot {
+            bucket_day_ms: 0, ts_ms: 1, strategy: "baseline".into(),
+            n_decisions: 0, sum_size_usd: 0.0, sum_pnl: 0.0,
+            n_yes: 0, n_no: 0, n_pass: 0,
+        }];
+        let strategies = super::strategies_in_view(&s);
+        let prev_ranks: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        let backend = TestBackend::new(140, 50);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                super::draw(
+                    f,
+                    &s,
+                    std::time::Duration::from_millis(0),
+                    std::time::Duration::from_secs(42),
+                    &strategies,
+                    None,
+                    &prev_ranks,
+                    super::ComparisonSort::DEFAULT,
+                )
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let baseline_chip = sample_row_fg(buf, "[1] baseline");
+        assert!(
+            !baseline_chip.contains(&Color::DarkGray),
+            "without filter, [1] baseline chip should NOT be dimmed:\n{dump}"
+        );
     }
 
     /// Render a ratatui [`Buffer`] to a newline-separated string by
