@@ -784,17 +784,39 @@ struct HealthAppState {
     ingest_restarts: Arc<IngestRestartCounters>,
 }
 
+/// Per-source restart bookkeeping for the ingest supervisor. Holds
+/// a lifetime count (monotonic; resets on process restart) and the
+/// timestamp of the most recent restart (`0` when none has
+/// happened yet). The latter feeds the daemon's "recent restart"
+/// health downgrade — any restart in the last
+/// [`RECENT_RESTART_MS`] window flips `/health.status` to
+/// "degraded" so reverse-proxy probes surface a flapping worker
+/// without comparing consecutive counts themselves.
+#[derive(Debug, Default)]
+pub struct RestartTracker {
+    pub count: std::sync::atomic::AtomicU64,
+    pub last_at_ms: std::sync::atomic::AtomicI64,
+}
+
 /// Per-source atomic counters for the ingest supervisor. Holds two
 /// hot fields — one per ingest source — instead of a HashMap so
-/// the supervisor's increment path is one atomic op without lock
-/// contention. Stored as Arc<AtomicU64> so the supervisor can hold
-/// a strong reference for the lifetime of the spawned task while
-/// the metrics handler still reads through the parent Arc.
+/// the supervisor's increment path is two atomic ops without lock
+/// contention. Stored as Arc<RestartTracker> so the supervisor can
+/// hold a strong reference for the lifetime of the spawned task
+/// while the metrics + health handlers still read through the
+/// parent Arc.
 #[derive(Debug, Default)]
 pub struct IngestRestartCounters {
-    pub binance: Arc<std::sync::atomic::AtomicU64>,
-    pub polymarket: Arc<std::sync::atomic::AtomicU64>,
+    pub binance: Arc<RestartTracker>,
+    pub polymarket: Arc<RestartTracker>,
 }
+
+/// Window during which a restart event keeps daemon status
+/// degraded. 5 min is long enough that a single transient flap
+/// stays visible to a Prometheus scrape but short enough that a
+/// recovered worker reports green on the next sustained 5-min
+/// healthy stretch.
+pub const RECENT_RESTART_MS: i64 = 5 * 60 * 1000;
 
 async fn health_handler(State(s): State<HealthAppState>) -> Json<HealthResponse> {
     let now = now_ms();
@@ -815,6 +837,12 @@ pub struct HealthInputs {
     pub polymarket_age_ms: Option<i64>,
     pub cache_ages: HealthCacheAges,
     pub ingest_restarts: IngestRestartsWire,
+    /// Timestamp (ms since epoch) of the most recent supervisor
+    /// restart, across both ingest sources. `None` when no
+    /// restart has happened in this process's lifetime. Fed into
+    /// the status check so a recent flap downgrades to "degraded"
+    /// for [`RECENT_RESTART_MS`] after the event.
+    pub last_restart_at_ms: Option<i64>,
 }
 
 async fn gather_health_inputs(s: &HealthAppState, now: i64) -> HealthInputs {
@@ -876,8 +904,35 @@ async fn gather_health_inputs(s: &HealthAppState, now: i64) -> HealthInputs {
             .map(|c| (now - c.fetched_at_ms).max(0)),
     };
     let ingest_restarts = IngestRestartsWire {
-        binance: s.ingest_restarts.binance.load(std::sync::atomic::Ordering::Relaxed),
-        polymarket: s.ingest_restarts.polymarket.load(std::sync::atomic::Ordering::Relaxed),
+        binance: s
+            .ingest_restarts
+            .binance
+            .count
+            .load(std::sync::atomic::Ordering::Relaxed),
+        polymarket: s
+            .ingest_restarts
+            .polymarket
+            .count
+            .load(std::sync::atomic::Ordering::Relaxed),
+    };
+    // Most-recent restart across both sources. 0 means "no restart
+    // ever in this process's lifetime" — map to None so the status
+    // check doesn't accidentally fire on a fresh daemon.
+    let last_b = s
+        .ingest_restarts
+        .binance
+        .last_at_ms
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let last_p = s
+        .ingest_restarts
+        .polymarket
+        .last_at_ms
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let last_restart_at_ms = match (last_b, last_p) {
+        (0, 0) => None,
+        (b, 0) => Some(b),
+        (0, p) => Some(p),
+        (b, p) => Some(b.max(p)),
     };
     HealthInputs {
         now_ms: now,
@@ -886,6 +941,7 @@ async fn gather_health_inputs(s: &HealthAppState, now: i64) -> HealthInputs {
         polymarket_age_ms,
         cache_ages,
         ingest_restarts,
+        last_restart_at_ms,
     }
 }
 
@@ -930,7 +986,22 @@ pub fn compute_health_response(inp: &HealthInputs) -> HealthResponse {
         && inp.health.compare.consecutive_errors < UNHEALTHY_AFTER_ERRORS
         && inp.health.settle.consecutive_errors < UNHEALTHY_AFTER_ERRORS;
     let cache_ok = !any_cache_stale(&inp.cache_ages, STALE_CACHE_HEALTH_MS);
-    let status = if ingest_ok && periodic_ok && cache_ok {
+    // Recent ingest restart: any supervisor restart within the
+    // last RECENT_RESTART_MS keeps daemon "degraded" so a
+    // reverse-proxy probe surfaces a flapping worker without
+    // having to diff the counters itself. Clock skew tolerated
+    // by clamping the diff to non-negative; a far-future
+    // `last_restart_at_ms` (would mean a corrupt timestamp) is
+    // treated as "ok" since reading "from the future" makes
+    // less operational sense than reading "old enough to be safe".
+    let restart_ok = match inp.last_restart_at_ms {
+        None => true,
+        Some(t) => {
+            let age = inp.now_ms.saturating_sub(t);
+            age < 0 || age > RECENT_RESTART_MS
+        }
+    };
+    let status = if ingest_ok && periodic_ok && cache_ok && restart_ok {
         "ok"
     } else {
         "degraded"
@@ -1795,10 +1866,12 @@ async fn gather_metrics_snapshot(s: &HealthAppState, now: i64) -> MetricsSnapsho
     let ingest_restarts_binance = s
         .ingest_restarts
         .binance
+        .count
         .load(std::sync::atomic::Ordering::Relaxed);
     let ingest_restarts_polymarket = s
         .ingest_restarts
         .polymarket
+        .count
         .load(std::sync::atomic::Ordering::Relaxed);
 
     MetricsSnapshot {
@@ -1935,7 +2008,7 @@ async fn supervised_ingest<P, PFut, S>(
     mut probe: P,
     mut spawn: S,
     mut shutdown: watch::Receiver<bool>,
-    restart_counter: Option<Arc<std::sync::atomic::AtomicU64>>,
+    restart_tracker: Option<Arc<RestartTracker>>,
 ) where
     P: FnMut() -> PFut + Send + 'static,
     PFut: std::future::Future<Output = Option<i64>> + Send,
@@ -1993,8 +2066,10 @@ async fn supervised_ingest<P, PFut, S>(
                         let (new_tx, new_rx) = watch::channel(false);
                         worker_tx = new_tx;
                         handle = spawn(new_rx);
-                        if let Some(c) = &restart_counter {
-                            c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if let Some(t) = &restart_tracker {
+                            t.count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            t.last_at_ms
+                                .store(now_ms(), std::sync::atomic::Ordering::Relaxed);
                         }
                         info!("ingest supervisor {label}: worker respawned");
                     }
@@ -2142,6 +2217,7 @@ mod tests {
             polymarket_age_ms: Some(12_000),
             cache_ages: super::HealthCacheAges::default(),
             ingest_restarts: super::IngestRestartsWire::default(),
+            last_restart_at_ms: None,
         }
     }
 
@@ -2224,6 +2300,50 @@ mod tests {
         // not stale. Status must stay "ok".
         let mut inp = happy_inputs();
         inp.cache_ages = super::HealthCacheAges::default();
+        let r = super::compute_health_response(&inp);
+        assert_eq!(r.status, "ok");
+    }
+
+    /// A restart within the last [`RECENT_RESTART_MS`] window
+    /// keeps the daemon status at "degraded" even if every other
+    /// signal (ingest, periodic, caches) is green. Reverse-proxy
+    /// probes grep'ing the status field see the incident without
+    /// having to diff the counters themselves.
+    #[test]
+    fn health_degraded_when_restart_within_recent_window() {
+        let mut inp = happy_inputs();
+        // 2 min ago — inside the 5-min window.
+        inp.last_restart_at_ms = Some(inp.now_ms - 2 * 60 * 1000);
+        let r = super::compute_health_response(&inp);
+        assert_eq!(r.status, "degraded");
+    }
+
+    #[test]
+    fn health_ok_when_restart_older_than_recent_window() {
+        let mut inp = happy_inputs();
+        // 10 min ago — past the 5-min window.
+        inp.last_restart_at_ms = Some(inp.now_ms - 10 * 60 * 1000);
+        let r = super::compute_health_response(&inp);
+        assert_eq!(r.status, "ok");
+    }
+
+    #[test]
+    fn health_ok_when_no_restart_has_ever_happened() {
+        let mut inp = happy_inputs();
+        inp.last_restart_at_ms = None;
+        let r = super::compute_health_response(&inp);
+        assert_eq!(r.status, "ok");
+    }
+
+    #[test]
+    fn health_ok_with_far_future_restart_timestamp() {
+        // Clock skew safety: a `last_restart_at_ms` from "the
+        // future" (e.g. clock went backwards on a previous boot)
+        // would naively produce a negative age. We treat that as
+        // ok — reading "from the future" makes less operational
+        // sense than reading "old enough to be safe".
+        let mut inp = happy_inputs();
+        inp.last_restart_at_ms = Some(inp.now_ms + 10 * 60 * 1000);
         let r = super::compute_health_response(&inp);
         assert_eq!(r.status, "ok");
     }
@@ -2888,17 +3008,17 @@ mod tests {
         // Probe always reports massive staleness.
         let probe_fn = || async { Some(1_000_000_i64) };
 
-        // Also wire a restart counter so we can assert it
+        // Also wire a restart tracker so we can assert it
         // increments on each restart, not just rely on
         // spawn-counting.
-        let restart_counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let restart_tracker = Arc::new(super::RestartTracker::default());
         let supervisor = tokio::spawn(super::supervised_ingest(
             "test",
             5_000, // 5s threshold (way under the 1Ms reported)
             probe_fn,
             spawn_fn,
             shutdown_rx,
-            Some(Arc::clone(&restart_counter)),
+            Some(Arc::clone(&restart_tracker)),
         ));
 
         // Advance the clock past two probe ticks (60s interval +
@@ -2917,14 +3037,26 @@ mod tests {
         // spawn — so it should be n-1 or more. The initial spawn
         // isn't a "restart", confirming the counter has the
         // monotonic-after-first-spawn semantics the metric needs.
-        let restarts = restart_counter.load(std::sync::atomic::Ordering::Relaxed);
+        let restarts = restart_tracker
+            .count
+            .load(std::sync::atomic::Ordering::Relaxed);
         assert!(
             restarts >= 1,
-            "expected restart_counter to fire at least once; got {restarts}",
+            "expected restart_tracker to fire at least once; got {restarts}",
         );
         assert!(
             restarts <= n as u64,
-            "restart_counter ({restarts}) exceeded total spawn count ({n})",
+            "restart_tracker.count ({restarts}) exceeded total spawn count ({n})",
+        );
+        // last_at_ms must have been written too (non-zero after at
+        // least one restart). The exact value depends on the
+        // mocked clock; non-zero is the contract.
+        let last_at = restart_tracker
+            .last_at_ms
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            last_at > 0,
+            "expected restart_tracker.last_at_ms to be set after restarts; got {last_at}",
         );
 
         let _ = shutdown_tx.send(true);
