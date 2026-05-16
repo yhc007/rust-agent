@@ -32,6 +32,7 @@ use tokio::time::{interval, MissedTickBehavior};
 use tracing::{info, warn};
 
 use crate::backtest::{self, BacktestPlan};
+use crate::coredb::agreement::AgreementRepo;
 use crate::coredb::btc::BtcTickRepo;
 use crate::coredb::decisions::DecisionRepo;
 use crate::coredb::markets::MarketRepo;
@@ -483,6 +484,7 @@ pub async fn run(cfg: DaemonConfig) -> Result<()> {
             .ok()
             .map(Arc::new);
         let position_repo_for_metrics = PositionRepo::new(db.session()).await.ok().map(Arc::new);
+        let agreement_repo = AgreementRepo::new(db.session()).await.ok().map(Arc::new);
         let app_state = HealthAppState {
             health: health.clone(),
             btc_repo: btc_repo_for_health,
@@ -501,6 +503,8 @@ pub async fn run(cfg: DaemonConfig) -> Result<()> {
             positions_cache: Arc::new(RwLock::new(None)),
             ingest_cache: Arc::new(RwLock::new(None)),
             ingest_restarts: Arc::clone(&ingest_restarts),
+            agreement_repo,
+            agreement_cache: Arc::new(RwLock::new(None)),
         };
         let app = Router::new()
             .route("/health", get(health_handler))
@@ -814,6 +818,23 @@ struct HealthAppState {
     /// /health poll. Counter semantics: monotonic, reset on
     /// process restart.
     ingest_restarts: Arc<IngestRestartCounters>,
+    /// Today's agreement_snapshots, cached per scrape so the
+    /// per-pair mean-rate computation doesn't re-read CoreDB each
+    /// time. Powers the `agent_disagreement_rate{strategy_a,
+    /// strategy_b}` gauge family. Same 10s TTL as the decisions
+    /// cache since both share the compare-pnl tick cadence
+    /// (~15min by default).
+    agreement_repo: Option<Arc<AgreementRepo>>,
+    agreement_cache: Arc<RwLock<Option<AgreementCacheEntry>>>,
+}
+
+/// Cached agreement snapshots for today's bucket. Rows are kept
+/// raw so the renderer can re-compute means (cheap) or extend the
+/// emitted format later without re-fetching.
+#[derive(Debug, Clone)]
+struct AgreementCacheEntry {
+    fetched_at_ms: i64,
+    rows: Vec<crate::coredb::types::AgreementSnapshot>,
 }
 
 /// Per-source restart bookkeeping for the ingest supervisor. Holds
@@ -1132,6 +1153,10 @@ pub struct MetricsSnapshot {
     /// `counter` (suffix `_total`).
     pub ingest_restarts_binance: u64,
     pub ingest_restarts_polymarket: u64,
+    /// Today's agreement_snapshots, raw. The renderer aggregates
+    /// per-pair (strategy_a, strategy_b) into mean-disagreement
+    /// values. `None` when the agreement repo isn't wired up.
+    pub agreement: Option<AgreementCacheEntry>,
     pub risk: RiskLimits,
     /// Operator-facing comment lines to prepend at the top of the
     /// output (e.g. "# decisions_today refresh failed; serving
@@ -1520,6 +1545,33 @@ pub fn render_metrics(s: &MetricsSnapshot) -> String {
         }
     }
 
+    // Per-pair disagreement rate. For each (strategy_a,
+    // strategy_b) pair seen in today's agreement_snapshots,
+    // compute `1 - mean(rate)` across all snapshots for that
+    // pair. Mean rate captures "how often do they agree?"; we
+    // emit the inverse so the metric direction matches the family
+    // name. Empty cache or no pairs → no series (the "missing =
+    // no data yet" convention used elsewhere).
+    if let Some(cache) = s.agreement.as_ref() {
+        if !cache.rows.is_empty() {
+            let pair_rates = aggregate_disagreement_rates(&cache.rows);
+            if !pair_rates.is_empty() {
+                out.push_str(
+                    "# HELP agent_disagreement_rate Per-pair (strategy_a, strategy_b) mean disagreement rate over today's bucket. 1.0 = always disagree on shared markets, 0.0 = always agree.\n",
+                );
+                out.push_str("# TYPE agent_disagreement_rate gauge\n");
+                for ((a, b), rate) in &pair_rates {
+                    out.push_str(&format!(
+                        "agent_disagreement_rate{{strategy_a=\"{}\",strategy_b=\"{}\"}} {}\n",
+                        escape_label(a),
+                        escape_label(b),
+                        rate,
+                    ));
+                }
+            }
+        }
+    }
+
     if let Some(cache) = s.positions.as_ref() {
         if !cache.rows.is_empty() {
             out.push_str(
@@ -1897,6 +1949,43 @@ async fn gather_metrics_snapshot(s: &HealthAppState, now: i64) -> MetricsSnapsho
             None
         };
 
+    // Agreement-snapshots cache refresh. Same 10s TTL as the
+    // decisions cache — both read CoreDB rows that change at the
+    // compare-pnl tick cadence. Empty rowset on a fresh
+    // deployment is fine; the renderer just skips the family.
+    let agreement: Option<AgreementCacheEntry> = if let Some(ag_repo) = s.agreement_repo.as_ref()
+    {
+        let mut cache_guard = s.agreement_cache.write().await;
+        let need_refresh = cache_guard
+            .as_ref()
+            .map(|c| now - c.fetched_at_ms > metrics_decisions_cache_ttl_ms())
+            .unwrap_or(true);
+        if need_refresh {
+            match ag_repo.list_day(bucket_day(now)).await {
+                Ok(rows) => {
+                    *cache_guard = Some(AgreementCacheEntry {
+                        fetched_at_ms: now,
+                        rows,
+                    });
+                }
+                Err(e) => {
+                    if cache_guard.is_none() {
+                        notes.push(format!(
+                            "# agreement_snapshots read failed (no cached fallback): {e}"
+                        ));
+                    } else {
+                        notes.push(format!(
+                            "# agreement_snapshots refresh failed; serving cached data: {e}"
+                        ));
+                    }
+                }
+            }
+        }
+        cache_guard.clone()
+    } else {
+        None
+    };
+
     // Positions cache refresh.
     let positions: Option<PositionsCacheEntry> =
         if let Some(position_repo) = s.position_repo_for_metrics.as_ref() {
@@ -1969,6 +2058,7 @@ async fn gather_metrics_snapshot(s: &HealthAppState, now: i64) -> MetricsSnapsho
         ingest_probe_age_ms,
         ingest_restarts_binance,
         ingest_restarts_polymarket,
+        agreement,
         risk: RiskLimits::default(),
         notes,
     }
@@ -2032,6 +2122,35 @@ async fn ingest_ages_cached(
         cache.btc_age_ms.map(|a| a.saturating_add(age_offset)),
         cache.polymarket_age_ms.map(|a| a.saturating_add(age_offset)),
     )
+}
+
+/// Collapse today's agreement snapshots into per-pair mean
+/// disagreement rates. Pure function output (BTreeMap so order is
+/// stable) so the renderer doesn't have to think about
+/// aggregation, and tests can drive it with synthetic rows.
+///
+/// Returns an empty map when there are no snapshots — the
+/// renderer skips the family entirely in that case (matching the
+/// "missing = no data yet" convention used by the other caches).
+fn aggregate_disagreement_rates(
+    rows: &[crate::coredb::types::AgreementSnapshot],
+) -> std::collections::BTreeMap<(String, String), f64> {
+    // (a, b) → (sum_of_rates, n_samples). Mean = sum / n.
+    let mut acc: std::collections::BTreeMap<(String, String), (f64, u32)> =
+        std::collections::BTreeMap::new();
+    for r in rows {
+        let entry = acc
+            .entry((r.strategy_a.clone(), r.strategy_b.clone()))
+            .or_insert((0.0, 0));
+        entry.0 += r.rate();
+        entry.1 += 1;
+    }
+    acc.into_iter()
+        .map(|((a, b), (sum, n))| {
+            let mean_rate = if n == 0 { 0.0 } else { sum / n as f64 };
+            ((a, b), 1.0 - mean_rate)
+        })
+        .collect()
 }
 
 /// Escape a Prometheus label-value: backslash, double-quote, and
@@ -2583,6 +2702,17 @@ mod tests {
             ingest_probe_age_ms: Some(1_500),
             ingest_restarts_binance: 3,
             ingest_restarts_polymarket: 1,
+            agreement: Some(super::AgreementCacheEntry {
+                fetched_at_ms: 1_700_000_009_000,
+                rows: vec![crate::coredb::types::AgreementSnapshot {
+                    bucket_day_ms: 1_700_000_000_000,
+                    ts_ms: 1_700_000_005_000,
+                    strategy_a: "baseline".into(),
+                    strategy_b: "deepseek".into(),
+                    shared: 4,
+                    matches: 1,
+                }],
+            }),
             risk: super::RiskLimits {
                 max_order_usd: 25.0,
                 kill_switch_path: PathBuf::from("/tmp/__definitely_nonexistent__"),
@@ -2599,6 +2729,7 @@ mod tests {
             "agent_cache_age_seconds",
             "agent_decisions_today",
             "agent_decisions_today_cache_age_seconds",
+            "agent_disagreement_rate",
             "agent_decisions_today_total",
             "agent_ingest_age_seconds",
             "agent_ingest_restarts_total",
@@ -2687,6 +2818,7 @@ mod tests {
             ingest_probe_age_ms: None,
             ingest_restarts_binance: 0,
             ingest_restarts_polymarket: 0,
+            agreement: None,
             risk: super::RiskLimits {
                 max_order_usd: 50.0,
                 kill_switch_path: PathBuf::from("/tmp/__definitely_nonexistent__"),
@@ -2762,6 +2894,7 @@ mod tests {
             ingest_probe_age_ms: Some(2_500),
             ingest_restarts_binance: 0,
             ingest_restarts_polymarket: 0,
+            agreement: None,
             risk: super::RiskLimits {
                 max_order_usd: 50.0,
                 kill_switch_path: PathBuf::from("/tmp/__definitely_nonexistent__"),
@@ -2796,6 +2929,91 @@ mod tests {
         );
     }
 
+    /// Per-pair disagreement aggregation: mean rate over all
+    /// snapshots for that pair, inverted to disagreement.
+    /// Pin the math against a hand-built rowset.
+    #[test]
+    fn aggregate_disagreement_rates_means_per_pair() {
+        // Two snapshots for (baseline, deepseek):
+        //   - shared=4, matches=1 → rate 0.25 → disagreement 0.75
+        //   - shared=10, matches=5 → rate 0.5  → disagreement 0.5
+        // Mean rate = (0.25 + 0.5) / 2 = 0.375; disagreement = 0.625.
+        // One snapshot for (anthropic, baseline): shared=5,
+        // matches=5 → rate 1.0 → disagreement 0.0.
+        let rows = vec![
+            crate::coredb::types::AgreementSnapshot {
+                bucket_day_ms: 0, ts_ms: 1,
+                strategy_a: "baseline".into(), strategy_b: "deepseek".into(),
+                shared: 4, matches: 1,
+            },
+            crate::coredb::types::AgreementSnapshot {
+                bucket_day_ms: 0, ts_ms: 2,
+                strategy_a: "baseline".into(), strategy_b: "deepseek".into(),
+                shared: 10, matches: 5,
+            },
+            crate::coredb::types::AgreementSnapshot {
+                bucket_day_ms: 0, ts_ms: 1,
+                strategy_a: "anthropic".into(), strategy_b: "baseline".into(),
+                shared: 5, matches: 5,
+            },
+        ];
+        let agg = super::aggregate_disagreement_rates(&rows);
+        let bd = agg
+            .get(&("baseline".to_string(), "deepseek".to_string()))
+            .copied()
+            .expect("baseline-deepseek pair missing");
+        assert!((bd - 0.625).abs() < 1e-9, "got {bd}");
+        let ab = agg
+            .get(&("anthropic".to_string(), "baseline".to_string()))
+            .copied()
+            .expect("anthropic-baseline pair missing");
+        assert!(ab.abs() < 1e-9, "expected 0.0 disagreement, got {ab}");
+    }
+
+    /// Empty snapshot rows → empty map → renderer emits no
+    /// `agent_disagreement_rate` series (the "missing = no data
+    /// yet" convention).
+    #[test]
+    fn render_metrics_disagreement_rate_empty_emits_no_series() {
+        use std::path::PathBuf;
+        let snap = super::MetricsSnapshot {
+            now_ms: 1_700_000_010_000,
+            health: super::HealthState {
+                started_at_ms: 1_700_000_000_000,
+                backtest: super::SubtaskHealth::default(),
+                compare: super::SubtaskHealth::default(),
+                settle: super::SubtaskHealth::default(),
+                user_channel_present: false,
+            },
+            btc_age_ms: None,
+            polymarket_age_ms: None,
+            decisions: None,
+            orders: None,
+            pnl_daily: None,
+            pnl_breakdown: None,
+            pnl_breakdown_yesterday: None,
+            pnl_breakdown_window: None,
+            positions: None,
+            ingest_probe_age_ms: None,
+            ingest_restarts_binance: 0,
+            ingest_restarts_polymarket: 0,
+            agreement: Some(super::AgreementCacheEntry {
+                fetched_at_ms: 1_700_000_009_000,
+                rows: Vec::new(),
+            }),
+            risk: super::RiskLimits {
+                max_order_usd: 50.0,
+                kill_switch_path: PathBuf::from("/tmp/__definitely_nonexistent__"),
+            },
+            notes: Vec::new(),
+        };
+        let out = super::render_metrics(&snap);
+        assert!(
+            !out.contains("agent_disagreement_rate"),
+            "empty agreement cache should not emit series:\n{out}",
+        );
+    }
+
     /// `agent_ingest_restarts_total` is a *counter*, not a gauge,
     /// with one series per ingest source. Pin the exact label
     /// shape + TYPE line so a Grafana panel using `rate()` keeps
@@ -2824,6 +3042,7 @@ mod tests {
             ingest_probe_age_ms: None,
             ingest_restarts_binance: 7,
             ingest_restarts_polymarket: 2,
+            agreement: None,
             risk: super::RiskLimits {
                 max_order_usd: 50.0,
                 kill_switch_path: PathBuf::from("/tmp/__definitely_nonexistent__"),
@@ -2874,6 +3093,7 @@ mod tests {
             ingest_probe_age_ms: None,
             ingest_restarts_binance: 0,
             ingest_restarts_polymarket: 0,
+            agreement: None,
             risk: super::RiskLimits {
                 max_order_usd: 50.0,
                 kill_switch_path: PathBuf::from("/tmp/__definitely_nonexistent__"),
@@ -2919,6 +3139,7 @@ mod tests {
             ingest_probe_age_ms: None,
             ingest_restarts_binance: 0,
             ingest_restarts_polymarket: 0,
+            agreement: None,
             risk: super::RiskLimits {
                 max_order_usd: 50.0,
                 kill_switch_path: PathBuf::from("/tmp/__definitely_nonexistent__"),
@@ -2956,6 +3177,7 @@ mod tests {
             "agent_cache_age_seconds",
             "agent_decisions_today",
             "agent_decisions_today_cache_age_seconds",
+            "agent_disagreement_rate",
             "agent_decisions_today_total",
             "agent_ingest_age_seconds",
             "agent_ingest_restarts_total",
