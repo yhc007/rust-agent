@@ -149,6 +149,21 @@ pub const MIGRATIONS: &[&str] = &[
         PRIMARY KEY (bucket_day, ts, strategy) \
      )",
 
+    // ---- Per-(strategy, exec) realized PnL breakdown ----
+    // Written by settle-pnl after the strategy×exec aggregation.
+    // PK is (bucket_day, strategy, exec) — first column =
+    // partition (single-day reads cluster cleanly), rest =
+    // clustering. Within a day, each (strategy, exec) pair has
+    // at most one row; re-running settle-pnl rewrites.
+    "CREATE TABLE IF NOT EXISTS polymarket_btc.pnl_breakdown ( \
+        bucket_day   TIMESTAMP, \
+        strategy     TEXT, \
+        exec         TEXT, \
+        realized_pnl DOUBLE, \
+        n_settled    INT, \
+        PRIMARY KEY (bucket_day, strategy, exec) \
+     )",
+
     // ---- Pairwise agreement matrix snapshots ----
     // N×(N-1) rows per compare-pnl invocation (no diagonal). PK
     // matches the strategy_pnl_snapshots shape (partition on

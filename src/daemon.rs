@@ -37,6 +37,7 @@ use crate::coredb::decisions::DecisionRepo;
 use crate::coredb::markets::MarketRepo;
 use crate::coredb::orders::{OrderRepo, PositionRepo};
 use crate::coredb::pnl::PnlRepo;
+use crate::coredb::pnl_breakdown::PnlBreakdownRepo;
 use crate::coredb::types::{bucket_day, now_ms};
 use crate::coredb::CoreDb;
 use crate::data::{binance, polymarket, user_channel};
@@ -358,6 +359,10 @@ pub async fn run(cfg: DaemonConfig) -> Result<()> {
         let decision_repo = DecisionRepo::new(db.session()).await.ok().map(Arc::new);
         let order_repo = OrderRepo::new(db.session()).await.ok().map(Arc::new);
         let pnl_repo = PnlRepo::new(db.session()).await.ok().map(Arc::new);
+        let pnl_breakdown_repo = PnlBreakdownRepo::new(db.session())
+            .await
+            .ok()
+            .map(Arc::new);
         let app_state = HealthAppState {
             health: health.clone(),
             btc_repo: btc_repo_for_health,
@@ -368,6 +373,8 @@ pub async fn run(cfg: DaemonConfig) -> Result<()> {
             orders_cache: Arc::new(RwLock::new(None)),
             pnl_repo,
             pnl_daily_cache: Arc::new(RwLock::new(None)),
+            pnl_breakdown_repo,
+            pnl_breakdown_cache: Arc::new(RwLock::new(None)),
             ingest_cache: Arc::new(RwLock::new(None)),
         };
         let app = Router::new()
@@ -523,6 +530,15 @@ struct PnlDailyCacheEntry {
 /// 1h cadence in the daemon).
 const METRICS_PNL_DAILY_CACHE_TTL_MS: i64 = 60_000;
 
+/// Cached today's pnl_breakdown rows (per strategy × exec).
+/// Same TTL as pnl_daily — both are written by the same
+/// settle-pnl call.
+#[derive(Debug, Clone)]
+struct PnlBreakdownCacheEntry {
+    fetched_at_ms: i64,
+    rows: Vec<crate::coredb::types::PnlBreakdown>,
+}
+
 /// Cached pair of ingest-staleness ages. Stored as a unit (not
 /// per-source) so a transient one-source outage shows up in the
 /// next refresh as `None` rather than being masked by per-source
@@ -559,6 +575,10 @@ struct HealthAppState {
     /// gauge. settle-pnl writes here; the metrics handler reads.
     pnl_repo: Option<Arc<PnlRepo>>,
     pnl_daily_cache: Arc<RwLock<Option<PnlDailyCacheEntry>>>,
+    /// Sibling to pnl_repo: per-(strategy, exec) realized PnL.
+    /// Also written by settle-pnl, also cached with the 60s pnl TTL.
+    pnl_breakdown_repo: Option<Arc<PnlBreakdownRepo>>,
+    pnl_breakdown_cache: Arc<RwLock<Option<PnlBreakdownCacheEntry>>>,
     /// Shared cache for the two ingest-staleness probes that
     /// `/health` and `/metrics` both need. Refresh on TTL expiry
     /// runs both probes once and stores whatever comes back, so a
@@ -919,6 +939,68 @@ async fn metrics_handler(State(s): State<HealthAppState>) -> impl IntoResponse {
                     "agent_pnl_daily_trades_count {}\n",
                     row.n_trades,
                 ));
+            }
+        }
+    }
+
+    // Per-(strategy, exec) realized PnL breakdown — sibling to
+    // pnl_daily, also written by settle-pnl. Empty cache means
+    // settle-pnl hasn't run today yet or had no settled trades to
+    // break down; emit no series in that case (same convention as
+    // the pnl_daily gauges above).
+    if let Some(breakdown_repo) = s.pnl_breakdown_repo.as_ref() {
+        let mut cache_guard = s.pnl_breakdown_cache.write().await;
+        let need_refresh = cache_guard
+            .as_ref()
+            .map(|c| now - c.fetched_at_ms > METRICS_PNL_DAILY_CACHE_TTL_MS)
+            .unwrap_or(true);
+        if need_refresh {
+            match breakdown_repo.list_day(bucket_day(now)).await {
+                Ok(rows) => {
+                    *cache_guard = Some(PnlBreakdownCacheEntry {
+                        fetched_at_ms: now,
+                        rows,
+                    });
+                }
+                Err(e) => {
+                    if cache_guard.is_none() {
+                        out.push_str(&format!(
+                            "# pnl_breakdown read failed (no cached fallback): {e}\n"
+                        ));
+                    } else {
+                        out.push_str(&format!(
+                            "# pnl_breakdown refresh failed; serving cached data: {e}\n"
+                        ));
+                    }
+                }
+            }
+        }
+        if let Some(cache) = cache_guard.as_ref() {
+            if !cache.rows.is_empty() {
+                out.push_str(
+                    "# HELP agent_pnl_breakdown_realized_usd Realized PnL in USD broken down by strategy + exec. Written by settle-pnl; read-only here.\n",
+                );
+                out.push_str("# TYPE agent_pnl_breakdown_realized_usd gauge\n");
+                for row in &cache.rows {
+                    out.push_str(&format!(
+                        "agent_pnl_breakdown_realized_usd{{strategy=\"{}\",exec=\"{}\"}} {}\n",
+                        escape_label(&row.strategy),
+                        escape_label(&row.exec),
+                        row.realized_pnl,
+                    ));
+                }
+                out.push_str(
+                    "# HELP agent_pnl_breakdown_trades_count Number of settled trades in this strategy/exec bucket.\n",
+                );
+                out.push_str("# TYPE agent_pnl_breakdown_trades_count gauge\n");
+                for row in &cache.rows {
+                    out.push_str(&format!(
+                        "agent_pnl_breakdown_trades_count{{strategy=\"{}\",exec=\"{}\"}} {}\n",
+                        escape_label(&row.strategy),
+                        escape_label(&row.exec),
+                        row.n_settled,
+                    ));
+                }
             }
         }
     }

@@ -241,6 +241,23 @@ impl AgreementSnapshot {
     }
 }
 
+/// Per-(strategy, exec) realized PnL breakdown for one UTC day.
+/// Settle-pnl writes one row per (strategy, exec) pair after
+/// computing fills. exec is "paper" or "live" — derived from
+/// `Order.order_id.starts_with("paper-")`.
+///
+/// PK: (bucket_day, strategy, exec). Within a single day, every
+/// (strategy, exec) combination resolves to at most one row.
+/// Re-running settle-pnl on the same day overwrites in place.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PnlBreakdown {
+    pub bucket_day_ms: Millis,
+    pub strategy: String,
+    pub exec: String,
+    pub realized_pnl: f64,
+    pub n_settled: i32,
+}
+
 /// Daily PnL roll-up.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PnlDaily {

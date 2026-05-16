@@ -25,7 +25,8 @@ use uuid::Uuid;
 use crate::coredb::decisions::DecisionRepo;
 use crate::coredb::orders::OrderRepo;
 use crate::coredb::pnl::PnlRepo;
-use crate::coredb::types::{bucket_day, now_ms, PnlDaily};
+use crate::coredb::pnl_breakdown::PnlBreakdownRepo;
+use crate::coredb::types::{bucket_day, now_ms, PnlBreakdown, PnlDaily};
 use crate::coredb::CoreDb;
 
 pub async fn run(coredb_uri: &str, json: bool) -> Result<()> {
@@ -37,6 +38,7 @@ pub async fn run(coredb_uri: &str, json: bool) -> Result<()> {
     let order_repo = OrderRepo::new(db.session()).await?;
     let dec_repo = DecisionRepo::new(db.session()).await?;
     let pnl_repo = PnlRepo::new(db.session()).await?;
+    let breakdown_repo = PnlBreakdownRepo::new(db.session()).await?;
 
     let bd = bucket_day(now_ms());
     let orders = order_repo.list_day(bd).await.context("read orders")?;
@@ -81,6 +83,10 @@ pub async fn run(coredb_uri: &str, json: bool) -> Result<()> {
     say!("   {} resolved markets visible", resolved.len());
 
     let mut by_strategy: HashMap<String, StrategyTotal> = HashMap::new();
+    // Parallel tally with the exec dimension added. Used to write
+    // pnl_breakdown rows so Grafana can panel-split paper vs live
+    // PnL by strategy without reaching back into the orders table.
+    let mut by_strategy_exec: HashMap<(String, String), StrategyTotal> = HashMap::new();
     let mut realized_total = 0.0;
     let mut n_settled = 0i32;
     let mut n_unresolved = 0u32;
@@ -89,8 +95,18 @@ pub async fn run(coredb_uri: &str, json: bool) -> Result<()> {
             .get(&o.decision_id)
             .cloned()
             .unwrap_or_else(|| "other".to_string());
-        let agg = by_strategy.entry(strategy).or_default();
+        // Same paper/live distinguishing rule as the
+        // agent_orders_today metric — PaperExec writes
+        // `order_id: paper-{uuid}`; everything else is live.
+        let exec = if o.order_id.starts_with("paper-") {
+            "paper".to_string()
+        } else {
+            "live".to_string()
+        };
+        let agg = by_strategy.entry(strategy.clone()).or_default();
         agg.n_orders += 1;
+        let agg_be = by_strategy_exec.entry((strategy, exec)).or_default();
+        agg_be.n_orders += 1;
 
         match resolved.get(&o.market_slug) {
             Some(&yes_won) => {
@@ -102,11 +118,14 @@ pub async fn run(coredb_uri: &str, json: bool) -> Result<()> {
                 };
                 agg.realized_pnl += pnl;
                 agg.n_settled += 1;
+                agg_be.realized_pnl += pnl;
+                agg_be.n_settled += 1;
                 realized_total += pnl;
                 n_settled += 1;
             }
             None => {
                 agg.n_unresolved += 1;
+                agg_be.n_unresolved += 1;
                 n_unresolved += 1;
             }
         }
@@ -180,6 +199,41 @@ pub async fn run(coredb_uri: &str, json: bool) -> Result<()> {
         "\n   ✓ upserted polymarket_btc.pnl_daily for day {bd}: realized={:+.2}, n_trades={}",
         realized_total, n_settled
     );
+
+    // Write the per-(strategy, exec) breakdown alongside the daily
+    // total. Skip pairs that had no settled trades — there's
+    // nothing to plot for an unresolved-only bucket. Failures are
+    // logged but don't bail the run; the operator-readable output
+    // and pnl_daily upsert above have already landed.
+    let mut n_breakdown = 0u32;
+    let mut breakdown_keys: Vec<&(String, String)> = by_strategy_exec.keys().collect();
+    breakdown_keys.sort();
+    for key in breakdown_keys {
+        let t = &by_strategy_exec[key];
+        if t.n_settled == 0 {
+            continue;
+        }
+        let b = PnlBreakdown {
+            bucket_day_ms: bd,
+            strategy: key.0.clone(),
+            exec: key.1.clone(),
+            realized_pnl: t.realized_pnl,
+            n_settled: t.n_settled as i32,
+        };
+        if let Err(e) = breakdown_repo.upsert(&b).await {
+            eprintln!(
+                "  ! pnl_breakdown upsert failed for ({}, {}): {e}",
+                b.strategy, b.exec
+            );
+        } else {
+            n_breakdown += 1;
+        }
+    }
+    if n_breakdown > 0 {
+        say!(
+            "   ✓ upserted {n_breakdown} pnl_breakdown row(s) for day {bd}"
+        );
+    }
 
     if json {
         print_json_payload(build_json_payload(

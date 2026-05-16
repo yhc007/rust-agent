@@ -12,6 +12,7 @@ pub mod markets;
 pub mod orderbook;
 pub mod orders;
 pub mod pnl;
+pub mod pnl_breakdown;
 pub mod schema;
 pub mod strategy_pnl;
 pub mod types;
@@ -59,6 +60,7 @@ impl CoreDb {
         "orders",
         "positions_v2",
         "pnl_daily",
+        "pnl_breakdown",
         "strategy_pnl_snapshots",
         "agreement_snapshots",
     ];
