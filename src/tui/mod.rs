@@ -1397,11 +1397,23 @@ fn draw_consensus(
             // active_picks because that's the difference between
             // "solo opinion vs. nobody else looked" and "solo
             // opinion vs. everyone else explicitly stayed out".
+            //
+            // Dim treatment: when a filter is active and the
+            // focused strategy isn't in active_picks for this
+            // market, the row renders in DarkGray. Same idea as
+            // the strategy comparison panel — the operator's eye
+            // lands on the focused-strategy markets, with the
+            // others fading into background.
+            let dim = match strategy_filter {
+                Some(name) => !c.active_picks.contains_key(name),
+                None => false,
+            };
             let mut spans: Vec<Span> = Vec::new();
             let highlight = Style::default()
                 .fg(Color::Black)
                 .bg(Color::Cyan)
                 .add_modifier(Modifier::BOLD);
+            let dim_style = Style::default().fg(Color::DarkGray);
             let mut first = true;
             for (strat, side) in &c.active_picks {
                 if !first {
@@ -1411,6 +1423,8 @@ fn draw_consensus(
                 let label = format!("{strat}={side}");
                 if strategy_filter == Some(strat.as_str()) {
                     spans.push(Span::styled(label, highlight));
+                } else if dim {
+                    spans.push(Span::styled(label, dim_style));
                 } else {
                     spans.push(Span::raw(label));
                 }
@@ -1419,17 +1433,39 @@ fn draw_consensus(
                 if !first {
                     spans.push(Span::raw("  "));
                 }
-                spans.push(Span::raw(format!("(+{} PASS)", c.pass_strategies)));
+                let pass_label = format!("(+{} PASS)", c.pass_strategies);
+                if dim {
+                    spans.push(Span::styled(pass_label, dim_style));
+                } else {
+                    spans.push(Span::raw(pass_label));
+                }
             }
-            let agree_cell = Span::styled(
-                c.agreement.short_label(),
-                Style::default().fg(c.agreement.color()).add_modifier(Modifier::BOLD),
-            );
+            let agree_cell = if dim {
+                Span::styled(c.agreement.short_label(), dim_style)
+            } else {
+                Span::styled(
+                    c.agreement.short_label(),
+                    Style::default().fg(c.agreement.color()).add_modifier(Modifier::BOLD),
+                )
+            };
+            let market_cell = if dim {
+                Cell::from(Span::styled(c.market_slug.clone(), dim_style))
+            } else {
+                Cell::from(c.market_slug.clone())
+            };
+            let size_cell = if dim {
+                Cell::from(Span::styled(
+                    format!("${:.2}", c.sum_size_usd),
+                    dim_style,
+                ))
+            } else {
+                Cell::from(format!("${:.2}", c.sum_size_usd))
+            };
             Row::new(vec![
-                Cell::from(c.market_slug.clone()),
+                market_cell,
                 Cell::from(agree_cell),
                 Cell::from(Line::from(spans)),
-                Cell::from(format!("${:.2}", c.sum_size_usd)),
+                size_cell,
             ])
         })
         .collect();
@@ -4306,6 +4342,78 @@ mod tests {
             }
         }
         out
+    }
+
+    /// Consensus panel applies the same dim treatment as the
+    /// comparison panel: markets where the focused strategy
+    /// doesn't participate (not in active_picks) render in
+    /// DarkGray. Markets WHERE the focused strategy participates
+    /// keep their full colors. Filter inactive → no dimming.
+    #[test]
+    fn panel_consensus_dims_unfocused_markets() {
+        use crate::coredb::types::Decision;
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        use uuid::Uuid;
+        // Two markets:
+        //   "btc-100k": baseline=YES, deepseek=YES  → both strategies
+        //   "btc-200k": deepseek=YES only           → no baseline
+        // Filter on "baseline" → btc-200k unfocused → DarkGray.
+        let mk = |slug: &str, strat: &str, side: &str, ts: i64| Decision {
+            bucket_day_ms: 0,
+            ts_ms: ts,
+            decision_id: Uuid::nil(),
+            market_slug: slug.into(),
+            side: side.into(),
+            size_usd: 1.0,
+            confidence: 0.0,
+            edge_bps: 0,
+            reasoning: String::new(),
+            raw_response: String::new(),
+            entry_price: 0.5,
+            strategy: strat.into(),
+        };
+        let mut s = super::Snapshot::default();
+        s.decisions = vec![
+            mk("btc-100k", "baseline", "YES", 1),
+            mk("btc-100k", "deepseek", "YES", 1),
+            mk("btc-200k", "deepseek", "YES", 1),
+        ];
+        s.consensus = super::build_consensus(&s.decisions);
+        let strategies = super::strategies_in_view(&s);
+        let prev_ranks: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        let backend = TestBackend::new(140, 50);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                super::draw(
+                    f,
+                    &s,
+                    std::time::Duration::from_millis(0),
+                    std::time::Duration::from_secs(42),
+                    &strategies,
+                    Some("baseline"), // ← focused strategy
+                    &prev_ranks,
+                    super::ComparisonSort::DEFAULT,
+                )
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let dump = render_buffer(buf);
+        // btc-200k row: baseline isn't in active_picks → dim.
+        // The market slug cell should carry DarkGray fg.
+        let dimmed = sample_row_fg(buf, "btc-200k");
+        assert!(
+            dimmed.contains(&Color::DarkGray),
+            "btc-200k row should be dimmed (baseline absent):\n{dump}"
+        );
+        // btc-100k row: baseline IS in active_picks → not dim.
+        let focused = sample_row_fg(buf, "btc-100k");
+        assert!(
+            !focused.contains(&Color::DarkGray),
+            "btc-100k row should NOT be dimmed (baseline present):\n{dump}"
+        );
     }
 
     /// No filter → no dimming. Every row keeps its natural color
