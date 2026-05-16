@@ -798,6 +798,12 @@ pub struct MetricsSnapshot {
     pub pnl_breakdown_yesterday: Option<PnlBreakdownCacheEntry>,
     pub pnl_breakdown_window: Option<PnlBreakdownWindowCacheEntry>,
     pub positions: Option<PositionsCacheEntry>,
+    /// Age (ms) of the shared ingest_probe cache. Stored separately
+    /// from the per-cache slots above because the ingest probe
+    /// itself doesn't surface its rows here — only its
+    /// fetched_at_ms. Used by the agent_cache_age_seconds gauge
+    /// family so operators see "ingest_probe" alongside the rest.
+    pub ingest_probe_age_ms: Option<i64>,
     pub risk: RiskLimits,
     /// Operator-facing comment lines to prepend at the top of the
     /// output (e.g. "# decisions_today refresh failed; serving
@@ -920,6 +926,62 @@ pub fn render_metrics(s: &MetricsSnapshot) -> String {
         "agent_user_channel_present {}\n",
         if snap.user_channel_present { 1 } else { 0 },
     ));
+
+    // Unified per-slot cache freshness gauge. Mirrors the
+    // `cache_ages_ms` sub-object on /health so Grafana can chart
+    // every cache's TTL behavior on one panel. A slot whose cache
+    // was never populated (None) emits no series — same "missing =
+    // no data yet" convention as the rest of the metrics output.
+    let cache_age_slots: [(&str, Option<i64>); 8] = [
+        (
+            "decisions",
+            s.decisions.as_ref().map(|c| (now - c.fetched_at_ms).max(0)),
+        ),
+        (
+            "orders",
+            s.orders.as_ref().map(|c| (now - c.fetched_at_ms).max(0)),
+        ),
+        (
+            "pnl_daily",
+            s.pnl_daily.as_ref().map(|c| (now - c.fetched_at_ms).max(0)),
+        ),
+        (
+            "pnl_breakdown",
+            s.pnl_breakdown.as_ref().map(|c| (now - c.fetched_at_ms).max(0)),
+        ),
+        (
+            "pnl_breakdown_yesterday",
+            s.pnl_breakdown_yesterday
+                .as_ref()
+                .map(|c| (now - c.fetched_at_ms).max(0)),
+        ),
+        (
+            "pnl_breakdown_window",
+            s.pnl_breakdown_window
+                .as_ref()
+                .map(|c| (now - c.fetched_at_ms).max(0)),
+        ),
+        (
+            "positions",
+            s.positions.as_ref().map(|c| (now - c.fetched_at_ms).max(0)),
+        ),
+        ("ingest_probe", s.ingest_probe_age_ms),
+    ];
+    let any_cache_populated = cache_age_slots.iter().any(|(_, age)| age.is_some());
+    if any_cache_populated {
+        out.push_str(
+            "# HELP agent_cache_age_seconds Age (s) of each per-cache slot since its last refresh. One series per slot in /health's cache_ages_ms.\n",
+        );
+        out.push_str("# TYPE agent_cache_age_seconds gauge\n");
+        for (slot, age) in cache_age_slots.iter() {
+            if let Some(a) = age {
+                out.push_str(&format!(
+                    "agent_cache_age_seconds{{slot=\"{slot}\"}} {}\n",
+                    a / 1000,
+                ));
+            }
+        }
+    }
 
     if let Some(cache) = s.decisions.as_ref() {
         let cache_age_secs = (now - cache.fetched_at_ms).max(0) / 1000;
@@ -1524,6 +1586,17 @@ async fn gather_metrics_snapshot(s: &HealthAppState, now: i64) -> MetricsSnapsho
             None
         };
 
+    // Ingest probe cache age: read fetched_at_ms separately so the
+    // agent_cache_age_seconds{slot="ingest_probe"} gauge has the
+    // same shape as the other slots. The probe rows themselves
+    // (btc_age_ms / polymarket_age_ms) are already in scope above.
+    let ingest_probe_age_ms = s
+        .ingest_cache
+        .read()
+        .await
+        .as_ref()
+        .map(|c| (now - c.fetched_at_ms).max(0));
+
     MetricsSnapshot {
         now_ms: now,
         health,
@@ -1536,6 +1609,7 @@ async fn gather_metrics_snapshot(s: &HealthAppState, now: i64) -> MetricsSnapsho
         pnl_breakdown_yesterday,
         pnl_breakdown_window,
         positions,
+        ingest_probe_age_ms,
         risk: RiskLimits::default(),
         notes,
     }
@@ -1971,6 +2045,7 @@ mod tests {
                     updated_at_ms: 1_700_000_005_000,
                 }],
             }),
+            ingest_probe_age_ms: Some(1_500),
             risk: super::RiskLimits {
                 max_order_usd: 25.0,
                 kill_switch_path: PathBuf::from("/tmp/__definitely_nonexistent__"),
@@ -1984,6 +2059,7 @@ mod tests {
         // an actual `agent_<name>` sample line, not just a TYPE
         // header. Stronger guarantee than the grep test below.
         const EXPECTED_FAMILIES: &[&str] = &[
+            "agent_cache_age_seconds",
             "agent_decisions_today",
             "agent_decisions_today_cache_age_seconds",
             "agent_decisions_today_total",
@@ -2070,6 +2146,7 @@ mod tests {
                 }],
             }),
             positions: None,
+            ingest_probe_age_ms: None,
             risk: super::RiskLimits {
                 max_order_usd: 50.0,
                 kill_switch_path: PathBuf::from("/tmp/__definitely_nonexistent__"),
@@ -2093,6 +2170,127 @@ mod tests {
         assert!(
             out.contains(&expected_count),
             "window count line missing or mis-labelled. Got:\n{out}",
+        );
+    }
+
+    /// `agent_cache_age_seconds{slot="..."}` emits one series per
+    /// populated cache. Pin the exact label name + units (the
+    /// metric is in *seconds*, not ms — fetched_at_ms is divided
+    /// by 1000 on the way out). Tested against a partially-
+    /// populated snapshot: decisions + ingest_probe present, the
+    /// rest missing.
+    #[test]
+    fn render_metrics_cache_age_seconds_emits_per_slot() {
+        use crate::coredb::types::PnlDaily;
+        use std::collections::BTreeMap;
+        use std::path::PathBuf;
+
+        let mut decisions_counts = BTreeMap::new();
+        decisions_counts.insert(("baseline".to_string(), "YES".to_string()), 1);
+        let snap = super::MetricsSnapshot {
+            now_ms: 1_700_000_010_000,
+            health: super::HealthState {
+                started_at_ms: 1_700_000_000_000,
+                backtest: super::SubtaskHealth::default(),
+                compare: super::SubtaskHealth::default(),
+                settle: super::SubtaskHealth::default(),
+                user_channel_present: false,
+            },
+            btc_age_ms: None,
+            polymarket_age_ms: None,
+            decisions: Some(super::DecisionsCacheEntry {
+                // 7s old: 1_700_000_010_000 - 1_700_000_003_000.
+                fetched_at_ms: 1_700_000_003_000,
+                counts: decisions_counts,
+            }),
+            orders: None,
+            pnl_daily: Some(super::PnlDailyCacheEntry {
+                // 17s old.
+                fetched_at_ms: 1_699_999_993_000,
+                row: Some(PnlDaily {
+                    day_ms: 1_700_000_000_000,
+                    realized: 0.0,
+                    unrealized: 0.0,
+                    n_trades: 0,
+                    llm_cost_usd: 0.0,
+                }),
+            }),
+            pnl_breakdown: None,
+            pnl_breakdown_yesterday: None,
+            pnl_breakdown_window: None,
+            positions: None,
+            ingest_probe_age_ms: Some(2_500),
+            risk: super::RiskLimits {
+                max_order_usd: 50.0,
+                kill_switch_path: PathBuf::from("/tmp/__definitely_nonexistent__"),
+            },
+            notes: Vec::new(),
+        };
+
+        let out = super::render_metrics(&snap);
+        // Populated slots: exact label + value (ms → s).
+        assert!(
+            out.contains("agent_cache_age_seconds{slot=\"decisions\"} 7"),
+            "decisions slot missing or wrong age. Got:\n{out}"
+        );
+        assert!(
+            out.contains("agent_cache_age_seconds{slot=\"pnl_daily\"} 17"),
+            "pnl_daily slot missing or wrong age. Got:\n{out}"
+        );
+        assert!(
+            out.contains("agent_cache_age_seconds{slot=\"ingest_probe\"} 2"),
+            "ingest_probe slot missing or wrong age (2500ms→2s). Got:\n{out}"
+        );
+        // Missing slots: no series emitted ("missing = no data yet"
+        // contract). Specifically check orders since the rest of
+        // the suite already pins this for the other slots.
+        assert!(
+            !out.contains("agent_cache_age_seconds{slot=\"orders\"}"),
+            "orders slot should not emit when cache is None"
+        );
+        assert!(
+            !out.contains("agent_cache_age_seconds{slot=\"positions\"}"),
+            "positions slot should not emit when cache is None"
+        );
+    }
+
+    /// All-None caches → no agent_cache_age_seconds series at all.
+    /// Pin the TYPE line too — if the renderer ever changes to
+    /// emit an empty family header, downstream tooling that grep's
+    /// for the TYPE line would silently start treating the
+    /// non-existent series as zero.
+    #[test]
+    fn render_metrics_cache_age_seconds_empty_emits_no_family() {
+        use std::path::PathBuf;
+        let snap = super::MetricsSnapshot {
+            now_ms: 1_700_000_010_000,
+            health: super::HealthState {
+                started_at_ms: 1_700_000_000_000,
+                backtest: super::SubtaskHealth::default(),
+                compare: super::SubtaskHealth::default(),
+                settle: super::SubtaskHealth::default(),
+                user_channel_present: false,
+            },
+            btc_age_ms: None,
+            polymarket_age_ms: None,
+            decisions: None,
+            orders: None,
+            pnl_daily: None,
+            pnl_breakdown: None,
+            pnl_breakdown_yesterday: None,
+            pnl_breakdown_window: None,
+            positions: None,
+            ingest_probe_age_ms: None,
+            risk: super::RiskLimits {
+                max_order_usd: 50.0,
+                kill_switch_path: PathBuf::from("/tmp/__definitely_nonexistent__"),
+            },
+            notes: Vec::new(),
+        };
+        let out = super::render_metrics(&snap);
+        assert!(
+            !out.contains("agent_cache_age_seconds"),
+            "no cache_age family should emit when every slot is None"
         );
     }
 
@@ -2125,6 +2323,7 @@ mod tests {
                 rows: Vec::new(),
             }),
             positions: None,
+            ingest_probe_age_ms: None,
             risk: super::RiskLimits {
                 max_order_usd: 50.0,
                 kill_switch_path: PathBuf::from("/tmp/__definitely_nonexistent__"),
@@ -2159,6 +2358,7 @@ mod tests {
         // `# TYPE <name> <type>` line for. Sorted for diff
         // readability when adding new entries.
         const EXPECTED_FAMILIES: &[&str] = &[
+            "agent_cache_age_seconds",
             "agent_decisions_today",
             "agent_decisions_today_cache_age_seconds",
             "agent_decisions_today_total",
