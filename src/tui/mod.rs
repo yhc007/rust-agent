@@ -465,6 +465,8 @@ struct HealthCacheAgesWire {
     positions: Option<i64>,
     #[serde(default)]
     ingest_probe: Option<i64>,
+    #[serde(default)]
+    strategy_pnl: Option<i64>,
 }
 
 #[derive(Debug, Default, serde::Deserialize)]
@@ -794,7 +796,7 @@ const STALE_CACHE_HINT_MS: i64 = 10 * 60 * 1000;
 /// Pure helper so the threshold logic + label formatting are
 /// unit-testable without spinning up a /health server.
 fn stalest_cache_hint(ages: &HealthCacheAgesWire) -> Option<String> {
-    let slots: [(&str, Option<i64>); 8] = [
+    let slots: [(&str, Option<i64>); 9] = [
         ("decisions", ages.decisions),
         ("orders", ages.orders),
         ("pnl_daily", ages.pnl_daily),
@@ -803,6 +805,7 @@ fn stalest_cache_hint(ages: &HealthCacheAgesWire) -> Option<String> {
         ("pnl_breakdown_window", ages.pnl_breakdown_window),
         ("positions", ages.positions),
         ("ingest_probe", ages.ingest_probe),
+        ("strategy_pnl", ages.strategy_pnl),
     ];
     let (name, age) = slots
         .iter()
@@ -2937,6 +2940,7 @@ mod tests {
             pnl_breakdown_window: Some(45_000),
             positions: Some(2_000),
             ingest_probe: Some(100),
+            strategy_pnl: Some(75_000),
         };
         assert!(super::stalest_cache_hint(&ages).is_none());
     }
@@ -2954,6 +2958,7 @@ mod tests {
             pnl_breakdown_window: Some(12 * 60 * 1000),
             positions: None,
             ingest_probe: Some(100),
+            strategy_pnl: None,
         };
         let hint = super::stalest_cache_hint(&ages).unwrap();
         assert!(
@@ -2969,6 +2974,36 @@ mod tests {
         // sees this via empty-row dashboard state).
         let ages = super::HealthCacheAgesWire::default();
         assert!(super::stalest_cache_hint(&ages).is_none());
+    }
+
+    /// The strategy_pnl slot must participate in the stalest-cache
+    /// hint just like every other cache — without this the new
+    /// Δ24h gauge could go stale silently (compare-pnl halted,
+    /// snapshots > 24h old) and the dashboard chip would stay
+    /// green. Pin the slot name as the hint's first token.
+    #[test]
+    fn stalest_cache_hint_recognises_strategy_pnl_slot() {
+        let ages = super::HealthCacheAgesWire {
+            decisions: Some(1_000),
+            orders: None,
+            pnl_daily: None,
+            pnl_breakdown: None,
+            pnl_breakdown_yesterday: None,
+            pnl_breakdown_window: None,
+            positions: None,
+            ingest_probe: None,
+            // 20 min — well over the 10-min threshold.
+            strategy_pnl: Some(20 * 60 * 1000),
+        };
+        let hint = super::stalest_cache_hint(&ages).unwrap();
+        assert!(
+            hint.starts_with("stale: strategy_pnl"),
+            "expected strategy_pnl as the stalest slot, got: {hint}",
+        );
+        assert!(
+            hint.contains("1200s"),
+            "expected age in seconds, got: {hint}",
+        );
     }
 
     /// Persistence round-trip: write state to a temp path, read

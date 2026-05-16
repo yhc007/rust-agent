@@ -198,6 +198,15 @@ pub struct HealthCacheAges {
     pub pnl_breakdown_window: Option<i64>,
     pub positions: Option<i64>,
     pub ingest_probe: Option<i64>,
+    /// Age of the `strategy_pnl_cache` slot — populated by the
+    /// metrics handler's Δ24h pipeline. Surfaces here so the
+    /// stalest-cache chip on the dashboard and the
+    /// agent_cache_age_seconds gauge family pick it up alongside
+    /// every other cache, and so an alert on
+    /// `agent_pnl_delta_24h_usd` can be cross-checked against a
+    /// freshness signal (a halted compare-pnl → delta stays
+    /// frozen, but this age keeps ticking up).
+    pub strategy_pnl: Option<i64>,
 }
 
 const UNHEALTHY_AFTER_ERRORS: u32 = 3;
@@ -1052,6 +1061,12 @@ async fn gather_health_inputs(s: &HealthAppState, now: i64) -> HealthInputs {
             .await
             .as_ref()
             .map(|c| (now - c.fetched_at_ms).max(0)),
+        strategy_pnl: s
+            .strategy_pnl_cache
+            .read()
+            .await
+            .as_ref()
+            .map(|c| (now - c.fetched_at_ms).max(0)),
     };
     let ingest_restarts = IngestRestartsWire {
         binance: s
@@ -1140,6 +1155,7 @@ fn any_cache_stale(ages: &HealthCacheAges, threshold_ms: i64) -> bool {
         ages.pnl_breakdown_window,
         ages.positions,
         ages.ingest_probe,
+        ages.strategy_pnl,
     ]
     .into_iter()
     .filter_map(|a| a)
@@ -1386,7 +1402,7 @@ pub fn render_metrics(s: &MetricsSnapshot) -> String {
     // every cache's TTL behavior on one panel. A slot whose cache
     // was never populated (None) emits no series — same "missing =
     // no data yet" convention as the rest of the metrics output.
-    let cache_age_slots: [(&str, Option<i64>); 8] = [
+    let cache_age_slots: [(&str, Option<i64>); 9] = [
         (
             "decisions",
             s.decisions.as_ref().map(|c| (now - c.fetched_at_ms).max(0)),
@@ -1420,6 +1436,10 @@ pub fn render_metrics(s: &MetricsSnapshot) -> String {
             s.positions.as_ref().map(|c| (now - c.fetched_at_ms).max(0)),
         ),
         ("ingest_probe", s.ingest_probe_age_ms),
+        (
+            "strategy_pnl",
+            s.strategy_pnl.as_ref().map(|c| (now - c.fetched_at_ms).max(0)),
+        ),
     ];
     let any_cache_populated = cache_age_slots.iter().any(|(_, age)| age.is_some());
     if any_cache_populated {
@@ -2818,6 +2838,7 @@ mod tests {
             pnl_breakdown_window: Some(60_000),
             positions: Some(800),
             ingest_probe: Some(100),
+            strategy_pnl: Some(42_000),
         };
         let r = super::compute_health_response(&inp);
         assert_eq!(r.cache_ages_ms.decisions, Some(1_234));
@@ -2828,6 +2849,7 @@ mod tests {
         assert_eq!(r.cache_ages_ms.pnl_breakdown_window, Some(60_000));
         assert_eq!(r.cache_ages_ms.positions, Some(800));
         assert_eq!(r.cache_ages_ms.ingest_probe, Some(100));
+        assert_eq!(r.cache_ages_ms.strategy_pnl, Some(42_000));
 
         // JSON shape pin: dashboard depends on the exact field
         // names + None → null mapping. Build the JSON via the
@@ -2839,6 +2861,7 @@ mod tests {
         assert_eq!(ages["pnl_daily"], serde_json::Value::Null);
         assert_eq!(ages["pnl_breakdown_window"], 60_000);
         assert_eq!(ages["ingest_probe"], 100);
+        assert_eq!(ages["strategy_pnl"], 42_000);
     }
 
     /// Status does NOT factor in cache_ages that are within the
