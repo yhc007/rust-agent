@@ -1554,10 +1554,23 @@ fn draw_header(
                 .add_modifier(Modifier::BOLD),
         ));
         if let Some(uptime) = chip.daemon_uptime_secs {
-            first_line.push(Span::raw(format!(
+            // Dim the uptime suffix when the chip itself is
+            // yellow/red. Without this, the bright white "up Xh"
+            // label sits right next to the warning chip and
+            // competes for attention; dim'd, the operator's eye
+            // lands on the chip's color first. Healthy (green)
+            // chip → uptime stays plain bright text.
+            let uptime_text = format!(
                 " up {}",
                 fmt_dur(Duration::from_secs(uptime.max(0) as u64))
-            )));
+            );
+            let uptime_span = match chip.status {
+                HealthStatus::Ok => Span::raw(uptime_text),
+                HealthStatus::Degraded | HealthStatus::Unreachable => {
+                    Span::styled(uptime_text, Style::default().fg(Color::DarkGray))
+                }
+            };
+            first_line.push(uptime_span);
         }
     }
 
@@ -4968,6 +4981,85 @@ mod tests {
     }
 
     #[test]
+    /// Health chip color drives the uptime suffix's brightness.
+    /// On Degraded/Unreachable the uptime fades to DarkGray so
+    /// the chip color stays the focal point; on Ok the uptime
+    /// stays plain bright. Pin both branches against the
+    /// rendered buffer's per-cell fg color.
+    #[test]
+    fn panel_header_uptime_dims_on_degraded() {
+        let fg = render_and_sample_header_uptime(super::HealthStatus::Degraded, 3_600, "up 1h00m00s");
+        assert!(
+            fg.contains(&Color::DarkGray),
+            "degraded chip should dim uptime to DarkGray; got fgs: {:?}",
+            fg,
+        );
+    }
+
+    /// Healthy chip keeps the uptime bright. DarkGray must NOT
+    /// appear in the `up Xs` cells.
+    #[test]
+    fn panel_header_uptime_bright_on_ok() {
+        let fg = render_and_sample_header_uptime(super::HealthStatus::Ok, 125, "up 2m05s");
+        assert!(
+            !fg.contains(&Color::DarkGray),
+            "ok chip should keep uptime bright (not DarkGray); got fgs: {:?}",
+            fg,
+        );
+    }
+
+    /// Helper: render the dashboard with a HealthChip carrying
+    /// the given status + uptime, then walk the buffer for the
+    /// substring `needle` and return the set of fg colors in
+    /// those cells. Inline buffer ownership avoids Box::leak.
+    fn render_and_sample_header_uptime(
+        status: super::HealthStatus,
+        uptime_secs: i64,
+        needle: &str,
+    ) -> std::collections::HashSet<Color> {
+        use crate::coredb::types::BtcTick;
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        use std::time::Duration;
+        let chip = super::HealthChip {
+            status,
+            daemon_uptime_secs: Some(uptime_secs),
+            detail: None,
+            ingest_restarts: Some((0, 0)),
+        };
+        let mut s = super::Snapshot::default();
+        s.btc = Some(BtcTick {
+            bucket_hour_ms: 0,
+            symbol: "BTCUSDT".into(),
+            ts_ms: 1700000000000,
+            price: 79123.45,
+            volume: 0.0,
+            bid: 79123.40,
+            ask: 79123.50,
+        });
+        s.health = Some(chip);
+        let strategies = super::strategies_in_view(&s);
+        let backend = TestBackend::new(140, 50);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let prev_ranks: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        terminal
+            .draw(|f| {
+                super::draw(
+                    f,
+                    &s,
+                    Duration::from_millis(0),
+                    Duration::from_secs(42),
+                    &strategies,
+                    None,
+                    &prev_ranks,
+                    super::ComparisonSort::DEFAULT,
+                )
+            })
+            .unwrap();
+        sample_row_fg(terminal.backend().buffer(), needle)
+    }
+
     fn panel_header_chip_degraded_surfaces_detail_message() {
         // Degraded daemon: detail carries the worst subtask error
         // instead of ingest ages. Operator needs to see "why?" in
