@@ -156,6 +156,15 @@ async fn main_loop(
         .as_ref()
         .map(|p| p.sort)
         .unwrap_or(ComparisonSort::Window7dDesc);
+    // Restore the focused-strategy filter too so a restart
+    // doesn't drop the operator back to "show every strategy."
+    // Note: if the saved strategy is no longer in the current
+    // snapshot, the cycle_strategy fallback handling lets the
+    // operator press +/- once to land back at None — better
+    // than silently clobbering their choice here.
+    let restored_filter: Option<String> = persisted
+        .as_ref()
+        .and_then(|p| p.strategy_filter.clone());
     let mut snapshot = fetch_snapshot(
         btc_repo, dec_repo, pos_repo, pnl_repo, agree_repo, breakdown_repo, health_url,
         health_client, pnl_days, prev_ingest_restarts,
@@ -168,8 +177,9 @@ async fn main_loop(
     // Strategy currently focused in the decisions panel. `None` = show
     // every strategy. Set by digit-key hotkeys; cleared by `0` or `c`.
     // Survives refreshes so the operator's selection doesn't reset on
-    // every auto-tick.
-    let mut strategy_filter: Option<String> = None;
+    // every auto-tick — and now survives a dashboard restart too,
+    // sourced from `restored_filter` above.
+    let mut strategy_filter: Option<String> = restored_filter;
 
     loop {
         let uptime = started_at.elapsed();
@@ -216,6 +226,7 @@ async fn main_loop(
                 ranks: prev_ranks.clone(),
                 sort: comparison_sort,
                 saved_at_ms: now_ms(),
+                strategy_filter: strategy_filter.clone(),
             },
         );
 
@@ -819,6 +830,13 @@ pub struct PersistedDashboardState {
     pub ranks: std::collections::HashMap<String, usize>,
     pub sort: ComparisonSort,
     pub saved_at_ms: i64,
+    /// Active strategy filter ("focused strategy") at the time
+    /// the state was saved. `#[serde(default)]` so existing
+    /// state files written before this field was added still
+    /// parse cleanly. `None` = no filter (the dashboard's
+    /// default state, equivalent to pressing `0` or `c`).
+    #[serde(default)]
+    pub strategy_filter: Option<String>,
 }
 
 /// Resolve the persistence path: `$DASHBOARD_STATE_PATH` if set,
@@ -2568,6 +2586,7 @@ mod tests {
             ranks: ranks.clone(),
             sort: super::ComparisonSort::TodayDesc,
             saved_at_ms: 1_700_000_000_000,
+            strategy_filter: Some("baseline".to_string()),
         };
         super::save_persisted_dashboard_state(&tmp, &saved);
 
@@ -2580,7 +2599,41 @@ mod tests {
         assert_eq!(loaded.ranks, ranks);
         assert_eq!(loaded.sort, super::ComparisonSort::TodayDesc);
         assert_eq!(loaded.saved_at_ms, 1_700_000_000_000);
+        assert_eq!(
+            loaded.strategy_filter.as_deref(),
+            Some("baseline"),
+            "expected strategy_filter to round-trip",
+        );
 
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// Backwards-compat: a state file written before the
+    /// `strategy_filter` field existed (or with the field as
+    /// `null`) still parses cleanly. `#[serde(default)]` keeps
+    /// existing rollouts forward-compatible.
+    #[test]
+    fn dashboard_state_load_tolerates_missing_strategy_filter_field() {
+        let mut tmp = std::env::temp_dir();
+        tmp.push(format!(
+            "rust-agent-state-compat-{}.json",
+            std::process::id(),
+        ));
+        // Hand-written JSON without the `strategy_filter` field
+        // mirrors a pre-2026-05 state file on disk.
+        let pre_filter_json = serde_json::json!({
+            "ranks": { "baseline": 1 },
+            "sort": "Window7dDesc",
+            "saved_at_ms": 1_700_000_000_000_i64,
+        });
+        std::fs::write(&tmp, pre_filter_json.to_string()).unwrap();
+        let loaded = super::load_persisted_dashboard_state(
+            &tmp,
+            1_700_000_000_000,
+            super::DASHBOARD_STATE_TTL_MS_DEFAULT,
+        )
+        .expect("expected pre-filter file to parse");
+        assert_eq!(loaded.strategy_filter, None, "missing field → None");
         let _ = std::fs::remove_file(&tmp);
     }
 
@@ -2600,6 +2653,7 @@ mod tests {
             ranks: Default::default(),
             sort: super::ComparisonSort::Window7dDesc,
             saved_at_ms: 1_700_000_000_000,
+            strategy_filter: None,
         };
         super::save_persisted_dashboard_state(&tmp, &saved);
 
