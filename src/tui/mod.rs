@@ -2041,35 +2041,53 @@ fn draw_strategy_comparison(
         ]));
     }
 
-    let title = if rows.is_empty() {
-        " strategy comparison (no data yet) ".to_string()
+    // Build the title as a Line of Spans so the focused
+    // strategy name can render in cyan+bold — visually echoing
+    // the row's cyan-bg chip so the operator's eye matches the
+    // two places. Empty-rowset state still uses a plain string.
+    let title_line: Line<'static> = if rows.is_empty() {
+        Line::from(" strategy comparison (no data yet) ")
     } else {
-        let base = format!(" strategy comparison • sorted by: {}", sort.label());
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        spans.push(Span::raw(format!(
+            " strategy comparison • sorted by: {}",
+            sort.label()
+        )));
         // Filter-aware annotation: when filter is active, append
         // the focused strategy's rank (1-based, from the sorted
         // rows_data) and its spread vs the 7d leader. Same idiom
-        // as the strategy-pnl / positions / consensus titles.
-        let focused_stats = strategy_filter.and_then(|name| {
-            let (idx, row) = rows_data
-                .iter()
-                .enumerate()
-                .find(|(_, r)| r.strategy == name)?;
-            let rank = idx + 1;
-            let spread_label = match leader_pnl {
-                Some(_) if idx == 0 => "(leader)".to_string(),
-                Some(lp) => {
-                    let spread = row.window_pnl - lp;
-                    if spread.abs() < f64::EPSILON {
-                        "(tied)".to_string()
-                    } else {
-                        format!("${:+.2} vs leader", spread)
+        // as the strategy-pnl / positions / consensus titles —
+        // the only difference is the cyan-bold styling on the
+        // strategy name.
+        if let Some(name) = strategy_filter {
+            if let Some((idx, row)) =
+                rows_data.iter().enumerate().find(|(_, r)| r.strategy == name)
+            {
+                let rank = idx + 1;
+                let spread_label = match leader_pnl {
+                    Some(_) if idx == 0 => "(leader)".to_string(),
+                    Some(lp) => {
+                        let spread = row.window_pnl - lp;
+                        if spread.abs() < f64::EPSILON {
+                            "(tied)".to_string()
+                        } else {
+                            format!("${:+.2} vs leader", spread)
+                        }
                     }
-                }
-                None => "—".to_string(),
-            };
-            Some(format!(" — {name}: rank #{rank}, {spread_label}"))
-        });
-        format!("{base}{} ", focused_stats.as_deref().unwrap_or(""))
+                    None => "—".to_string(),
+                };
+                spans.push(Span::raw(" — "));
+                spans.push(Span::styled(
+                    name.to_string(),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ));
+                spans.push(Span::raw(format!(": rank #{rank}, {spread_label}")));
+            }
+        }
+        spans.push(Span::raw(" "));
+        Line::from(spans)
     };
     let widths = [
         Constraint::Length(2),  // Δ rank change
@@ -2084,7 +2102,7 @@ fn draw_strategy_comparison(
     ];
     let table = Table::new(rows, widths)
         .header(header)
-        .block(Block::default().borders(Borders::ALL).title(title));
+        .block(Block::default().borders(Borders::ALL).title(title_line));
     f.render_widget(table, area);
 }
 
@@ -3959,6 +3977,80 @@ mod tests {
         assert!(
             !dump_plain.contains(": rank #"),
             "no rank annotation should appear without filter:\n{dump_plain}",
+        );
+    }
+
+    /// Focus name in the comparison title renders cyan + bold so
+    /// it visually echoes the row's cyan-bg chip. Pin the fg by
+    /// walking the rendered buffer for the substring "baseline"
+    /// inside the title line and confirming Cyan is present.
+    #[test]
+    fn panel_strategy_comparison_title_name_renders_cyan() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let mut s = super::Snapshot::default();
+        s.pnl_breakdown_window = vec![super::PnlBreakdown {
+            bucket_day_ms: 0,
+            strategy: "baseline".into(),
+            exec: "paper".into(),
+            realized_pnl: 5.0,
+            n_settled: 1,
+        }];
+        let strategies = super::strategies_in_view(&s);
+        let prev_ranks: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        let backend = TestBackend::new(140, 50);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                super::draw(
+                    f,
+                    &s,
+                    std::time::Duration::from_millis(0),
+                    std::time::Duration::from_secs(42),
+                    &strategies,
+                    Some("baseline"),
+                    &prev_ranks,
+                    super::ComparisonSort::DEFAULT,
+                )
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        // Walk the first occurrence of "baseline" in any row.
+        // First match should be in the comparison panel title
+        // because the strategy-pnl panel above renders the name
+        // without a filter-driven cyan (it uses cyan only for
+        // the ▶ chip's bg, not fg).
+        let width = buf.area.width as usize;
+        let total = buf.content.len();
+        // Search row-by-row, top-down, for the title line —
+        // identified by the "sorted by:" prefix.
+        let mut found_cyan_in_title = false;
+        for row_start in (0..total).step_by(width) {
+            let row_end = (row_start + width).min(total);
+            let row: String = buf.content[row_start..row_end]
+                .iter()
+                .map(|c| c.symbol())
+                .collect();
+            if !row.contains("sorted by:") {
+                continue;
+            }
+            // We're on the title line. Find "baseline".
+            let Some(col) = row.find("baseline") else { continue };
+            let from = row_start + col;
+            let to = (from + "baseline".len()).min(row_end);
+            for cell in &buf.content[from..to] {
+                if cell.fg == ratatui::style::Color::Cyan {
+                    found_cyan_in_title = true;
+                    break;
+                }
+            }
+            break;
+        }
+        assert!(
+            found_cyan_in_title,
+            "expected focused strategy name in comparison title to be Cyan:\n{}",
+            render_buffer(buf),
         );
     }
 
