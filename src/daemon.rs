@@ -716,13 +716,21 @@ pub fn metrics_pnl_daily_cache_ttl_ms() -> i64 {
 /// One UTC bucket_day per offset, anchored on `now`.
 const PNL_BREAKDOWN_WINDOW_DAYS: i64 = 7;
 
-/// Width of the rolling per-pair disagreement window metric, in
-/// days. Same shape as `PNL_BREAKDOWN_WINDOW_DAYS` — hard-coded
-/// 7 so the metric query is trivially
-/// `agent_disagreement_rate_window{days="7"}`. Operators wanting
-/// a different horizon should add a sibling family rather than
-/// turning this one into a histogram.
-const AGREEMENT_WINDOW_DAYS: i64 = 7;
+/// Default width of the rolling per-pair disagreement window
+/// metric, in days. Same shape as `PNL_BREAKDOWN_WINDOW_DAYS`.
+/// Operator-tunable via the `AGREEMENT_WINDOW_DAYS` env var;
+/// the metric's `days` label reflects the active value so a
+/// Grafana query against `days="7"` (or whatever the operator
+/// set) keeps working.
+pub const AGREEMENT_WINDOW_DAYS_DEFAULT: i64 = 7;
+
+pub fn agreement_window_days() -> i64 {
+    std::env::var("AGREEMENT_WINDOW_DAYS")
+        .ok()
+        .and_then(|s| s.parse::<i64>().ok())
+        .filter(|n| *n >= 1)
+        .unwrap_or(AGREEMENT_WINDOW_DAYS_DEFAULT)
+}
 
 /// Cached today's pnl_breakdown rows (per strategy × exec).
 /// Same TTL as pnl_daily — both are written by the same
@@ -1618,7 +1626,7 @@ pub fn render_metrics(s: &MetricsSnapshot) -> String {
                         "agent_disagreement_rate_window{{strategy_a=\"{}\",strategy_b=\"{}\",days=\"{}\"}} {}\n",
                         escape_label(a),
                         escape_label(b),
-                        AGREEMENT_WINDOW_DAYS,
+                        agreement_window_days(),
                         rate,
                     ));
                 }
@@ -2061,7 +2069,8 @@ async fn gather_metrics_snapshot(s: &HealthAppState, now: i64) -> MetricsSnapsho
                 let day_ms = 86_400_000_i64;
                 let mut all_rows: Vec<crate::coredb::types::AgreementSnapshot> = Vec::new();
                 let mut any_err = false;
-                for i in 0..AGREEMENT_WINDOW_DAYS {
+                let window_days = agreement_window_days();
+                for i in 0..window_days {
                     let bd = today_bd - i * day_ms;
                     match ag_repo.list_day(bd).await {
                         Ok(rows) => all_rows.extend(rows),
@@ -3133,10 +3142,15 @@ mod tests {
             },
             notes: Vec::new(),
         };
+        // The default window applies here (no env override). Use
+        // the accessor so a test running concurrent with a CI
+        // run that exports AGREEMENT_WINDOW_DAYS still pins the
+        // right label.
+        std::env::remove_var("AGREEMENT_WINDOW_DAYS");
         let out = super::render_metrics(&snap);
         let expected = format!(
             "agent_disagreement_rate_window{{strategy_a=\"baseline\",strategy_b=\"deepseek\",days=\"{}\"}} 0.75",
-            super::AGREEMENT_WINDOW_DAYS,
+            super::AGREEMENT_WINDOW_DAYS_DEFAULT,
         );
         assert!(
             out.contains(&expected),
@@ -3437,6 +3451,39 @@ mod tests {
     /// explicit override, and malformed value all round-trip
     /// through the same accessors gather_metrics_snapshot uses.
     #[test]
+    /// Env-parsing for the agreement window knob. Default,
+    /// explicit override, "0/negative rejected (falls back to
+    /// default — a 0-day window would emit nothing)", and
+    /// malformed string all round-trip through the accessor.
+    #[test]
+    fn agreement_window_days_env_parsing() {
+        std::env::remove_var("AGREEMENT_WINDOW_DAYS");
+        assert_eq!(
+            super::agreement_window_days(),
+            super::AGREEMENT_WINDOW_DAYS_DEFAULT,
+        );
+        std::env::set_var("AGREEMENT_WINDOW_DAYS", "14");
+        assert_eq!(super::agreement_window_days(), 14);
+        // 0 + negative → default. A 0-day window would gather no
+        // rows; that's not a useful operator setting.
+        std::env::set_var("AGREEMENT_WINDOW_DAYS", "0");
+        assert_eq!(
+            super::agreement_window_days(),
+            super::AGREEMENT_WINDOW_DAYS_DEFAULT,
+        );
+        std::env::set_var("AGREEMENT_WINDOW_DAYS", "-5");
+        assert_eq!(
+            super::agreement_window_days(),
+            super::AGREEMENT_WINDOW_DAYS_DEFAULT,
+        );
+        std::env::set_var("AGREEMENT_WINDOW_DAYS", "bogus");
+        assert_eq!(
+            super::agreement_window_days(),
+            super::AGREEMENT_WINDOW_DAYS_DEFAULT,
+        );
+        std::env::remove_var("AGREEMENT_WINDOW_DAYS");
+    }
+
     fn metrics_decisions_cache_ttl_ms_env_parsing() {
         std::env::remove_var("METRICS_DECISIONS_CACHE_TTL_S");
         assert_eq!(
