@@ -1520,9 +1520,16 @@ fn draw_strategy_comparison(
         Cell::from("today Σpnl"),
         Cell::from("yesterday"),
         Cell::from("7d total"),
+        Cell::from("vs leader"),
         Cell::from(agree_header),
     ])
     .style(Style::default().add_modifier(Modifier::BOLD));
+
+    // Leader's 7d total drives the `vs leader` spread column.
+    // After sort, rows_data[0] is the leader (largest window_pnl
+    // with alphabetical tiebreak). `None` when there are no rows
+    // yet — the spread column is unused in that case.
+    let leader_pnl: Option<f64> = rows_data.first().map(|r| r.window_pnl);
 
     let mut rows: Vec<Row> = Vec::new();
     for (i, r) in rows_data.iter().enumerate() {
@@ -1572,12 +1579,40 @@ fn draw_strategy_comparison(
                 Style::default().fg(Color::DarkGray),
             )),
         };
+        // `vs leader`: gap to the #1's 7d total. Leader row reads
+        // "(leader)" in gold; tied non-leader rows read "(tied)"
+        // in cyan; behind rows read "$-N.NN" in red (the value is
+        // always ≤ 0 by the desc-sort invariant). When there are
+        // no rows yet (empty universe) the cell is unused — the
+        // for-loop didn't fire.
+        let spread_cell = match leader_pnl {
+            Some(_) if i == 0 => Cell::from(Span::styled(
+                "(leader)",
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            )),
+            Some(lp) => {
+                let spread = r.window_pnl - lp;
+                if spread.abs() < f64::EPSILON {
+                    Cell::from(Span::styled(
+                        "(tied)",
+                        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    ))
+                } else {
+                    Cell::from(Span::styled(
+                        format!("${:+.2}", spread),
+                        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                    ))
+                }
+            }
+            None => Cell::from(""),
+        };
         rows.push(Row::new(vec![
             rank_cell,
             strategy_cell,
             cell_money(r.today_pnl),
             cell_money(r.yesterday_pnl),
             cell_money(r.window_pnl),
+            spread_cell,
             agree_cell,
         ]));
     }
@@ -1588,12 +1623,13 @@ fn draw_strategy_comparison(
         " strategy comparison ".to_string()
     };
     let widths = [
-        Constraint::Length(3),  // rank column "#NN"
-        Constraint::Length(12),
-        Constraint::Length(12),
-        Constraint::Length(12),
-        Constraint::Length(12),
-        Constraint::Length(15),
+        Constraint::Length(3),  // rank "#NN"
+        Constraint::Length(12), // strategy
+        Constraint::Length(12), // today
+        Constraint::Length(12), // yesterday
+        Constraint::Length(12), // 7d total
+        Constraint::Length(12), // vs leader
+        Constraint::Length(15), // agree
     ];
     let table = Table::new(rows, widths)
         .header(header)
@@ -2866,16 +2902,17 @@ mod tests {
             dump.contains("▶deepseek"),
             "expected ▶deepseek row marker under active filter"
         );
-        // The unfiltered case must NOT have "vs " in it (sanity-
-        // check on the dynamic-header logic in the opposite
-        // direction). The consensus panel uses plain "agree" as a
-        // column name in both cases, so we don't try to assert
-        // its absence — only check that the filtered prefix
-        // doesn't leak into the no-filter render.
+        // The unfiltered strategy-pnl panel must NOT have
+        // `vs <strategy-name>` in its `agree` column header
+        // (sanity-check on the dynamic-header logic in the
+        // opposite direction). Note that the comparison panel
+        // unconditionally has a `vs leader` column header — so
+        // we look for the specific `vs deepseek` form rather than
+        // any "vs " substring.
         let plain_dump = render_test_dashboard(None);
         assert!(
-            !plain_dump.contains("vs "),
-            "`vs ` leaked into no-filter render"
+            !plain_dump.contains("vs deepseek"),
+            "`vs deepseek` leaked into no-filter render"
         );
     }
 
@@ -3466,6 +3503,99 @@ mod tests {
         assert!(dump.contains("#1"), "expected #1 rank in dump:\n{dump}");
         assert!(dump.contains("#2"), "expected #2 rank in dump:\n{dump}");
         assert!(dump.contains("#3"), "expected #3 rank in dump:\n{dump}");
+    }
+
+    /// Spread column: leader row reads "(leader)" in gold; tied
+    /// non-leader rows read "(tied)" in cyan; non-tied rows read
+    /// "$-N.NN" in red. Pin all three branches with a fixture
+    /// that exercises each.
+    #[test]
+    fn panel_strategy_comparison_spread_column_branches() {
+        let window = vec![
+            // deepseek leads at +100 → rank 1, "(leader)"
+            super::PnlBreakdown {
+                bucket_day_ms: 0,
+                strategy: "deepseek".into(),
+                exec: "paper".into(),
+                realized_pnl: 100.0,
+                n_settled: 1,
+            },
+            // anthropic at +50 → rank 2, spread = -50 → "$-50.00"
+            super::PnlBreakdown {
+                bucket_day_ms: 0,
+                strategy: "anthropic".into(),
+                exec: "paper".into(),
+                realized_pnl: 50.0,
+                n_settled: 1,
+            },
+            // baseline at -10 → rank 3, spread = -110 → "$-110.00"
+            super::PnlBreakdown {
+                bucket_day_ms: 0,
+                strategy: "baseline".into(),
+                exec: "paper".into(),
+                realized_pnl: -10.0,
+                n_settled: 1,
+            },
+        ];
+        let dump = render_test_dashboard_full(None, None, Vec::new(), window);
+        assert!(dump.contains("(leader)"), "leader marker missing:\n{dump}");
+        assert!(dump.contains("$-50.00"), "rank-2 spread missing:\n{dump}");
+        assert!(dump.contains("$-110.00"), "rank-3 spread missing:\n{dump}");
+        // Header label visible.
+        assert!(dump.contains("vs leader"), "spread header missing:\n{dump}");
+    }
+
+    /// Tied non-leader rows read "(tied)" instead of "$+0.00" —
+    /// "(tied)" is more informative for the operator since
+    /// "$+0.00" could ambiguously mean "exactly $0 ahead" or
+    /// "no data".
+    #[test]
+    fn panel_strategy_comparison_spread_tied_rows() {
+        let window = vec![
+            super::PnlBreakdown {
+                bucket_day_ms: 0,
+                strategy: "anthropic".into(),
+                exec: "paper".into(),
+                realized_pnl: 5.0,
+                n_settled: 1,
+            },
+            super::PnlBreakdown {
+                bucket_day_ms: 0,
+                strategy: "baseline".into(),
+                exec: "paper".into(),
+                realized_pnl: 5.0,
+                n_settled: 1,
+            },
+            super::PnlBreakdown {
+                bucket_day_ms: 0,
+                strategy: "deepseek".into(),
+                exec: "paper".into(),
+                realized_pnl: 5.0,
+                n_settled: 1,
+            },
+        ];
+        let dump = render_test_dashboard_full(None, None, Vec::new(), window);
+        assert!(dump.contains("(leader)"), "leader marker missing");
+        assert!(dump.contains("(tied)"), "tied marker missing");
+        // The leader is anthropic (alphabetical tiebreak), and
+        // the other two are tied with it. No "$-" or "$+" in the
+        // spread column for these rows.
+        let spread_block: String = dump
+            .lines()
+            .filter(|l| {
+                l.contains("anthropic")
+                    || l.contains("baseline")
+                    || l.contains("deepseek")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        // Other panels (decisions, etc.) might contain "$+5.00"
+        // for unrelated reasons. Just confirm the leader marker +
+        // tied marker both appear in the comparison rows.
+        assert!(
+            spread_block.contains("(leader)") && spread_block.contains("(tied)"),
+            "leader+tied combo missing in comparison rows:\n{spread_block}",
+        );
     }
 
     /// Filter highlight: when a strategy_filter is active, that
