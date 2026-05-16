@@ -1784,16 +1784,36 @@ fn draw_strategy_comparison(
         // gold/silver/bronze accent so the eye lands there first;
         // 4+ stays neutral.
         let rank = i + 1;
+        let is_active = strategy_filter == Some(r.strategy.as_str());
+        // When a filter is active and this row isn't the focused
+        // strategy, render every cell in dark gray instead of the
+        // normal red/green/cyan/gold colors. The focused row keeps
+        // its full styling, so it pops against the dimmed
+        // background. Filter inactive → every row uses its
+        // natural colors (no dim).
+        let dim = strategy_filter.is_some() && !is_active;
+        // Cell-style helpers respect `dim`: when set, return a
+        // dark-gray cell carrying the same text; otherwise apply
+        // the original color logic. Pulled out so each cell
+        // computation is a one-liner below.
+        let styled = |text: String, style: Style| -> Cell<'static> {
+            if dim {
+                Cell::from(Span::styled(text, Style::default().fg(Color::DarkGray)))
+            } else {
+                Cell::from(Span::styled(text, style))
+            }
+        };
+
         let rank_color = match rank {
             1 => Color::Yellow, // gold
             2 => Color::Gray,   // silver — closest ratatui has to it
             3 => Color::LightRed, // bronze-ish
             _ => Color::DarkGray,
         };
-        let rank_cell = Cell::from(Span::styled(
+        let rank_cell = styled(
             format!("#{rank}"),
             Style::default().fg(rank_color).add_modifier(Modifier::BOLD),
-        ));
+        );
         // Rank-change indicator: compare against the rank we saw
         // for this strategy on the previous refresh. Empty
         // (single space) when there's no prior baseline — a fresh
@@ -1806,11 +1826,12 @@ fn draw_strategy_comparison(
             Some(prev) if prev > rank => ("↑", Color::Green), // moved up
             Some(_) => ("↓", Color::Red),                       // moved down
         };
-        let delta_cell = Cell::from(Span::styled(
+        let delta_cell = styled(
             delta_glyph.to_string(),
             Style::default().fg(delta_color).add_modifier(Modifier::BOLD),
-        ));
-        let is_active = strategy_filter == Some(r.strategy.as_str());
+        );
+        // Strategy cell: focused row gets ▶ + cyan bg, others
+        // either plain or dimmed depending on filter state.
         let strategy_cell = if is_active {
             Cell::from(Span::styled(
                 format!("▶{}", r.strategy),
@@ -1819,25 +1840,30 @@ fn draw_strategy_comparison(
                     .bg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
             ))
+        } else if dim {
+            Cell::from(Span::styled(
+                r.strategy.clone(),
+                Style::default().fg(Color::DarkGray),
+            ))
         } else {
             Cell::from(r.strategy.clone())
         };
         let cell_money = |v: f64| -> Cell<'static> {
             let color = if v >= 0.0 { Color::Green } else { Color::Red };
-            Cell::from(Span::styled(
+            styled(
                 format!("${:+.2}", v),
                 Style::default().fg(color).add_modifier(Modifier::BOLD),
-            ))
+            )
         };
         let agree_cell = match r.agree_rate {
-            Some(rate) => Cell::from(Span::styled(
+            Some(rate) => styled(
                 format!("{:.0}%", rate * 100.0),
                 Style::default().fg(Color::Cyan),
-            )),
-            None => Cell::from(Span::styled(
-                "—",
+            ),
+            None => styled(
+                "—".to_string(),
                 Style::default().fg(Color::DarkGray),
-            )),
+            ),
         };
         // `7d gap`: gap to the #1's 7d total. Leader row reads
         // "(leader)" in gold; tied non-leader rows read "(tied)"
@@ -1846,22 +1872,22 @@ fn draw_strategy_comparison(
         // no rows yet (empty universe) the cell is unused — the
         // for-loop didn't fire.
         let spread_cell = match leader_pnl {
-            Some(_) if i == 0 => Cell::from(Span::styled(
-                "(leader)",
+            Some(_) if i == 0 => styled(
+                "(leader)".to_string(),
                 Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-            )),
+            ),
             Some(lp) => {
                 let spread = r.window_pnl - lp;
                 if spread.abs() < f64::EPSILON {
-                    Cell::from(Span::styled(
-                        "(tied)",
+                    styled(
+                        "(tied)".to_string(),
                         Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-                    ))
+                    )
                 } else {
-                    Cell::from(Span::styled(
+                    styled(
                         format!("${:+.2}", spread),
                         Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-                    ))
+                    )
                 }
             }
             None => Cell::from(""),
@@ -1878,22 +1904,22 @@ fn draw_strategy_comparison(
                     .map(|s| s == r.strategy.as_str())
                     .unwrap_or(false);
                 if is_today_leader {
-                    Cell::from(Span::styled(
-                        "(leader)",
+                    styled(
+                        "(leader)".to_string(),
                         Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-                    ))
+                    )
                 } else {
                     let spread = r.today_pnl - lp;
                     if spread.abs() < f64::EPSILON {
-                        Cell::from(Span::styled(
-                            "(tied)",
+                        styled(
+                            "(tied)".to_string(),
                             Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-                        ))
+                        )
                     } else {
-                        Cell::from(Span::styled(
+                        styled(
                             format!("${:+.2}", spread),
                             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-                        ))
+                        )
                     }
                 }
             }
@@ -4179,6 +4205,151 @@ mod tests {
         assert!(
             spread_block.contains("(leader)") && spread_block.contains("(tied)"),
             "leader+tied combo missing in comparison rows:\n{spread_block}",
+        );
+    }
+
+    /// When a filter is active, unfiltered rows render dim
+    /// (DarkGray) on every cell, while the focused row keeps its
+    /// full styling. The TestBackend buffer's style bytes carry
+    /// the fg colors, so we can verify by walking the rendered
+    /// buffer cell-by-cell.
+    #[test]
+    fn panel_strategy_comparison_dims_unfiltered_rows() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let mut s = super::Snapshot::default();
+        // Three strategies in the comparison panel.
+        s.pnl_breakdown_window = vec![
+            super::PnlBreakdown {
+                bucket_day_ms: 0, strategy: "anthropic".into(),
+                exec: "paper".into(), realized_pnl: 100.0, n_settled: 1,
+            },
+            super::PnlBreakdown {
+                bucket_day_ms: 0, strategy: "baseline".into(),
+                exec: "paper".into(), realized_pnl: 50.0, n_settled: 1,
+            },
+            super::PnlBreakdown {
+                bucket_day_ms: 0, strategy: "deepseek".into(),
+                exec: "paper".into(), realized_pnl: 10.0, n_settled: 1,
+            },
+        ];
+        let strategies = super::strategies_in_view(&s);
+        let prev_ranks: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        let backend = TestBackend::new(140, 50);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                super::draw(
+                    f,
+                    &s,
+                    std::time::Duration::from_millis(0),
+                    std::time::Duration::from_secs(42),
+                    &strategies,
+                    Some("baseline"), // ← filter active
+                    &prev_ranks,
+                    super::ComparisonSort::DEFAULT,
+                )
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        // Walk the buffer and confirm:
+        //   - The "$+100.00" cell (anthropic, unfiltered → dim)
+        //     has DarkGray fg.
+        //   - The "$+50.00" cell (baseline, focused → not dim)
+        //     does NOT have DarkGray fg (it keeps Green).
+        // Use a substring search to locate each row's money cell
+        // and inspect its style.
+        let dump = render_buffer(buf);
+        // Anthropic row: contains "anthropic" and "$+100.00". The
+        // money string's fg should be DarkGray.
+        let row_styles = sample_row_fg(buf, "$+100.00");
+        assert!(
+            row_styles.contains(&Color::DarkGray),
+            "anthropic row should have DarkGray fg on $+100.00 cell:\n{dump}"
+        );
+        // Baseline row: contains "$+50.00". Focused → fg should
+        // NOT be DarkGray. (It's Green for positive money; we
+        // just assert "not DarkGray" to keep the test stable
+        // across Color enum extensions.)
+        let baseline_styles = sample_row_fg(buf, "$+50.00");
+        assert!(
+            !baseline_styles.contains(&Color::DarkGray),
+            "baseline (focused) row should NOT have DarkGray fg:\n{dump}"
+        );
+    }
+
+    /// Walk a TestBackend buffer to find the substring `needle`
+    /// and return the set of distinct fg Colors used in those
+    /// cells. Helper for the dim-row test above.
+    fn sample_row_fg(buf: &ratatui::buffer::Buffer, needle: &str) -> std::collections::HashSet<Color> {
+        let width = buf.area.width as usize;
+        let total = buf.content.len();
+        let mut out = std::collections::HashSet::new();
+        for row_start in (0..total).step_by(width) {
+            let row_end = (row_start + width).min(total);
+            let row: String = buf.content[row_start..row_end]
+                .iter()
+                .map(|c| c.symbol())
+                .collect();
+            if let Some(col) = row.find(needle) {
+                let from = row_start + col;
+                let to = (from + needle.chars().count()).min(row_end);
+                for cell in &buf.content[from..to] {
+                    if let ratatui::style::Color::DarkGray = cell.fg {
+                        out.insert(Color::DarkGray);
+                    } else {
+                        out.insert(cell.fg);
+                    }
+                }
+                break;
+            }
+        }
+        out
+    }
+
+    /// No filter → no dimming. Every row keeps its natural color
+    /// scheme even though the panel is rendering more than one
+    /// strategy.
+    #[test]
+    fn panel_strategy_comparison_no_dim_without_filter() {
+        let window = vec![
+            super::PnlBreakdown {
+                bucket_day_ms: 0, strategy: "anthropic".into(),
+                exec: "paper".into(), realized_pnl: 100.0, n_settled: 1,
+            },
+            super::PnlBreakdown {
+                bucket_day_ms: 0, strategy: "baseline".into(),
+                exec: "paper".into(), realized_pnl: 50.0, n_settled: 1,
+            },
+        ];
+        let mut s = super::Snapshot::default();
+        s.pnl_breakdown_window = window;
+        let strategies = super::strategies_in_view(&s);
+        let prev_ranks: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        let backend = ratatui::backend::TestBackend::new(140, 50);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                super::draw(
+                    f,
+                    &s,
+                    std::time::Duration::from_millis(0),
+                    std::time::Duration::from_secs(42),
+                    &strategies,
+                    None, // no filter
+                    &prev_ranks,
+                    super::ComparisonSort::DEFAULT,
+                )
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let dump = render_buffer(buf);
+        let row_styles = sample_row_fg(buf, "$+100.00");
+        assert!(
+            !row_styles.contains(&Color::DarkGray),
+            "with no filter, no row should be dimmed:\n{dump}"
         );
     }
 
