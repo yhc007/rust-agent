@@ -42,6 +42,7 @@ use crate::coredb::types::{bucket_day, now_ms};
 use crate::coredb::CoreDb;
 use crate::data::{binance, polymarket, user_channel};
 use crate::execution::clob_auth::ApiCreds;
+use crate::risk::RiskLimits;
 
 #[derive(Debug, Clone)]
 pub struct DaemonConfig {
@@ -942,6 +943,36 @@ async fn metrics_handler(State(s): State<HealthAppState>) -> impl IntoResponse {
             }
         }
     }
+
+    // Risk-gate state: what limit is loaded and whether the kill
+    // switch is armed right now. `RiskLimits::default()` reads
+    // `RISK_MAX_ORDER_USD` + `RISK_KILL_PATH` from env, which
+    // matches what `auto::route_decision` constructs per backtest
+    // call — so the metric reflects the operative limit at scrape
+    // time, even if env was changed mid-flight (via `systemctl
+    // edit` + restart, etc).
+    //
+    // kill_switch_active is the higher-value of the two: it's the
+    // operator's "did I touch ./KILL?" feedback loop. Re-check the
+    // filesystem on every scrape so latency tops out at one scrape
+    // interval — bounded by Prometheus' 15s default.
+    let risk = RiskLimits::default();
+    out.push_str(
+        "# HELP agent_risk_max_order_usd Current RISK_MAX_ORDER_USD limit ($) in force.\n",
+    );
+    out.push_str("# TYPE agent_risk_max_order_usd gauge\n");
+    out.push_str(&format!(
+        "agent_risk_max_order_usd {}\n",
+        risk.max_order_usd
+    ));
+    out.push_str(
+        "# HELP agent_risk_kill_switch_active 1 when the RISK_KILL_PATH file exists (all orders blocked); 0 otherwise.\n",
+    );
+    out.push_str("# TYPE agent_risk_kill_switch_active gauge\n");
+    out.push_str(&format!(
+        "agent_risk_kill_switch_active {}\n",
+        if risk.kill_switch_path.exists() { 1 } else { 0 },
+    ));
 
     // Per-(strategy, exec) realized PnL breakdown — sibling to
     // pnl_daily, also written by settle-pnl. Empty cache means
