@@ -1373,8 +1373,18 @@ fn render_yesterday_pnl_footer<'a>(
         }
         first = false;
         let color = if total >= 0.0 { Color::Green } else { Color::Red };
-        let label = format!("{strategy} ${:+.2}", total);
-        let style = if strategy_filter == Some(strategy.as_str()) {
+        // Filter highlight on a chip gets the same `▶<name>` prefix
+        // the table row uses, so the table's cyan-row + footer's
+        // cyan-chip pair visually rhyme. Without the triangle, the
+        // operator's eye reads cyan-on-cyan as "different things"
+        // even though they mark the same focused strategy.
+        let is_active = strategy_filter == Some(strategy.as_str());
+        let label = if is_active {
+            format!("▶{strategy} ${:+.2}", total)
+        } else {
+            format!("{strategy} ${:+.2}", total)
+        };
+        let style = if is_active {
             Style::default()
                 .fg(Color::Black)
                 .bg(Color::Cyan)
@@ -1430,8 +1440,18 @@ fn render_window_pnl_footer<'a>(
         }
         first = false;
         let color = if total >= 0.0 { Color::Green } else { Color::Red };
-        let label = format!("{strategy} ${:+.2}", total);
-        let style = if strategy_filter == Some(strategy.as_str()) {
+        // Filter highlight on a chip gets the same `▶<name>` prefix
+        // the table row uses, so the table's cyan-row + footer's
+        // cyan-chip pair visually rhyme. Without the triangle, the
+        // operator's eye reads cyan-on-cyan as "different things"
+        // even though they mark the same focused strategy.
+        let is_active = strategy_filter == Some(strategy.as_str());
+        let label = if is_active {
+            format!("▶{strategy} ${:+.2}", total)
+        } else {
+            format!("{strategy} ${:+.2}", total)
+        };
+        let style = if is_active {
             Style::default()
                 .fg(Color::Black)
                 .bg(Color::Cyan)
@@ -2380,6 +2400,76 @@ mod tests {
         assert!(
             alpha_pos < beta_pos,
             "strategies should render alphabetically — got: {flat}"
+        );
+    }
+
+    #[test]
+    fn yesterday_footer_chip_prefixes_filtered_strategy_with_triangle() {
+        // Filter on "deepseek" → that chip should render with the
+        // ▶ marker. baseline (unfiltered) stays plain.
+        let rows = vec![
+            super::PnlBreakdown {
+                bucket_day_ms: 0,
+                strategy: "baseline".into(),
+                exec: "paper".into(),
+                realized_pnl: 1.0,
+                n_settled: 1,
+            },
+            super::PnlBreakdown {
+                bucket_day_ms: 0,
+                strategy: "deepseek".into(),
+                exec: "paper".into(),
+                realized_pnl: -2.0,
+                n_settled: 1,
+            },
+        ];
+        let line = super::render_yesterday_pnl_footer(&rows, Some("deepseek"));
+        let flat: String = line
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect::<String>();
+        assert!(
+            flat.contains("▶deepseek $-2.00"),
+            "filtered chip should carry ▶ prefix — got: {flat}",
+        );
+        assert!(
+            !flat.contains("▶baseline"),
+            "non-filtered chip must NOT carry ▶ prefix — got: {flat}",
+        );
+    }
+
+    #[test]
+    fn window_footer_chip_prefixes_filtered_strategy_with_triangle() {
+        let rows = vec![
+            super::PnlBreakdown {
+                bucket_day_ms: 0,
+                strategy: "anthropic".into(),
+                exec: "paper".into(),
+                realized_pnl: 5.5,
+                n_settled: 2,
+            },
+            super::PnlBreakdown {
+                bucket_day_ms: 0,
+                strategy: "baseline".into(),
+                exec: "paper".into(),
+                realized_pnl: 1.0,
+                n_settled: 1,
+            },
+        ];
+        let line = super::render_window_pnl_footer(&rows, Some("anthropic"));
+        let flat: String = line
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect::<String>();
+        assert!(
+            flat.contains("▶anthropic $+5.50"),
+            "filtered window chip should carry ▶ prefix — got: {flat}",
+        );
+        assert!(
+            !flat.contains("▶baseline"),
+            "non-filtered window chip must NOT carry ▶ prefix — got: {flat}",
         );
     }
 
