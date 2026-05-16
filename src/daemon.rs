@@ -808,6 +808,14 @@ async fn metrics_handler(State(s): State<HealthAppState>) -> impl IntoResponse {
                     n,
                 ));
             }
+            // Headline scalar: `sum(agent_decisions_today)` baked in
+            // so Grafana Stat panels render without PromQL.
+            let total: u32 = cache.counts.values().sum();
+            out.push_str(
+                "# HELP agent_decisions_today_total Total decisions written today across every (strategy, side).\n",
+            );
+            out.push_str("# TYPE agent_decisions_today_total gauge\n");
+            out.push_str(&format!("agent_decisions_today_total {total}\n"));
         }
     }
 
@@ -898,6 +906,13 @@ async fn metrics_handler(State(s): State<HealthAppState>) -> impl IntoResponse {
                     n,
                 ));
             }
+            // Headline scalar (see agent_decisions_today_total).
+            let total: u32 = cache.counts.values().sum();
+            out.push_str(
+                "# HELP agent_orders_today_total Total orders written today across every (strategy, side, exec, status).\n",
+            );
+            out.push_str("# TYPE agent_orders_today_total gauge\n");
+            out.push_str(&format!("agent_orders_today_total {total}\n"));
         }
     }
 
