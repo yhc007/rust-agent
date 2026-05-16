@@ -10,6 +10,7 @@
 
 use std::path::PathBuf;
 
+#[derive(Debug)]
 pub struct RiskLimits {
     pub max_order_usd: f64,
     pub kill_switch_path: PathBuf,

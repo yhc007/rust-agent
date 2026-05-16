@@ -130,7 +130,7 @@ fn truncate_error(s: &str, max: usize) -> String {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct HealthState {
     pub started_at_ms: i64,
     pub backtest: SubtaskHealth,
@@ -633,27 +633,66 @@ async fn health_handler(State(s): State<HealthAppState>) -> Json<HealthResponse>
     })
 }
 
-/// Prometheus text-exposition handler. Surfaces the same HealthState
-/// `/health` does, but in line-oriented gauges keyed by the standard
-/// `agent_*` namespace so an existing Prometheus scrape config can
-/// pick it up without a JSON-to-metrics translator. No external
-/// prometheus crate dependency — the exposition format is plain
-/// text and we render it directly.
+/// Pre-gathered data the pure `render_metrics` renderer needs to
+/// build a Prometheus exposition body. The async `metrics_handler`
+/// is responsible for populating this from the live caches +
+/// repos; the renderer just emits formatted lines so it can be
+/// driven from a unit test without a real CoreDB.
+#[derive(Debug, Clone)]
+pub struct MetricsSnapshot {
+    pub now_ms: i64,
+    pub health: HealthState,
+    pub btc_age_ms: Option<i64>,
+    pub polymarket_age_ms: Option<i64>,
+    pub decisions: Option<DecisionsCacheEntry>,
+    pub orders: Option<OrdersCacheEntry>,
+    pub pnl_daily: Option<PnlDailyCacheEntry>,
+    pub pnl_breakdown: Option<PnlBreakdownCacheEntry>,
+    pub positions: Option<PositionsCacheEntry>,
+    pub risk: RiskLimits,
+    /// Operator-facing comment lines to prepend at the top of the
+    /// output (e.g. "# decisions_today refresh failed; serving
+    /// cached data: ..."). Each entry is one line — no trailing
+    /// newline; the renderer adds it. Prometheus parsers ignore
+    /// `#`-prefixed lines.
+    pub notes: Vec<String>,
+}
+
+// Need Clone for MetricsSnapshot; RiskLimits doesn't currently
+// implement it. PathBuf + f64 are both Clone — add the derive.
+impl Clone for RiskLimits {
+    fn clone(&self) -> Self {
+        RiskLimits {
+            max_order_usd: self.max_order_usd,
+            kill_switch_path: self.kill_switch_path.clone(),
+        }
+    }
+}
+
+/// Pure renderer: takes pre-gathered cache snapshots + health state
+/// and returns the Prometheus exposition body. No async, no I/O,
+/// no lock acquisition — driveable from any test without a CoreDB
+/// session.
 ///
-/// Returns `text/plain; version=0.0.4; charset=utf-8` per the
-/// Prometheus convention so scrapers content-negotiate correctly.
-async fn metrics_handler(State(s): State<HealthAppState>) -> impl IntoResponse {
-    let now = now_ms();
-    let snap = s.health.read().await;
-
-    let (btc_age, polymarket_age) = ingest_ages_cached(&s, now).await;
-
+/// Behavioural contract (matched against the prior inline-handler
+/// version): same metric family names, same label keys, same
+/// "missing series = no data yet" convention, same headline-scalar
+/// derivations. Operator-facing `# refresh failed` comments are
+/// emitted at the top via `MetricsSnapshot.notes` so the renderer
+/// itself is a straight function of its input.
+pub fn render_metrics(s: &MetricsSnapshot) -> String {
+    let now = s.now_ms;
+    let snap = &s.health;
     let mut out = String::with_capacity(2048);
-    let uptime_secs = (now - snap.started_at_ms).max(0) / 1000;
 
-    // Helper: emit one HELP/TYPE/sample triplet. Prometheus
-    // discourages duplicate HELP/TYPE lines, so families with
-    // multiple labeled samples emit the header once via push_help.
+    for note in &s.notes {
+        out.push_str(note);
+        if !note.ends_with('\n') {
+            out.push('\n');
+        }
+    }
+
+    let uptime_secs = (now - snap.started_at_ms).max(0) / 1000;
     out.push_str("# HELP agent_uptime_seconds Process uptime in seconds.\n");
     out.push_str("# TYPE agent_uptime_seconds gauge\n");
     out.push_str(&format!("agent_uptime_seconds {uptime_secs}\n"));
@@ -673,11 +712,6 @@ async fn metrics_handler(State(s): State<HealthAppState>) -> impl IntoResponse {
         ));
     }
 
-    // Age-since-last-tick / age-since-last-success in seconds. NaN
-    // when the subtask hasn't ticked yet — Prometheus accepts NaN as
-    // a valid sample value but emits a warning in some scrapers, so
-    // skip the sample entirely instead. A missing series is the
-    // clearer signal here.
     out.push_str(
         "# HELP agent_subtask_last_tick_age_seconds Seconds since the subtask's last tick.\n",
     );
@@ -716,13 +750,13 @@ async fn metrics_handler(State(s): State<HealthAppState>) -> impl IntoResponse {
         "# HELP agent_ingest_age_seconds Seconds since the newest ingest row for each source.\n",
     );
     out.push_str("# TYPE agent_ingest_age_seconds gauge\n");
-    if let Some(age_ms) = btc_age {
+    if let Some(age_ms) = s.btc_age_ms {
         out.push_str(&format!(
             "agent_ingest_age_seconds{{source=\"btc\"}} {}\n",
             age_ms.max(0) / 1000,
         ));
     }
-    if let Some(age_ms) = polymarket_age {
+    if let Some(age_ms) = s.polymarket_age_ms {
         out.push_str(&format!(
             "agent_ingest_age_seconds{{source=\"polymarket\"}} {}\n",
             age_ms.max(0) / 1000,
@@ -738,25 +772,227 @@ async fn metrics_handler(State(s): State<HealthAppState>) -> impl IntoResponse {
         if snap.user_channel_present { 1 } else { 0 },
     ));
 
-    // Today's decision count per (strategy, side). Gauge, not counter,
-    // because the value resets at UTC midnight when the bucket_day
-    // partition rolls — Prometheus `increase()` over a sub-day window
-    // works perfectly on a gauge, and tagging this `_total` would
-    // mislead `rate()`-using dashboards. Skipped silently when the
-    // repo failed to construct at startup.
-    //
-    // Stale-while-revalidate: we hold the write lock through the
-    // optional refresh, then either emit the freshly fetched data or
-    // fall back to the previous cached entry on transient failures.
-    // The cache age itself is exposed as `agent_decisions_today_cache_age_seconds`
-    // so operators can verify the TTL is doing what they expect.
-    if let Some(dec_repo) = &s.decision_repo {
+    if let Some(cache) = s.decisions.as_ref() {
+        let cache_age_secs = (now - cache.fetched_at_ms).max(0) / 1000;
+        out.push_str(
+            "# HELP agent_decisions_today_cache_age_seconds Age of the cached decisions tally in seconds. Bounded by METRICS_DECISIONS_CACHE_TTL_MS.\n",
+        );
+        out.push_str("# TYPE agent_decisions_today_cache_age_seconds gauge\n");
+        out.push_str(&format!(
+            "agent_decisions_today_cache_age_seconds {cache_age_secs}\n"
+        ));
+
+        out.push_str(
+            "# HELP agent_decisions_today Count of polymarket_btc.decisions rows written for today's UTC bucket, by strategy/side.\n",
+        );
+        out.push_str("# TYPE agent_decisions_today gauge\n");
+        for ((strategy, side), n) in &cache.counts {
+            out.push_str(&format!(
+                "agent_decisions_today{{strategy=\"{}\",side=\"{}\"}} {}\n",
+                escape_label(strategy),
+                escape_label(side),
+                n,
+            ));
+        }
+        let total: u32 = cache.counts.values().sum();
+        out.push_str(
+            "# HELP agent_decisions_today_total Total decisions written today across every (strategy, side).\n",
+        );
+        out.push_str("# TYPE agent_decisions_today_total gauge\n");
+        out.push_str(&format!("agent_decisions_today_total {total}\n"));
+    }
+
+    if let Some(cache) = s.orders.as_ref() {
+        out.push_str(
+            "# HELP agent_orders_today Count of polymarket_btc.orders rows for today's UTC bucket, by strategy/side/exec/status.\n",
+        );
+        out.push_str("# TYPE agent_orders_today gauge\n");
+        for ((strategy, side, exec, status), n) in &cache.counts {
+            out.push_str(&format!(
+                "agent_orders_today{{strategy=\"{}\",side=\"{}\",exec=\"{}\",status=\"{}\"}} {}\n",
+                escape_label(strategy),
+                escape_label(side),
+                escape_label(exec),
+                escape_label(status),
+                n,
+            ));
+        }
+        let total: u32 = cache.counts.values().sum();
+        out.push_str(
+            "# HELP agent_orders_today_total Total orders written today across every (strategy, side, exec, status).\n",
+        );
+        out.push_str("# TYPE agent_orders_today_total gauge\n");
+        out.push_str(&format!("agent_orders_today_total {total}\n"));
+    }
+
+    if let Some(cache) = s.pnl_daily.as_ref() {
+        if let Some(row) = cache.row.as_ref() {
+            out.push_str(
+                "# HELP agent_pnl_daily_realized_usd Realized PnL in USD for today's UTC bucket. Written by settle-pnl; read-only here.\n",
+            );
+            out.push_str("# TYPE agent_pnl_daily_realized_usd gauge\n");
+            out.push_str(&format!(
+                "agent_pnl_daily_realized_usd {}\n",
+                row.realized
+            ));
+            out.push_str(
+                "# HELP agent_pnl_daily_trades_count Number of settled trades counted into today's realized PnL.\n",
+            );
+            out.push_str("# TYPE agent_pnl_daily_trades_count gauge\n");
+            out.push_str(&format!(
+                "agent_pnl_daily_trades_count {}\n",
+                row.n_trades
+            ));
+        }
+    }
+
+    out.push_str(
+        "# HELP agent_risk_max_order_usd Current RISK_MAX_ORDER_USD limit ($) in force.\n",
+    );
+    out.push_str("# TYPE agent_risk_max_order_usd gauge\n");
+    out.push_str(&format!(
+        "agent_risk_max_order_usd {}\n",
+        s.risk.max_order_usd
+    ));
+    out.push_str(
+        "# HELP agent_risk_kill_switch_active 1 when the RISK_KILL_PATH file exists (all orders blocked); 0 otherwise.\n",
+    );
+    out.push_str("# TYPE agent_risk_kill_switch_active gauge\n");
+    out.push_str(&format!(
+        "agent_risk_kill_switch_active {}\n",
+        if s.risk.kill_switch_path.exists() { 1 } else { 0 },
+    ));
+
+    if let Some(cache) = s.pnl_breakdown.as_ref() {
+        if !cache.rows.is_empty() {
+            out.push_str(
+                "# HELP agent_pnl_breakdown_realized_usd Realized PnL in USD broken down by strategy + exec. Written by settle-pnl; read-only here.\n",
+            );
+            out.push_str("# TYPE agent_pnl_breakdown_realized_usd gauge\n");
+            for row in &cache.rows {
+                out.push_str(&format!(
+                    "agent_pnl_breakdown_realized_usd{{strategy=\"{}\",exec=\"{}\"}} {}\n",
+                    escape_label(&row.strategy),
+                    escape_label(&row.exec),
+                    row.realized_pnl,
+                ));
+            }
+            out.push_str(
+                "# HELP agent_pnl_breakdown_trades_count Number of settled trades in this strategy/exec bucket.\n",
+            );
+            out.push_str("# TYPE agent_pnl_breakdown_trades_count gauge\n");
+            for row in &cache.rows {
+                out.push_str(&format!(
+                    "agent_pnl_breakdown_trades_count{{strategy=\"{}\",exec=\"{}\"}} {}\n",
+                    escape_label(&row.strategy),
+                    escape_label(&row.exec),
+                    row.n_settled,
+                ));
+            }
+        }
+    }
+
+    if let Some(cache) = s.positions.as_ref() {
+        if !cache.rows.is_empty() {
+            out.push_str(
+                "# HELP agent_open_positions_size Open position size (shares) per (market, side) from positions_v2.\n",
+            );
+            out.push_str("# TYPE agent_open_positions_size gauge\n");
+            for p in &cache.rows {
+                out.push_str(&format!(
+                    "agent_open_positions_size{{market=\"{}\",side=\"{}\"}} {}\n",
+                    escape_label(&p.market_slug),
+                    escape_label(&p.side),
+                    p.size,
+                ));
+            }
+            out.push_str(
+                "# HELP agent_open_positions_avg_price Volume-weighted average fill price per (market, side) in [0,1] Polymarket outcome units.\n",
+            );
+            out.push_str("# TYPE agent_open_positions_avg_price gauge\n");
+            for p in &cache.rows {
+                out.push_str(&format!(
+                    "agent_open_positions_avg_price{{market=\"{}\",side=\"{}\"}} {}\n",
+                    escape_label(&p.market_slug),
+                    escape_label(&p.side),
+                    p.avg_price,
+                ));
+            }
+            out.push_str(
+                "# HELP agent_open_positions_notional_usd Notional value of the open position in USD — pre-computed `size * avg_price` so single-query panels don't need label-matching.\n",
+            );
+            out.push_str("# TYPE agent_open_positions_notional_usd gauge\n");
+            for p in &cache.rows {
+                out.push_str(&format!(
+                    "agent_open_positions_notional_usd{{market=\"{}\",side=\"{}\"}} {}\n",
+                    escape_label(&p.market_slug),
+                    escape_label(&p.side),
+                    p.size * p.avg_price,
+                ));
+            }
+            let nonzero = cache.rows.iter().filter(|p| p.size > 0.0).count();
+            let total_notional: f64 = cache.rows.iter().map(|p| p.size * p.avg_price).sum();
+            out.push_str(
+                "# HELP agent_open_positions_count Number of non-empty open positions (size > 0).\n",
+            );
+            out.push_str("# TYPE agent_open_positions_count gauge\n");
+            out.push_str(&format!("agent_open_positions_count {}\n", nonzero));
+            out.push_str(
+                "# HELP agent_open_positions_total_notional_usd Sum of notional ($) across every open position.\n",
+            );
+            out.push_str("# TYPE agent_open_positions_total_notional_usd gauge\n");
+            out.push_str(&format!(
+                "agent_open_positions_total_notional_usd {}\n",
+                total_notional
+            ));
+        }
+    }
+
+    out
+}
+
+/// Prometheus text-exposition handler. Surfaces the same HealthState
+/// `/health` does, but in line-oriented gauges keyed by the standard
+/// `agent_*` namespace so an existing Prometheus scrape config can
+/// pick it up without a JSON-to-metrics translator. No external
+/// prometheus crate dependency — the exposition format is plain
+/// text and we render it directly.
+///
+/// Returns `text/plain; version=0.0.4; charset=utf-8` per the
+/// Prometheus convention so scrapers content-negotiate correctly.
+async fn metrics_handler(State(s): State<HealthAppState>) -> impl IntoResponse {
+    let now = now_ms();
+    let snapshot = gather_metrics_snapshot(&s, now).await;
+    let body = render_metrics(&snapshot);
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; version=0.0.4; charset=utf-8"),
+    );
+    (StatusCode::OK, headers, body)
+}
+
+/// Refresh every cache that backs `/metrics` and snapshot the
+/// resulting state into a [`MetricsSnapshot`] that the pure
+/// [`render_metrics`] can consume. Holds the write locks only
+/// while each cache is being refreshed; clones the entries out
+/// so the snapshot can be rendered after every lock is dropped.
+async fn gather_metrics_snapshot(s: &HealthAppState, now: i64) -> MetricsSnapshot {
+    let mut notes: Vec<String> = Vec::new();
+
+    // Health subtask state — small struct, copy is cheap.
+    let health = s.health.read().await.clone();
+
+    let (btc_age_ms, polymarket_age_ms) = ingest_ages_cached(s, now).await;
+
+    // Decisions cache refresh.
+    let decisions: Option<DecisionsCacheEntry> = if let Some(dec_repo) = &s.decision_repo {
         let mut cache_guard = s.decisions_cache.write().await;
         let need_refresh = cache_guard
             .as_ref()
             .map(|c| now - c.fetched_at_ms > METRICS_DECISIONS_CACHE_TTL_MS)
             .unwrap_or(true);
-
         if need_refresh {
             match dec_repo.list_day(bucket_day(now)).await {
                 Ok(rows) => {
@@ -774,65 +1010,24 @@ async fn metrics_handler(State(s): State<HealthAppState>) -> impl IntoResponse {
                 }
                 Err(e) => {
                     if cache_guard.is_none() {
-                        out.push_str(&format!(
-                            "# decisions_today read failed (no cached fallback): {e}\n"
+                        notes.push(format!(
+                            "# decisions_today read failed (no cached fallback): {e}"
                         ));
                     } else {
-                        out.push_str(&format!(
-                            "# decisions_today refresh failed; serving cached data: {e}\n"
+                        notes.push(format!(
+                            "# decisions_today refresh failed; serving cached data: {e}"
                         ));
                     }
                 }
             }
         }
+        cache_guard.clone()
+    } else {
+        None
+    };
 
-        if let Some(cache) = cache_guard.as_ref() {
-            let cache_age_secs = (now - cache.fetched_at_ms).max(0) / 1000;
-            out.push_str(
-                "# HELP agent_decisions_today_cache_age_seconds Age of the cached decisions tally in seconds. Bounded by METRICS_DECISIONS_CACHE_TTL_MS.\n",
-            );
-            out.push_str("# TYPE agent_decisions_today_cache_age_seconds gauge\n");
-            out.push_str(&format!(
-                "agent_decisions_today_cache_age_seconds {cache_age_secs}\n"
-            ));
-
-            out.push_str(
-                "# HELP agent_decisions_today Count of polymarket_btc.decisions rows written for today's UTC bucket, by strategy/side.\n",
-            );
-            out.push_str("# TYPE agent_decisions_today gauge\n");
-            for ((strategy, side), n) in &cache.counts {
-                out.push_str(&format!(
-                    "agent_decisions_today{{strategy=\"{}\",side=\"{}\"}} {}\n",
-                    escape_label(strategy),
-                    escape_label(side),
-                    n,
-                ));
-            }
-            // Headline scalar: `sum(agent_decisions_today)` baked in
-            // so Grafana Stat panels render without PromQL.
-            let total: u32 = cache.counts.values().sum();
-            out.push_str(
-                "# HELP agent_decisions_today_total Total decisions written today across every (strategy, side).\n",
-            );
-            out.push_str("# TYPE agent_decisions_today_total gauge\n");
-            out.push_str(&format!("agent_decisions_today_total {total}\n"));
-        }
-    }
-
-    // Today's order count per (strategy, side, exec, status).
-    // exec="paper" iff `order_id` starts with "paper-" (PaperExec's
-    // synthetic id format); else "live" — covers CLOB-issued IDs
-    // and any future executor that doesn't share the paper- prefix.
-    // status comes straight from the orders.status column ("filled"
-    // / "pending" / "partial" / "canceled" today).
-    //
-    // strategy is joined back via decisions.decision_id, same as
-    // settle-pnl does; orders that don't match a decision (legacy
-    // rows or tool-driven inserts) fall into "other".
-    //
-    // Shares the 10s cache TTL with decisions — orders churn at
-    // the same backtest cadence so freshness invariant matches.
-    if let (Some(order_repo), Some(decision_repo)) =
+    // Orders cache refresh.
+    let orders: Option<OrdersCacheEntry> = if let (Some(order_repo), Some(decision_repo)) =
         (s.order_repo.as_ref(), s.decision_repo.as_ref())
     {
         let mut cache_guard = s.orders_cache.write().await;
@@ -840,11 +1035,8 @@ async fn metrics_handler(State(s): State<HealthAppState>) -> impl IntoResponse {
             .as_ref()
             .map(|c| now - c.fetched_at_ms > METRICS_DECISIONS_CACHE_TTL_MS)
             .unwrap_or(true);
-
         if need_refresh {
             let bd = bucket_day(now);
-            // Decisions read can fail independently — if it does, we
-            // fall back to "other" for every order's strategy.
             let strategy_of: std::collections::HashMap<uuid::Uuid, String> =
                 match decision_repo.list_day(bd).await {
                     Ok(rows) => rows
@@ -879,54 +1071,24 @@ async fn metrics_handler(State(s): State<HealthAppState>) -> impl IntoResponse {
                 }
                 Err(e) => {
                     if cache_guard.is_none() {
-                        out.push_str(&format!(
-                            "# orders_today read failed (no cached fallback): {e}\n"
+                        notes.push(format!(
+                            "# orders_today read failed (no cached fallback): {e}"
                         ));
                     } else {
-                        out.push_str(&format!(
-                            "# orders_today refresh failed; serving cached data: {e}\n"
+                        notes.push(format!(
+                            "# orders_today refresh failed; serving cached data: {e}"
                         ));
                     }
                 }
             }
         }
+        cache_guard.clone()
+    } else {
+        None
+    };
 
-        if let Some(cache) = cache_guard.as_ref() {
-            out.push_str(
-                "# HELP agent_orders_today Count of polymarket_btc.orders rows for today's UTC bucket, by strategy/side/exec/status.\n",
-            );
-            out.push_str("# TYPE agent_orders_today gauge\n");
-            for ((strategy, side, exec, status), n) in &cache.counts {
-                out.push_str(&format!(
-                    "agent_orders_today{{strategy=\"{}\",side=\"{}\",exec=\"{}\",status=\"{}\"}} {}\n",
-                    escape_label(strategy),
-                    escape_label(side),
-                    escape_label(exec),
-                    escape_label(status),
-                    n,
-                ));
-            }
-            // Headline scalar (see agent_decisions_today_total).
-            let total: u32 = cache.counts.values().sum();
-            out.push_str(
-                "# HELP agent_orders_today_total Total orders written today across every (strategy, side, exec, status).\n",
-            );
-            out.push_str("# TYPE agent_orders_today_total gauge\n");
-            out.push_str(&format!("agent_orders_today_total {total}\n"));
-        }
-    }
-
-    // Today's realized PnL from polymarket_btc.pnl_daily. Single
-    // value per scrape, surfaces what settle-pnl most recently
-    // computed (and persisted) without re-running Gamma against
-    // every scrape. 60s cache TTL — realized PnL only changes
-    // when settle-pnl runs (default 1h cadence in the daemon) so
-    // freshness ceiling is generous.
-    //
-    // Missing row (settle-pnl hasn't run today, or no orders
-    // settled) → emit nothing. Same "missing series = no data
-    // yet" convention as the subtask-age metrics.
-    if let Some(pnl_repo) = s.pnl_repo.as_ref() {
+    // pnl_daily cache refresh.
+    let pnl_daily: Option<PnlDailyCacheEntry> = if let Some(pnl_repo) = s.pnl_repo.as_ref() {
         let mut cache_guard = s.pnl_daily_cache.write().await;
         let need_refresh = cache_guard
             .as_ref()
@@ -943,247 +1105,105 @@ async fn metrics_handler(State(s): State<HealthAppState>) -> impl IntoResponse {
                 }
                 Err(e) => {
                     if cache_guard.is_none() {
-                        out.push_str(&format!(
-                            "# pnl_daily read failed (no cached fallback): {e}\n"
+                        notes.push(format!(
+                            "# pnl_daily read failed (no cached fallback): {e}"
                         ));
                     } else {
-                        out.push_str(&format!(
-                            "# pnl_daily refresh failed; serving cached data: {e}\n"
+                        notes.push(format!(
+                            "# pnl_daily refresh failed; serving cached data: {e}"
                         ));
                     }
                 }
             }
         }
-        if let Some(cache) = cache_guard.as_ref() {
-            if let Some(row) = cache.row.as_ref() {
-                out.push_str(
-                    "# HELP agent_pnl_daily_realized_usd Realized PnL in USD for today's UTC bucket. Written by settle-pnl; read-only here.\n",
-                );
-                out.push_str("# TYPE agent_pnl_daily_realized_usd gauge\n");
-                out.push_str(&format!(
-                    "agent_pnl_daily_realized_usd {}\n",
-                    row.realized,
-                ));
-                out.push_str(
-                    "# HELP agent_pnl_daily_trades_count Number of settled trades counted into today's realized PnL.\n",
-                );
-                out.push_str("# TYPE agent_pnl_daily_trades_count gauge\n");
-                out.push_str(&format!(
-                    "agent_pnl_daily_trades_count {}\n",
-                    row.n_trades,
-                ));
-            }
-        }
-    }
+        cache_guard.clone()
+    } else {
+        None
+    };
 
-    // Risk-gate state: what limit is loaded and whether the kill
-    // switch is armed right now. `RiskLimits::default()` reads
-    // `RISK_MAX_ORDER_USD` + `RISK_KILL_PATH` from env, which
-    // matches what `auto::route_decision` constructs per backtest
-    // call — so the metric reflects the operative limit at scrape
-    // time, even if env was changed mid-flight (via `systemctl
-    // edit` + restart, etc).
-    //
-    // kill_switch_active is the higher-value of the two: it's the
-    // operator's "did I touch ./KILL?" feedback loop. Re-check the
-    // filesystem on every scrape so latency tops out at one scrape
-    // interval — bounded by Prometheus' 15s default.
-    let risk = RiskLimits::default();
-    out.push_str(
-        "# HELP agent_risk_max_order_usd Current RISK_MAX_ORDER_USD limit ($) in force.\n",
-    );
-    out.push_str("# TYPE agent_risk_max_order_usd gauge\n");
-    out.push_str(&format!(
-        "agent_risk_max_order_usd {}\n",
-        risk.max_order_usd
-    ));
-    out.push_str(
-        "# HELP agent_risk_kill_switch_active 1 when the RISK_KILL_PATH file exists (all orders blocked); 0 otherwise.\n",
-    );
-    out.push_str("# TYPE agent_risk_kill_switch_active gauge\n");
-    out.push_str(&format!(
-        "agent_risk_kill_switch_active {}\n",
-        if risk.kill_switch_path.exists() { 1 } else { 0 },
-    ));
-
-    // Per-(strategy, exec) realized PnL breakdown — sibling to
-    // pnl_daily, also written by settle-pnl. Empty cache means
-    // settle-pnl hasn't run today yet or had no settled trades to
-    // break down; emit no series in that case (same convention as
-    // the pnl_daily gauges above).
-    if let Some(breakdown_repo) = s.pnl_breakdown_repo.as_ref() {
-        let mut cache_guard = s.pnl_breakdown_cache.write().await;
-        let need_refresh = cache_guard
-            .as_ref()
-            .map(|c| now - c.fetched_at_ms > METRICS_PNL_DAILY_CACHE_TTL_MS)
-            .unwrap_or(true);
-        if need_refresh {
-            match breakdown_repo.list_day(bucket_day(now)).await {
-                Ok(rows) => {
-                    *cache_guard = Some(PnlBreakdownCacheEntry {
-                        fetched_at_ms: now,
-                        rows,
-                    });
-                }
-                Err(e) => {
-                    if cache_guard.is_none() {
-                        out.push_str(&format!(
-                            "# pnl_breakdown read failed (no cached fallback): {e}\n"
-                        ));
-                    } else {
-                        out.push_str(&format!(
-                            "# pnl_breakdown refresh failed; serving cached data: {e}\n"
-                        ));
+    // pnl_breakdown cache refresh.
+    let pnl_breakdown: Option<PnlBreakdownCacheEntry> =
+        if let Some(breakdown_repo) = s.pnl_breakdown_repo.as_ref() {
+            let mut cache_guard = s.pnl_breakdown_cache.write().await;
+            let need_refresh = cache_guard
+                .as_ref()
+                .map(|c| now - c.fetched_at_ms > METRICS_PNL_DAILY_CACHE_TTL_MS)
+                .unwrap_or(true);
+            if need_refresh {
+                match breakdown_repo.list_day(bucket_day(now)).await {
+                    Ok(rows) => {
+                        *cache_guard = Some(PnlBreakdownCacheEntry {
+                            fetched_at_ms: now,
+                            rows,
+                        });
+                    }
+                    Err(e) => {
+                        if cache_guard.is_none() {
+                            notes.push(format!(
+                                "# pnl_breakdown read failed (no cached fallback): {e}"
+                            ));
+                        } else {
+                            notes.push(format!(
+                                "# pnl_breakdown refresh failed; serving cached data: {e}"
+                            ));
+                        }
                     }
                 }
             }
-        }
-        if let Some(cache) = cache_guard.as_ref() {
-            if !cache.rows.is_empty() {
-                out.push_str(
-                    "# HELP agent_pnl_breakdown_realized_usd Realized PnL in USD broken down by strategy + exec. Written by settle-pnl; read-only here.\n",
-                );
-                out.push_str("# TYPE agent_pnl_breakdown_realized_usd gauge\n");
-                for row in &cache.rows {
-                    out.push_str(&format!(
-                        "agent_pnl_breakdown_realized_usd{{strategy=\"{}\",exec=\"{}\"}} {}\n",
-                        escape_label(&row.strategy),
-                        escape_label(&row.exec),
-                        row.realized_pnl,
-                    ));
-                }
-                out.push_str(
-                    "# HELP agent_pnl_breakdown_trades_count Number of settled trades in this strategy/exec bucket.\n",
-                );
-                out.push_str("# TYPE agent_pnl_breakdown_trades_count gauge\n");
-                for row in &cache.rows {
-                    out.push_str(&format!(
-                        "agent_pnl_breakdown_trades_count{{strategy=\"{}\",exec=\"{}\"}} {}\n",
-                        escape_label(&row.strategy),
-                        escape_label(&row.exec),
-                        row.n_settled,
-                    ));
-                }
-            }
-        }
-    }
+            cache_guard.clone()
+        } else {
+            None
+        };
 
-    // Open positions snapshot from polymarket_btc.positions_v2.
-    // Two gauges per (market, side) — shares and avg fill price.
-    // Grafana can compute notional via `shares * avg_price` if
-    // needed; pre-computing it here would just bake a third
-    // metric series that's redundant with the input data.
-    //
-    // 10s scrape cache — positions only change on fill events
-    // (paper fills land inline via route_decision, live fills
-    // through the user-channel WS listener). Stale-while-revalidate
-    // on CoreDB failure.
-    if let Some(position_repo) = s.position_repo_for_metrics.as_ref() {
-        let mut cache_guard = s.positions_cache.write().await;
-        let need_refresh = cache_guard
-            .as_ref()
-            .map(|c| now - c.fetched_at_ms > METRICS_DECISIONS_CACHE_TTL_MS)
-            .unwrap_or(true);
-        if need_refresh {
-            match position_repo.list_all().await {
-                Ok(rows) => {
-                    *cache_guard = Some(PositionsCacheEntry {
-                        fetched_at_ms: now,
-                        rows,
-                    });
-                }
-                Err(e) => {
-                    if cache_guard.is_none() {
-                        out.push_str(&format!(
-                            "# open_positions read failed (no cached fallback): {e}\n"
-                        ));
-                    } else {
-                        out.push_str(&format!(
-                            "# open_positions refresh failed; serving cached data: {e}\n"
-                        ));
+    // Positions cache refresh.
+    let positions: Option<PositionsCacheEntry> =
+        if let Some(position_repo) = s.position_repo_for_metrics.as_ref() {
+            let mut cache_guard = s.positions_cache.write().await;
+            let need_refresh = cache_guard
+                .as_ref()
+                .map(|c| now - c.fetched_at_ms > METRICS_DECISIONS_CACHE_TTL_MS)
+                .unwrap_or(true);
+            if need_refresh {
+                match position_repo.list_all().await {
+                    Ok(rows) => {
+                        *cache_guard = Some(PositionsCacheEntry {
+                            fetched_at_ms: now,
+                            rows,
+                        });
+                    }
+                    Err(e) => {
+                        if cache_guard.is_none() {
+                            notes.push(format!(
+                                "# open_positions read failed (no cached fallback): {e}"
+                            ));
+                        } else {
+                            notes.push(format!(
+                                "# open_positions refresh failed; serving cached data: {e}"
+                            ));
+                        }
                     }
                 }
             }
-        }
-        if let Some(cache) = cache_guard.as_ref() {
-            if !cache.rows.is_empty() {
-                out.push_str(
-                    "# HELP agent_open_positions_size Open position size (shares) per (market, side) from positions_v2.\n",
-                );
-                out.push_str("# TYPE agent_open_positions_size gauge\n");
-                for p in &cache.rows {
-                    out.push_str(&format!(
-                        "agent_open_positions_size{{market=\"{}\",side=\"{}\"}} {}\n",
-                        escape_label(&p.market_slug),
-                        escape_label(&p.side),
-                        p.size,
-                    ));
-                }
-                out.push_str(
-                    "# HELP agent_open_positions_avg_price Volume-weighted average fill price per (market, side) in [0,1] Polymarket outcome units.\n",
-                );
-                out.push_str("# TYPE agent_open_positions_avg_price gauge\n");
-                for p in &cache.rows {
-                    out.push_str(&format!(
-                        "agent_open_positions_avg_price{{market=\"{}\",side=\"{}\"}} {}\n",
-                        escape_label(&p.market_slug),
-                        escape_label(&p.side),
-                        p.avg_price,
-                    ));
-                }
-                // Pre-computed notional ($). Same series shape as
-                // `size * avg_price` would give in PromQL, but
-                // emitted as its own named gauge so Grafana panels
-                // can render it without the on(market,side)
-                // label-matching incantation. Cheap to compute
-                // (one f64 multiply per row) and the wire payload
-                // stays linear in position count.
-                out.push_str(
-                    "# HELP agent_open_positions_notional_usd Notional value of the open position in USD — pre-computed `size * avg_price` so single-query panels don't need label-matching.\n",
-                );
-                out.push_str("# TYPE agent_open_positions_notional_usd gauge\n");
-                for p in &cache.rows {
-                    out.push_str(&format!(
-                        "agent_open_positions_notional_usd{{market=\"{}\",side=\"{}\"}} {}\n",
-                        escape_label(&p.market_slug),
-                        escape_label(&p.side),
-                        p.size * p.avg_price,
-                    ));
-                }
-                // Headline summary gauges: count of non-empty
-                // positions and total notional across all of them.
-                // Derivable from the per-row gauges via
-                // `count(agent_open_positions_size > 0)` /
-                // `sum(agent_open_positions_notional_usd)` but a
-                // single named scalar is the right primitive for
-                // Grafana Stat panels — no PromQL needed for the
-                // "how exposed am I right now?" headline.
-                let nonzero = cache.rows.iter().filter(|p| p.size > 0.0).count();
-                let total_notional: f64 = cache.rows.iter().map(|p| p.size * p.avg_price).sum();
-                out.push_str(
-                    "# HELP agent_open_positions_count Number of non-empty open positions (size > 0).\n",
-                );
-                out.push_str("# TYPE agent_open_positions_count gauge\n");
-                out.push_str(&format!("agent_open_positions_count {}\n", nonzero));
-                out.push_str(
-                    "# HELP agent_open_positions_total_notional_usd Sum of notional ($) across every open position.\n",
-                );
-                out.push_str("# TYPE agent_open_positions_total_notional_usd gauge\n");
-                out.push_str(&format!(
-                    "agent_open_positions_total_notional_usd {}\n",
-                    total_notional
-                ));
-            }
-        }
-    }
+            cache_guard.clone()
+        } else {
+            None
+        };
 
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("text/plain; version=0.0.4; charset=utf-8"),
-    );
-    (StatusCode::OK, headers, out)
+    MetricsSnapshot {
+        now_ms: now,
+        health,
+        btc_age_ms,
+        polymarket_age_ms,
+        decisions,
+        orders,
+        pnl_daily,
+        pnl_breakdown,
+        positions,
+        risk: RiskLimits::default(),
+        notes,
+    }
 }
+
 
 /// Shared ingest-staleness cache lookup.
 ///
@@ -1398,6 +1418,138 @@ mod tests {
         assert_eq!(escape_label("a\\b"), "a\\\\b");
         assert_eq!(escape_label("a\"b"), "a\\\"b");
         assert_eq!(escape_label("a\nb"), "a\\nb");
+    }
+
+    /// Drive `render_metrics` with a fully-populated synthetic
+    /// MetricsSnapshot — exercises every conditional branch
+    /// (every cache populated, every subtask field set) so the
+    /// output contains every metric family the daemon can emit.
+    /// Stronger than the source-grep companion: catches "branch
+    /// silently stopped emitting" at runtime, not just textual
+    /// rename.
+    #[test]
+    fn render_metrics_emits_every_family_with_populated_snapshot() {
+        use crate::coredb::types::{PnlBreakdown, PnlDaily, Position};
+        use std::collections::BTreeMap;
+        use std::path::PathBuf;
+
+        let mut decisions_counts = BTreeMap::new();
+        decisions_counts.insert(("baseline".to_string(), "YES".to_string()), 3);
+        let mut orders_counts = BTreeMap::new();
+        orders_counts.insert(
+            ("baseline".into(), "YES".into(), "paper".into(), "filled".into()),
+            2,
+        );
+
+        let snap = super::MetricsSnapshot {
+            now_ms: 1_700_000_010_000,
+            health: super::HealthState {
+                started_at_ms: 1_700_000_000_000,
+                backtest: super::SubtaskHealth {
+                    last_tick_ms: Some(1_700_000_005_000),
+                    last_success_ms: Some(1_700_000_005_000),
+                    last_error_ms: None,
+                    last_error: None,
+                    consecutive_errors: 0,
+                },
+                compare: super::SubtaskHealth::default(),
+                settle: super::SubtaskHealth::default(),
+                user_channel_present: true,
+            },
+            btc_age_ms: Some(500),
+            polymarket_age_ms: Some(12_000),
+            decisions: Some(super::DecisionsCacheEntry {
+                fetched_at_ms: 1_700_000_009_000,
+                counts: decisions_counts,
+            }),
+            orders: Some(super::OrdersCacheEntry {
+                fetched_at_ms: 1_700_000_009_000,
+                counts: orders_counts,
+            }),
+            pnl_daily: Some(super::PnlDailyCacheEntry {
+                fetched_at_ms: 1_700_000_009_000,
+                row: Some(PnlDaily {
+                    day_ms: 1_700_000_000_000,
+                    realized: 12.34,
+                    unrealized: 0.0,
+                    n_trades: 5,
+                    llm_cost_usd: 0.0,
+                }),
+            }),
+            pnl_breakdown: Some(super::PnlBreakdownCacheEntry {
+                fetched_at_ms: 1_700_000_009_000,
+                rows: vec![PnlBreakdown {
+                    bucket_day_ms: 1_700_000_000_000,
+                    strategy: "baseline".into(),
+                    exec: "paper".into(),
+                    realized_pnl: 12.34,
+                    n_settled: 5,
+                }],
+            }),
+            positions: Some(super::PositionsCacheEntry {
+                fetched_at_ms: 1_700_000_009_000,
+                rows: vec![Position {
+                    market_slug: "m".into(),
+                    side: "YES".into(),
+                    size: 10.0,
+                    avg_price: 0.5,
+                    updated_at_ms: 1_700_000_005_000,
+                }],
+            }),
+            risk: super::RiskLimits {
+                max_order_usd: 25.0,
+                kill_switch_path: PathBuf::from("/tmp/__definitely_nonexistent__"),
+            },
+            notes: vec!["# heads up, this is a test note".to_string()],
+        };
+
+        let out = super::render_metrics(&snap);
+
+        // Every metric family from EXPECTED_FAMILIES must appear as
+        // an actual `agent_<name>` sample line, not just a TYPE
+        // header. Stronger guarantee than the grep test below.
+        const EXPECTED_FAMILIES: &[&str] = &[
+            "agent_decisions_today",
+            "agent_decisions_today_cache_age_seconds",
+            "agent_decisions_today_total",
+            "agent_ingest_age_seconds",
+            "agent_open_positions_avg_price",
+            "agent_open_positions_count",
+            "agent_open_positions_notional_usd",
+            "agent_open_positions_size",
+            "agent_open_positions_total_notional_usd",
+            "agent_orders_today",
+            "agent_orders_today_total",
+            "agent_pnl_breakdown_realized_usd",
+            "agent_pnl_breakdown_trades_count",
+            "agent_pnl_daily_realized_usd",
+            "agent_pnl_daily_trades_count",
+            "agent_risk_kill_switch_active",
+            "agent_risk_max_order_usd",
+            "agent_subtask_consecutive_errors",
+            "agent_subtask_last_success_age_seconds",
+            "agent_subtask_last_tick_age_seconds",
+            "agent_uptime_seconds",
+            "agent_user_channel_present",
+        ];
+        for family in EXPECTED_FAMILIES {
+            // Either the bare name (for scalars) or the `{` suffix
+            // (for labelled gauges) — both forms count as "this
+            // family produced a sample". Anchor with `\n` so we
+            // don't match prefix overlap (`foo_total` vs `foo`).
+            let bare = format!("\n{family} ");
+            let labelled = format!("\n{family}{{");
+            assert!(
+                out.contains(&bare) || out.contains(&labelled),
+                "render_metrics did not emit a sample line for `{family}`",
+            );
+        }
+
+        // Notes prepended at the top.
+        assert!(
+            out.starts_with("# heads up, this is a test note"),
+            "render_metrics dropped the notes preamble",
+        );
     }
 
     /// Pin the set of metric family names the daemon's /metrics
