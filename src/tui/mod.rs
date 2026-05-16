@@ -1094,13 +1094,15 @@ fn draw(
             // footer + 1-row "7d total:" footer, both rendered
             // below the table's box.
             Constraint::Length(8),                  // strategy pnl + yesterday + 7d footers
-            // 6 = bordered comparison table (1 border + 1 header
-            // + up to 3 data rows + 1 border). One row per
-            // strategy: today / yesterday / 7d / agreement-rate.
-            // Consolidates the per-strategy numbers that were
-            // previously spread across the strategy-pnl trend
-            // sparkline + the two footer chip lines.
-            Constraint::Length(6),                  // strategy comparison
+            // 7 = bordered comparison table (1 top border + 1
+            // header + up to 4 data rows + 1 bottom border). One
+            // row per strategy: rank# / today / yesterday / 7d /
+            // agreement-rate. Consolidates the per-strategy
+            // numbers that were previously spread across the
+            // strategy-pnl trend sparkline + the two footer chip
+            // lines. 4 data rows fits typical 2-4 strategy LLM
+            // configs without needing a scroll.
+            Constraint::Length(7),                  // strategy comparison
             Constraint::Min(5),                     // market consensus
             Constraint::Min(5),                     // positions
             Constraint::Min(7),                     // recent decisions
@@ -1513,6 +1515,7 @@ fn draw_strategy_comparison(
         Some(name) => format!("vs {name}"),
     };
     let header = Row::new(vec![
+        Cell::from("#"),
         Cell::from("strategy"),
         Cell::from("today Σpnl"),
         Cell::from("yesterday"),
@@ -1522,7 +1525,24 @@ fn draw_strategy_comparison(
     .style(Style::default().add_modifier(Modifier::BOLD));
 
     let mut rows: Vec<Row> = Vec::new();
-    for r in &rows_data {
+    for (i, r) in rows_data.iter().enumerate() {
+        // 1-based rank: rows are already sorted 7d-desc with
+        // alphabetical tiebreak, so position == rank. Explicit
+        // number makes "who's winning?" unambiguous even when
+        // scrolling clips lower rows mid-list. Top-3 ranks get a
+        // gold/silver/bronze accent so the eye lands there first;
+        // 4+ stays neutral.
+        let rank = i + 1;
+        let rank_color = match rank {
+            1 => Color::Yellow, // gold
+            2 => Color::Gray,   // silver — closest ratatui has to it
+            3 => Color::LightRed, // bronze-ish
+            _ => Color::DarkGray,
+        };
+        let rank_cell = Cell::from(Span::styled(
+            format!("#{rank}"),
+            Style::default().fg(rank_color).add_modifier(Modifier::BOLD),
+        ));
         let is_active = strategy_filter == Some(r.strategy.as_str());
         let strategy_cell = if is_active {
             Cell::from(Span::styled(
@@ -1553,6 +1573,7 @@ fn draw_strategy_comparison(
             )),
         };
         rows.push(Row::new(vec![
+            rank_cell,
             strategy_cell,
             cell_money(r.today_pnl),
             cell_money(r.yesterday_pnl),
@@ -1567,6 +1588,7 @@ fn draw_strategy_comparison(
         " strategy comparison ".to_string()
     };
     let widths = [
+        Constraint::Length(3),  // rank column "#NN"
         Constraint::Length(12),
         Constraint::Length(12),
         Constraint::Length(12),
@@ -2679,7 +2701,13 @@ mod tests {
         s.pnl_breakdown_window = pnl_breakdown_window;
 
         let strategies = super::strategies_in_view(&s);
-        let backend = TestBackend::new(140, 35);
+        // 50 rows tall: 4 (header) + 8 (strategy pnl) + 7
+        // (comparison) + 5 + 5 + 7 (3 Min panels) + 4 (footer) = 40
+        // wanted; the extra 10 rows give the Min chunks room to
+        // expand rather than getting squeezed (and shrinking the
+        // adjacent Length chunks with them, which silently clipped
+        // the comparison panel's bottom rows back when this was 35).
+        let backend = TestBackend::new(140, 50);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
             .draw(|f| {
@@ -3401,6 +3429,43 @@ mod tests {
             dump.contains("$+1.50"),
             "expected baseline yesterday value $+1.50 in dump"
         );
+    }
+
+    /// Rank prefix on each row matches the sort position. The
+    /// comparison panel is 7d-desc-sorted, so the top row gets
+    /// "#1", the next "#2", etc. Pin the indicator so a refactor
+    /// that drops the rank cell or swaps in a different format
+    /// (e.g. "1." vs "#1") fails loudly.
+    #[test]
+    fn panel_strategy_comparison_shows_rank_prefix() {
+        let window = vec![
+            super::PnlBreakdown {
+                bucket_day_ms: 0,
+                strategy: "deepseek".into(),
+                exec: "paper".into(),
+                realized_pnl: 100.0,
+                n_settled: 1,
+            },
+            super::PnlBreakdown {
+                bucket_day_ms: 0,
+                strategy: "anthropic".into(),
+                exec: "paper".into(),
+                realized_pnl: 50.0,
+                n_settled: 1,
+            },
+            super::PnlBreakdown {
+                bucket_day_ms: 0,
+                strategy: "baseline".into(),
+                exec: "paper".into(),
+                realized_pnl: -10.0,
+                n_settled: 1,
+            },
+        ];
+        let dump = render_test_dashboard_full(None, None, Vec::new(), window);
+        // Header indicator (just "#") and the three ranks.
+        assert!(dump.contains("#1"), "expected #1 rank in dump:\n{dump}");
+        assert!(dump.contains("#2"), "expected #2 rank in dump:\n{dump}");
+        assert!(dump.contains("#3"), "expected #3 rank in dump:\n{dump}");
     }
 
     /// Filter highlight: when a strategy_filter is active, that
