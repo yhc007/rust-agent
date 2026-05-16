@@ -36,6 +36,7 @@ use crate::coredb::btc::BtcTickRepo;
 use crate::coredb::decisions::DecisionRepo;
 use crate::coredb::markets::MarketRepo;
 use crate::coredb::orders::{OrderRepo, PositionRepo};
+use crate::coredb::pnl::PnlRepo;
 use crate::coredb::types::{bucket_day, now_ms};
 use crate::coredb::CoreDb;
 use crate::data::{binance, polymarket, user_channel};
@@ -356,6 +357,7 @@ pub async fn run(cfg: DaemonConfig) -> Result<()> {
         // Wrapped in Arc so HealthAppState's Clone stays cheap.
         let decision_repo = DecisionRepo::new(db.session()).await.ok().map(Arc::new);
         let order_repo = OrderRepo::new(db.session()).await.ok().map(Arc::new);
+        let pnl_repo = PnlRepo::new(db.session()).await.ok().map(Arc::new);
         let app_state = HealthAppState {
             health: health.clone(),
             btc_repo: btc_repo_for_health,
@@ -364,6 +366,8 @@ pub async fn run(cfg: DaemonConfig) -> Result<()> {
             decisions_cache: Arc::new(RwLock::new(None)),
             order_repo,
             orders_cache: Arc::new(RwLock::new(None)),
+            pnl_repo,
+            pnl_daily_cache: Arc::new(RwLock::new(None)),
             ingest_cache: Arc::new(RwLock::new(None)),
         };
         let app = Router::new()
@@ -501,6 +505,24 @@ struct OrdersCacheEntry {
     counts: std::collections::BTreeMap<(String, String, String, String), u32>,
 }
 
+/// Cached today's `pnl_daily` row. Realized PnL only changes when
+/// `settle-pnl` runs and markets resolve — both hours-scale events
+/// — so a 60s TTL is plenty of freshness without hammering CoreDB.
+/// The row is small (single-row partition lookup) but the cache
+/// keeps scrape latency bounded.
+#[derive(Debug, Clone)]
+struct PnlDailyCacheEntry {
+    fetched_at_ms: i64,
+    /// `None` when no row exists for today yet — settle-pnl hasn't
+    /// run, or no orders have resolved.
+    row: Option<crate::coredb::types::PnlDaily>,
+}
+
+/// TTL for the pnl_daily cache. Longer than the decisions cache
+/// because realized PnL only ticks when settle-pnl runs (default
+/// 1h cadence in the daemon).
+const METRICS_PNL_DAILY_CACHE_TTL_MS: i64 = 60_000;
+
 /// Cached pair of ingest-staleness ages. Stored as a unit (not
 /// per-source) so a transient one-source outage shows up in the
 /// next refresh as `None` rather than being masked by per-source
@@ -533,6 +555,10 @@ struct HealthAppState {
     /// originating strategy via decision_id.
     order_repo: Option<Arc<OrderRepo>>,
     orders_cache: Arc<RwLock<Option<OrdersCacheEntry>>>,
+    /// Used by `/metrics` for the agent_pnl_daily_realized_usd
+    /// gauge. settle-pnl writes here; the metrics handler reads.
+    pnl_repo: Option<Arc<PnlRepo>>,
+    pnl_daily_cache: Arc<RwLock<Option<PnlDailyCacheEntry>>>,
     /// Shared cache for the two ingest-staleness probes that
     /// `/health` and `/metrics` both need. Refresh on TTL expiry
     /// runs both probes once and stores whatever comes back, so a
@@ -832,6 +858,66 @@ async fn metrics_handler(State(s): State<HealthAppState>) -> impl IntoResponse {
                     escape_label(exec),
                     escape_label(status),
                     n,
+                ));
+            }
+        }
+    }
+
+    // Today's realized PnL from polymarket_btc.pnl_daily. Single
+    // value per scrape, surfaces what settle-pnl most recently
+    // computed (and persisted) without re-running Gamma against
+    // every scrape. 60s cache TTL — realized PnL only changes
+    // when settle-pnl runs (default 1h cadence in the daemon) so
+    // freshness ceiling is generous.
+    //
+    // Missing row (settle-pnl hasn't run today, or no orders
+    // settled) → emit nothing. Same "missing series = no data
+    // yet" convention as the subtask-age metrics.
+    if let Some(pnl_repo) = s.pnl_repo.as_ref() {
+        let mut cache_guard = s.pnl_daily_cache.write().await;
+        let need_refresh = cache_guard
+            .as_ref()
+            .map(|c| now - c.fetched_at_ms > METRICS_PNL_DAILY_CACHE_TTL_MS)
+            .unwrap_or(true);
+        if need_refresh {
+            let bd = bucket_day(now);
+            match pnl_repo.range(bd, bd).await {
+                Ok(rows) => {
+                    *cache_guard = Some(PnlDailyCacheEntry {
+                        fetched_at_ms: now,
+                        row: rows.into_iter().next(),
+                    });
+                }
+                Err(e) => {
+                    if cache_guard.is_none() {
+                        out.push_str(&format!(
+                            "# pnl_daily read failed (no cached fallback): {e}\n"
+                        ));
+                    } else {
+                        out.push_str(&format!(
+                            "# pnl_daily refresh failed; serving cached data: {e}\n"
+                        ));
+                    }
+                }
+            }
+        }
+        if let Some(cache) = cache_guard.as_ref() {
+            if let Some(row) = cache.row.as_ref() {
+                out.push_str(
+                    "# HELP agent_pnl_daily_realized_usd Realized PnL in USD for today's UTC bucket. Written by settle-pnl; read-only here.\n",
+                );
+                out.push_str("# TYPE agent_pnl_daily_realized_usd gauge\n");
+                out.push_str(&format!(
+                    "agent_pnl_daily_realized_usd {}\n",
+                    row.realized,
+                ));
+                out.push_str(
+                    "# HELP agent_pnl_daily_trades_count Number of settled trades counted into today's realized PnL.\n",
+                );
+                out.push_str("# TYPE agent_pnl_daily_trades_count gauge\n");
+                out.push_str(&format!(
+                    "agent_pnl_daily_trades_count {}\n",
+                    row.n_trades,
                 ));
             }
         }
