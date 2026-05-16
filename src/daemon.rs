@@ -254,14 +254,93 @@ pub async fn run(cfg: DaemonConfig) -> Result<()> {
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
-    // 1. Ingest pollers (long-running tasks). These already accept a
-    //    watch::Receiver and exit cleanly when it flips to `true`.
+    // 1. Ingest pollers (long-running tasks). Wrap each in a
+    //    supervisor that respawns the worker if the corresponding
+    //    repo's newest row goes stale past INGEST_STALE_RESTART_S
+    //    seconds. Covers stuck WS connections / hung HTTP polls
+    //    where the inner reconnect loop never fires because the
+    //    OS sees the socket as alive. The supervisor itself
+    //    observes the shared shutdown signal so a daemon Ctrl+C
+    //    drops both supervisor + worker cleanly.
+    //
     //    Clone the repo handles for the health endpoint before
-    //    they move into the spawn — the handler reads them too.
+    //    they move into the supervisor — the handler reads them
+    //    too.
     let btc_repo_for_health = btc_repo.clone();
     let market_repo_for_health = market_repo.clone();
-    let h_binance = tokio::spawn(binance::run(btc_repo, shutdown_rx.clone()));
-    let h_polymarket = tokio::spawn(polymarket::run(market_repo, shutdown_rx.clone()));
+    let stale_threshold_ms = ingest_stale_restart_ms();
+    info!(
+        "daemon: ingest watchdog threshold = {}ms (0 disables)",
+        stale_threshold_ms,
+    );
+    let h_binance = tokio::spawn({
+        let btc_repo = btc_repo.clone();
+        let shutdown_rx = shutdown_rx.clone();
+        async move {
+            supervised_ingest(
+                "binance",
+                stale_threshold_ms,
+                {
+                    let btc_repo = btc_repo.clone();
+                    move || {
+                        let r = btc_repo.clone();
+                        async move {
+                            r.latest("BTCUSDT")
+                                .await
+                                .ok()
+                                .flatten()
+                                .map(|t| (now_ms() - t.ts_ms).max(0))
+                        }
+                    }
+                },
+                {
+                    let btc_repo = btc_repo.clone();
+                    move |sub_shutdown| {
+                        let r = btc_repo.clone();
+                        tokio::spawn(async move { binance::run(r, sub_shutdown).await })
+                    }
+                },
+                shutdown_rx,
+            )
+            .await;
+            Ok::<(), anyhow::Error>(())
+        }
+    });
+    let h_polymarket = tokio::spawn({
+        let market_repo = market_repo.clone();
+        let shutdown_rx = shutdown_rx.clone();
+        async move {
+            supervised_ingest(
+                "polymarket",
+                stale_threshold_ms,
+                {
+                    let market_repo = market_repo.clone();
+                    move || {
+                        let r = market_repo.clone();
+                        async move {
+                            r.list_open()
+                                .await
+                                .ok()
+                                .and_then(|rows| {
+                                    rows.iter().map(|m| m.updated_at_ms).max()
+                                })
+                                .map(|t| (now_ms() - t).max(0))
+                        }
+                    }
+                },
+                {
+                    let market_repo = market_repo.clone();
+                    move |sub_shutdown| {
+                        let r = market_repo.clone();
+                        tokio::spawn(async move { polymarket::run(r, sub_shutdown).await })
+                    }
+                },
+                shutdown_rx,
+            )
+            .await;
+            Ok::<(), anyhow::Error>(())
+        }
+    });
 
     // Polymarket user-channel WS listener — only spawned when CLOB
     // credentials are visible in env. Paper-only deployments skip
@@ -523,6 +602,23 @@ const METRICS_DECISIONS_CACHE_TTL_MS: i64 = 10_000;
 /// per-scrape btc.latest + markets.list_open round-trips that
 /// /health and /metrics each used to issue independently.
 const INGEST_CACHE_TTL_MS: i64 = 5_000;
+
+/// Default threshold for the ingest watchdog. When the newest btc
+/// tick (or polymarket market) is older than this, the supervisor
+/// aborts the running worker and respawns a fresh one — covers
+/// stuck WS connections where the underlying reconnect loop never
+/// fires because the OS sees the socket as alive. Operator can
+/// override via `INGEST_STALE_RESTART_S` env (seconds). Set to 0 to
+/// disable auto-restart entirely.
+const DEFAULT_INGEST_STALE_RESTART_MS: i64 = 5 * 60 * 1000;
+
+fn ingest_stale_restart_ms() -> i64 {
+    std::env::var("INGEST_STALE_RESTART_S")
+        .ok()
+        .and_then(|s| s.parse::<i64>().ok())
+        .map(|s| s.saturating_mul(1000))
+        .unwrap_or(DEFAULT_INGEST_STALE_RESTART_MS)
+}
 
 #[derive(Debug, Clone)]
 struct DecisionsCacheEntry {
@@ -1710,6 +1806,90 @@ fn load_clob_creds_from_env() -> Option<ApiCreds> {
     })
 }
 
+/// Supervise an ingest worker: spawn it, probe its data
+/// freshness every 60s, abort + respawn if the newest row is older
+/// than `stale_threshold_ms`. A threshold of 0 disables auto-
+/// restart entirely (the worker still runs; we just don't watch
+/// it).
+///
+/// `probe` reads the latest row age; `spawn` takes a per-worker
+/// shutdown receiver and returns a JoinHandle for the spawned
+/// task. The supervisor owns one watch::Sender per worker so it
+/// can issue a graceful shutdown before resorting to abort.
+///
+/// On global shutdown the supervisor signals the worker via its
+/// per-worker channel, awaits it briefly, and returns.
+async fn supervised_ingest<P, PFut, S>(
+    label: &'static str,
+    stale_threshold_ms: i64,
+    mut probe: P,
+    mut spawn: S,
+    mut shutdown: watch::Receiver<bool>,
+) where
+    P: FnMut() -> PFut + Send + 'static,
+    PFut: std::future::Future<Output = Option<i64>> + Send,
+    S: FnMut(watch::Receiver<bool>) -> tokio::task::JoinHandle<Result<()>> + Send + 'static,
+{
+    // Per-worker shutdown channel. Re-created on each restart so an
+    // earlier "shutdown then respawn" can't leak the prior signal.
+    let (mut worker_tx, worker_rx) = watch::channel(false);
+    let mut handle = spawn(worker_rx);
+    let mut tick = interval(Duration::from_secs(60));
+    tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    // Skip the immediate first tick: workers need time to make
+    // their first WS / HTTP probe before we evaluate freshness.
+    tick.tick().await;
+
+    loop {
+        tokio::select! {
+            biased;
+            _ = shutdown.changed() => {
+                if *shutdown.borrow() {
+                    info!("ingest supervisor {label}: daemon shutdown — stopping worker");
+                    let _ = worker_tx.send(true);
+                    let _ = handle.await;
+                    return;
+                }
+            }
+            _ = tick.tick() => {
+                if stale_threshold_ms <= 0 {
+                    continue;
+                }
+                if let Some(age_ms) = probe().await {
+                    if age_ms > stale_threshold_ms {
+                        warn!(
+                            "ingest supervisor {label}: stale ({}ms > {}ms threshold) — restarting worker",
+                            age_ms, stale_threshold_ms,
+                        );
+                        // Graceful shutdown first, then abort if it
+                        // doesn't drain promptly. Abort is safe —
+                        // both workers drop their socket / HTTP
+                        // client on Drop.
+                        let _ = worker_tx.send(true);
+                        let abort_deadline = tokio::time::sleep(Duration::from_secs(5));
+                        tokio::pin!(abort_deadline);
+                        tokio::select! {
+                            _ = &mut handle => {}
+                            _ = &mut abort_deadline => {
+                                warn!("ingest supervisor {label}: worker did not drain in 5s — aborting");
+                                handle.abort();
+                                let _ = (&mut handle).await;
+                            }
+                        }
+                        // Fresh channel + fresh task. The old `tx`
+                        // is dropped at end of scope; readers of
+                        // the new `rx` start clean.
+                        let (new_tx, new_rx) = watch::channel(false);
+                        worker_tx = new_tx;
+                        handle = spawn(new_rx);
+                        info!("ingest supervisor {label}: worker respawned");
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// One periodic-job loop. Names the task in log lines, optionally
 /// skips the immediate first tick (so compare/settle don't try to read
 /// before backtest has populated anything), records every tick /
@@ -2428,6 +2608,89 @@ mod tests {
                  EXPECTED_FAMILIES — please add it (and update CLAUDE.md)",
             );
         }
+    }
+
+    /// Env-parsing for the ingest watchdog threshold. Default,
+    /// explicit override, "0 = disabled", and malformed value all
+    /// round-trip through the same accessor the daemon uses.
+    #[test]
+    fn ingest_stale_restart_ms_env_parsing() {
+        // Hermetic: clear before each branch.
+        std::env::remove_var("INGEST_STALE_RESTART_S");
+        assert_eq!(
+            super::ingest_stale_restart_ms(),
+            super::DEFAULT_INGEST_STALE_RESTART_MS,
+        );
+
+        std::env::set_var("INGEST_STALE_RESTART_S", "120");
+        assert_eq!(super::ingest_stale_restart_ms(), 120_000);
+
+        // 0 = disabled; the supervisor checks `<= 0` and skips.
+        std::env::set_var("INGEST_STALE_RESTART_S", "0");
+        assert_eq!(super::ingest_stale_restart_ms(), 0);
+
+        // Malformed string → fall back to default.
+        std::env::set_var("INGEST_STALE_RESTART_S", "not-a-number");
+        assert_eq!(
+            super::ingest_stale_restart_ms(),
+            super::DEFAULT_INGEST_STALE_RESTART_MS,
+        );
+
+        std::env::remove_var("INGEST_STALE_RESTART_S");
+    }
+
+    /// Supervisor respawns the worker when the probe reports
+    /// staleness above threshold. The probe returns 1_000_000ms
+    /// (way over the 5-min default); the spawn closure counts
+    /// calls. After two probe ticks (≈ first 60s + restart) the
+    /// counter must be ≥ 2.
+    ///
+    /// Uses a 50ms tick window via overriding TOKIO_TEST sleeps —
+    /// actually no, the supervisor's interval is hardcoded to
+    /// 60s. To make this fast we use `tokio::time::pause()` to
+    /// mock the clock and advance manually.
+    #[tokio::test(start_paused = true)]
+    async fn supervised_ingest_respawns_when_probe_reports_stale() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let spawn_calls = Arc::new(AtomicUsize::new(0));
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let spawn_calls_for_spawn = Arc::clone(&spawn_calls);
+        let spawn_fn = move |_rx: watch::Receiver<bool>| {
+            spawn_calls_for_spawn.fetch_add(1, Ordering::SeqCst);
+            // Worker that exits immediately — supervisor will
+            // notice the handle drained but doesn't react to that
+            // (only to staleness). The next probe tick fires the
+            // restart.
+            tokio::spawn(async move { Ok(()) })
+        };
+
+        // Probe always reports massive staleness.
+        let probe_fn = || async { Some(1_000_000_i64) };
+
+        let supervisor = tokio::spawn(super::supervised_ingest(
+            "test",
+            5_000, // 5s threshold (way under the 1Ms reported)
+            probe_fn,
+            spawn_fn,
+            shutdown_rx,
+        ));
+
+        // Advance the clock past two probe ticks (60s interval +
+        // a bit). Spawn count should grow: initial spawn at start,
+        // plus a restart after each stale tick. Be generous with
+        // sleep — tokio's paused clock advances synchronously so
+        // multiple ticks fire in one .advance call.
+        tokio::time::sleep(std::time::Duration::from_secs(125)).await;
+
+        let n = spawn_calls.load(Ordering::SeqCst);
+        assert!(
+            n >= 2,
+            "expected supervisor to respawn at least once after staleness; got {n} spawn calls",
+        );
+
+        let _ = shutdown_tx.send(true);
+        let _ = supervisor.await;
     }
 
     #[tokio::test]
