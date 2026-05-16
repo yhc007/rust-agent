@@ -1778,7 +1778,26 @@ fn draw_strategy_pnl(
         " strategy pnl (no snapshots yet — run `compare-pnl` or daemon) ".to_string()
     } else {
         let span_label = ts_span_label(&s.snapshots);
-        format!(" strategy pnl (latest snapshot per strategy, trend ~ {span_label}) ")
+        // Filter-aware annotation: append the focused strategy's
+        // latest-snapshot stats (decisions count + Σ pnl) so the
+        // operator sees their headline numbers in the title
+        // without scanning the row. Mirrors the positions +
+        // consensus titles' filter-aware annotations.
+        let focused_stats = strategy_filter.and_then(|name| {
+            by_strategy
+                .get(name)
+                .and_then(|series| series.last().copied())
+                .map(|latest| {
+                    format!(
+                        " — {name}: {} decisions, Σ${:+.2}",
+                        latest.n_decisions, latest.sum_pnl
+                    )
+                })
+        });
+        format!(
+            " strategy pnl (latest snapshot per strategy, trend ~ {span_label}{}) ",
+            focused_stats.as_deref().unwrap_or(""),
+        )
     };
     let widths = [
         Constraint::Length(10),
@@ -4453,6 +4472,79 @@ mod tests {
             }
         }
         out
+    }
+
+    /// Strategy-pnl title gets a focused-stats annotation when
+    /// filter is active. Format: " strategy pnl (latest …,
+    /// trend ~ today's series — <name>: N decisions, Σ$X.XX) ".
+    /// Filter inactive → no annotation.
+    #[test]
+    fn panel_strategy_pnl_title_shows_focused_stats() {
+        use crate::coredb::types::StrategyPnlSnapshot;
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let mut s = super::Snapshot::default();
+        s.snapshots = vec![
+            StrategyPnlSnapshot {
+                bucket_day_ms: 0, ts_ms: 1, strategy: "baseline".into(),
+                n_decisions: 100, sum_size_usd: 500.0, sum_pnl: 12.34,
+                n_yes: 30, n_no: 30, n_pass: 40,
+            },
+            StrategyPnlSnapshot {
+                bucket_day_ms: 0, ts_ms: 1, strategy: "deepseek".into(),
+                n_decisions: 50, sum_size_usd: 250.0, sum_pnl: -5.67,
+                n_yes: 10, n_no: 30, n_pass: 10,
+            },
+        ];
+        let strategies = super::strategies_in_view(&s);
+        let prev_ranks: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+
+        // Filter active → focused-stats annotation.
+        let backend = TestBackend::new(140, 50);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                super::draw(
+                    f,
+                    &s,
+                    std::time::Duration::from_millis(0),
+                    std::time::Duration::from_secs(42),
+                    &strategies,
+                    Some("baseline"),
+                    &prev_ranks,
+                    super::ComparisonSort::DEFAULT,
+                )
+            })
+            .unwrap();
+        let dump = render_buffer(terminal.backend().buffer());
+        assert!(
+            dump.contains("baseline: 100 decisions, Σ$+12.34"),
+            "expected focused-stats annotation in title:\n{dump}",
+        );
+
+        // Filter inactive → no annotation.
+        let backend2 = TestBackend::new(140, 50);
+        let mut terminal2 = Terminal::new(backend2).unwrap();
+        terminal2
+            .draw(|f| {
+                super::draw(
+                    f,
+                    &s,
+                    std::time::Duration::from_millis(0),
+                    std::time::Duration::from_secs(42),
+                    &strategies,
+                    None,
+                    &prev_ranks,
+                    super::ComparisonSort::DEFAULT,
+                )
+            })
+            .unwrap();
+        let dump_plain = render_buffer(terminal2.backend().buffer());
+        assert!(
+            !dump_plain.contains("decisions, Σ$"),
+            "no decisions-Σ annotation should appear without filter:\n{dump_plain}",
+        );
     }
 
     /// Strategy-pnl panel applies the same dim treatment as the
