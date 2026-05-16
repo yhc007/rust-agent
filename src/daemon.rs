@@ -606,31 +606,61 @@ struct HealthAppState {
 
 async fn health_handler(State(s): State<HealthAppState>) -> Json<HealthResponse> {
     let now = now_ms();
-    let snap = s.health.read().await;
+    let inputs = gather_health_inputs(&s, now).await;
+    Json(compute_health_response(&inputs))
+}
 
-    let (btc_age, polymarket_age) = ingest_ages_cached(&s, now).await;
+/// Pre-gathered inputs the pure `compute_health_response` function
+/// needs. Same gather/render split idea as `metrics_handler` —
+/// keeps cache locks acquired only during the async refresh, and
+/// makes the status / serialization logic testable in isolation
+/// without scylla sessions.
+#[derive(Debug, Clone)]
+pub struct HealthInputs {
+    pub now_ms: i64,
+    pub health: HealthState,
+    pub btc_age_ms: Option<i64>,
+    pub polymarket_age_ms: Option<i64>,
+}
 
-    let ingest_ok = match (btc_age, polymarket_age) {
+async fn gather_health_inputs(s: &HealthAppState, now: i64) -> HealthInputs {
+    let health = s.health.read().await.clone();
+    let (btc_age_ms, polymarket_age_ms) = ingest_ages_cached(s, now).await;
+    HealthInputs {
+        now_ms: now,
+        health,
+        btc_age_ms,
+        polymarket_age_ms,
+    }
+}
+
+/// Pure /health response builder. Status is "ok" iff every periodic
+/// subtask has `< UNHEALTHY_AFTER_ERRORS` consecutive errors AND
+/// both ingest sources have an age below `INGEST_STALE_MS`. Any
+/// `None` ingest age (probe failed entirely) counts as stale —
+/// operators want the bad state to fire, not be masked by a
+/// missing measurement.
+pub fn compute_health_response(inp: &HealthInputs) -> HealthResponse {
+    let ingest_ok = match (inp.btc_age_ms, inp.polymarket_age_ms) {
         (Some(b), Some(p)) => b < INGEST_STALE_MS && p < INGEST_STALE_MS,
         _ => false,
     };
-    let periodic_ok = snap.backtest.consecutive_errors < UNHEALTHY_AFTER_ERRORS
-        && snap.compare.consecutive_errors < UNHEALTHY_AFTER_ERRORS
-        && snap.settle.consecutive_errors < UNHEALTHY_AFTER_ERRORS;
+    let periodic_ok = inp.health.backtest.consecutive_errors < UNHEALTHY_AFTER_ERRORS
+        && inp.health.compare.consecutive_errors < UNHEALTHY_AFTER_ERRORS
+        && inp.health.settle.consecutive_errors < UNHEALTHY_AFTER_ERRORS;
     let status = if ingest_ok && periodic_ok { "ok" } else { "degraded" };
-
-    Json(HealthResponse {
+    HealthResponse {
         status,
-        started_at_ms: snap.started_at_ms,
-        now_ms: now,
-        uptime_secs: (now - snap.started_at_ms) / 1000,
-        backtest: snap.backtest.clone(),
-        compare: snap.compare.clone(),
-        settle: snap.settle.clone(),
-        user_channel_present: snap.user_channel_present,
-        ingest_btc_age_ms: btc_age,
-        ingest_polymarket_age_ms: polymarket_age,
-    })
+        started_at_ms: inp.health.started_at_ms,
+        now_ms: inp.now_ms,
+        uptime_secs: (inp.now_ms - inp.health.started_at_ms) / 1000,
+        backtest: inp.health.backtest.clone(),
+        compare: inp.health.compare.clone(),
+        settle: inp.health.settle.clone(),
+        user_channel_present: inp.health.user_channel_present,
+        ingest_btc_age_ms: inp.btc_age_ms,
+        ingest_polymarket_age_ms: inp.polymarket_age_ms,
+    }
 }
 
 /// Pre-gathered data the pure `render_metrics` renderer needs to
@@ -1418,6 +1448,65 @@ mod tests {
         assert_eq!(escape_label("a\\b"), "a\\\\b");
         assert_eq!(escape_label("a\"b"), "a\\\"b");
         assert_eq!(escape_label("a\nb"), "a\\nb");
+    }
+
+    /// Builder for the pure `compute_health_response` test cases.
+    /// Defaults to a "fresh + happy" state — every test tweaks the
+    /// fields relevant to the branch it's exercising.
+    fn happy_inputs() -> super::HealthInputs {
+        super::HealthInputs {
+            now_ms: 1_700_000_010_000,
+            health: super::HealthState {
+                started_at_ms: 1_700_000_000_000,
+                backtest: super::SubtaskHealth::default(),
+                compare: super::SubtaskHealth::default(),
+                settle: super::SubtaskHealth::default(),
+                user_channel_present: false,
+            },
+            btc_age_ms: Some(500),
+            polymarket_age_ms: Some(12_000),
+        }
+    }
+
+    #[test]
+    fn health_ok_when_fresh_ingest_and_no_subtask_errors() {
+        let r = super::compute_health_response(&happy_inputs());
+        assert_eq!(r.status, "ok");
+        assert_eq!(r.uptime_secs, 10);
+    }
+
+    #[test]
+    fn health_degraded_when_ingest_missing() {
+        let mut inp = happy_inputs();
+        inp.btc_age_ms = None;
+        let r = super::compute_health_response(&inp);
+        assert_eq!(r.status, "degraded");
+    }
+
+    #[test]
+    fn health_degraded_when_ingest_stale() {
+        let mut inp = happy_inputs();
+        // Past INGEST_STALE_MS (5 min = 300_000 ms).
+        inp.polymarket_age_ms = Some(600_000);
+        let r = super::compute_health_response(&inp);
+        assert_eq!(r.status, "degraded");
+    }
+
+    #[test]
+    fn health_degraded_when_subtask_over_error_threshold() {
+        let mut inp = happy_inputs();
+        // UNHEALTHY_AFTER_ERRORS = 3; >= 3 is degraded.
+        inp.health.backtest.consecutive_errors = 5;
+        let r = super::compute_health_response(&inp);
+        assert_eq!(r.status, "degraded");
+    }
+
+    #[test]
+    fn health_ok_at_subtask_error_threshold_minus_one() {
+        let mut inp = happy_inputs();
+        inp.health.backtest.consecutive_errors = super::UNHEALTHY_AFTER_ERRORS - 1;
+        let r = super::compute_health_response(&inp);
+        assert_eq!(r.status, "ok");
     }
 
     /// Drive `render_metrics` with a fully-populated synthetic
