@@ -505,6 +505,7 @@ pub async fn run(cfg: DaemonConfig) -> Result<()> {
             ingest_restarts: Arc::clone(&ingest_restarts),
             agreement_repo,
             agreement_cache: Arc::new(RwLock::new(None)),
+            agreement_window_cache: Arc::new(RwLock::new(None)),
         };
         let app = Router::new()
             .route("/health", get(health_handler))
@@ -715,6 +716,14 @@ pub fn metrics_pnl_daily_cache_ttl_ms() -> i64 {
 /// One UTC bucket_day per offset, anchored on `now`.
 const PNL_BREAKDOWN_WINDOW_DAYS: i64 = 7;
 
+/// Width of the rolling per-pair disagreement window metric, in
+/// days. Same shape as `PNL_BREAKDOWN_WINDOW_DAYS` — hard-coded
+/// 7 so the metric query is trivially
+/// `agent_disagreement_rate_window{days="7"}`. Operators wanting
+/// a different horizon should add a sibling family rather than
+/// turning this one into a histogram.
+const AGREEMENT_WINDOW_DAYS: i64 = 7;
+
 /// Cached today's pnl_breakdown rows (per strategy × exec).
 /// Same TTL as pnl_daily — both are written by the same
 /// settle-pnl call.
@@ -826,6 +835,22 @@ struct HealthAppState {
     /// (~15min by default).
     agreement_repo: Option<Arc<AgreementRepo>>,
     agreement_cache: Arc<RwLock<Option<AgreementCacheEntry>>>,
+    /// Rolling N-day window over agreement_snapshots — concat of
+    /// the last `AGREEMENT_WINDOW_DAYS` UTC bucket_days, anchored
+    /// on today. Cached so a Prometheus scrape doesn't fan out 7
+    /// list_day calls per hit; refreshed on day-roll so the
+    /// window stays anchored.
+    agreement_window_cache: Arc<RwLock<Option<AgreementWindowCacheEntry>>>,
+}
+
+/// Same shape as `AgreementCacheEntry` but for the rolling-window
+/// metric. Stores the anchor bucket_day so we can detect day-
+/// rollover and rebuild instead of serving stale data.
+#[derive(Debug, Clone)]
+struct AgreementWindowCacheEntry {
+    fetched_at_ms: i64,
+    anchor_bucket_day_ms: i64,
+    rows: Vec<crate::coredb::types::AgreementSnapshot>,
 }
 
 /// Cached agreement snapshots for today's bucket. Rows are kept
@@ -1157,6 +1182,10 @@ pub struct MetricsSnapshot {
     /// per-pair (strategy_a, strategy_b) into mean-disagreement
     /// values. `None` when the agreement repo isn't wired up.
     pub agreement: Option<AgreementCacheEntry>,
+    /// Rolling N-day agreement_snapshots window. Same shape as
+    /// `agreement` but spans `AGREEMENT_WINDOW_DAYS` of
+    /// bucket_days, anchored on today.
+    pub agreement_window: Option<AgreementWindowCacheEntry>,
     pub risk: RiskLimits,
     /// Operator-facing comment lines to prepend at the top of the
     /// output (e.g. "# decisions_today refresh failed; serving
@@ -1565,6 +1594,31 @@ pub fn render_metrics(s: &MetricsSnapshot) -> String {
                         "agent_disagreement_rate{{strategy_a=\"{}\",strategy_b=\"{}\"}} {}\n",
                         escape_label(a),
                         escape_label(b),
+                        rate,
+                    ));
+                }
+            }
+        }
+    }
+
+    // Rolling N-day disagreement rate. Same shape as the today
+    // family above, with a `days` label baked in so a single
+    // Grafana panel can graph today vs window side by side.
+    // Aggregator is the same — just operates on the wider rowset.
+    if let Some(cache) = s.agreement_window.as_ref() {
+        if !cache.rows.is_empty() {
+            let pair_rates = aggregate_disagreement_rates(&cache.rows);
+            if !pair_rates.is_empty() {
+                out.push_str(
+                    "# HELP agent_disagreement_rate_window Per-pair mean disagreement rate over the last `days` UTC days. Same metric semantics as agent_disagreement_rate; wider window.\n",
+                );
+                out.push_str("# TYPE agent_disagreement_rate_window gauge\n");
+                for ((a, b), rate) in &pair_rates {
+                    out.push_str(&format!(
+                        "agent_disagreement_rate_window{{strategy_a=\"{}\",strategy_b=\"{}\",days=\"{}\"}} {}\n",
+                        escape_label(a),
+                        escape_label(b),
+                        AGREEMENT_WINDOW_DAYS,
                         rate,
                     ));
                 }
@@ -1986,6 +2040,52 @@ async fn gather_metrics_snapshot(s: &HealthAppState, now: i64) -> MetricsSnapsho
         None
     };
 
+    // Rolling N-day agreement window. Fans out N list_day calls
+    // and concats their rows; mean-rate aggregation per pair lives
+    // in render_metrics so it stays a pure function of cached
+    // rowsets. Day-roll detected via stored anchor_bucket_day_ms
+    // so the window doesn't drift past midnight. Same TTL as the
+    // today agreement cache.
+    let agreement_window: Option<AgreementWindowCacheEntry> =
+        if let Some(ag_repo) = s.agreement_repo.as_ref() {
+            let mut cache_guard = s.agreement_window_cache.write().await;
+            let today_bd = bucket_day(now);
+            let cached_anchor = cache_guard.as_ref().map(|c| c.anchor_bucket_day_ms);
+            let day_rolled = cached_anchor.map(|d| d != today_bd).unwrap_or(false);
+            let need_refresh = day_rolled
+                || cache_guard
+                    .as_ref()
+                    .map(|c| now - c.fetched_at_ms > metrics_decisions_cache_ttl_ms())
+                    .unwrap_or(true);
+            if need_refresh {
+                let day_ms = 86_400_000_i64;
+                let mut all_rows: Vec<crate::coredb::types::AgreementSnapshot> = Vec::new();
+                let mut any_err = false;
+                for i in 0..AGREEMENT_WINDOW_DAYS {
+                    let bd = today_bd - i * day_ms;
+                    match ag_repo.list_day(bd).await {
+                        Ok(rows) => all_rows.extend(rows),
+                        Err(e) => {
+                            any_err = true;
+                            notes.push(format!(
+                                "# agreement_window day {bd} read failed: {e}"
+                            ));
+                        }
+                    }
+                }
+                if !(any_err && all_rows.is_empty() && cache_guard.is_some()) {
+                    *cache_guard = Some(AgreementWindowCacheEntry {
+                        fetched_at_ms: now,
+                        anchor_bucket_day_ms: today_bd,
+                        rows: all_rows,
+                    });
+                }
+            }
+            cache_guard.clone()
+        } else {
+            None
+        };
+
     // Positions cache refresh.
     let positions: Option<PositionsCacheEntry> =
         if let Some(position_repo) = s.position_repo_for_metrics.as_ref() {
@@ -2059,6 +2159,7 @@ async fn gather_metrics_snapshot(s: &HealthAppState, now: i64) -> MetricsSnapsho
         ingest_restarts_binance,
         ingest_restarts_polymarket,
         agreement,
+        agreement_window,
         risk: RiskLimits::default(),
         notes,
     }
@@ -2713,6 +2814,18 @@ mod tests {
                     matches: 1,
                 }],
             }),
+            agreement_window: Some(super::AgreementWindowCacheEntry {
+                fetched_at_ms: 1_700_000_009_000,
+                anchor_bucket_day_ms: 1_700_000_000_000,
+                rows: vec![crate::coredb::types::AgreementSnapshot {
+                    bucket_day_ms: 1_700_000_000_000,
+                    ts_ms: 1_700_000_005_000,
+                    strategy_a: "baseline".into(),
+                    strategy_b: "deepseek".into(),
+                    shared: 10,
+                    matches: 4,
+                }],
+            }),
             risk: super::RiskLimits {
                 max_order_usd: 25.0,
                 kill_switch_path: PathBuf::from("/tmp/__definitely_nonexistent__"),
@@ -2730,6 +2843,7 @@ mod tests {
             "agent_decisions_today",
             "agent_decisions_today_cache_age_seconds",
             "agent_disagreement_rate",
+            "agent_disagreement_rate_window",
             "agent_decisions_today_total",
             "agent_ingest_age_seconds",
             "agent_ingest_restarts_total",
@@ -2819,6 +2933,7 @@ mod tests {
             ingest_restarts_binance: 0,
             ingest_restarts_polymarket: 0,
             agreement: None,
+            agreement_window: None,
             risk: super::RiskLimits {
                 max_order_usd: 50.0,
                 kill_switch_path: PathBuf::from("/tmp/__definitely_nonexistent__"),
@@ -2895,6 +3010,7 @@ mod tests {
             ingest_restarts_binance: 0,
             ingest_restarts_polymarket: 0,
             agreement: None,
+            agreement_window: None,
             risk: super::RiskLimits {
                 max_order_usd: 50.0,
                 kill_switch_path: PathBuf::from("/tmp/__definitely_nonexistent__"),
@@ -2970,6 +3086,64 @@ mod tests {
         assert!(ab.abs() < 1e-9, "expected 0.0 disagreement, got {ab}");
     }
 
+    /// `agent_disagreement_rate_window` carries the `days="7"`
+    /// label so a Grafana panel can graph today vs window side
+    /// by side. Pin the exact label shape — same regression
+    /// risk as the pnl_breakdown_window family.
+    #[test]
+    fn render_metrics_disagreement_rate_window_emits_with_days_label() {
+        use std::path::PathBuf;
+        let snap = super::MetricsSnapshot {
+            now_ms: 1_700_000_010_000,
+            health: super::HealthState {
+                started_at_ms: 1_700_000_000_000,
+                backtest: super::SubtaskHealth::default(),
+                compare: super::SubtaskHealth::default(),
+                settle: super::SubtaskHealth::default(),
+                user_channel_present: false,
+            },
+            btc_age_ms: None,
+            polymarket_age_ms: None,
+            decisions: None,
+            orders: None,
+            pnl_daily: None,
+            pnl_breakdown: None,
+            pnl_breakdown_yesterday: None,
+            pnl_breakdown_window: None,
+            positions: None,
+            ingest_probe_age_ms: None,
+            ingest_restarts_binance: 0,
+            ingest_restarts_polymarket: 0,
+            agreement: None,
+            agreement_window: Some(super::AgreementWindowCacheEntry {
+                fetched_at_ms: 1_700_000_009_000,
+                anchor_bucket_day_ms: 1_700_000_000_000,
+                rows: vec![crate::coredb::types::AgreementSnapshot {
+                    bucket_day_ms: 1_700_000_000_000,
+                    ts_ms: 1_700_000_005_000,
+                    strategy_a: "baseline".into(),
+                    strategy_b: "deepseek".into(),
+                    shared: 4,
+                    matches: 1, // rate 0.25 → disagreement 0.75
+                }],
+            }),
+            risk: super::RiskLimits {
+                max_order_usd: 50.0,
+                kill_switch_path: PathBuf::from("/tmp/__definitely_nonexistent__"),
+            },
+            notes: Vec::new(),
+        };
+        let out = super::render_metrics(&snap);
+        let expected = format!(
+            "agent_disagreement_rate_window{{strategy_a=\"baseline\",strategy_b=\"deepseek\",days=\"{}\"}} 0.75",
+            super::AGREEMENT_WINDOW_DAYS,
+        );
+        assert!(
+            out.contains(&expected),
+            "window disagreement line missing or mis-labelled. Got:\n{out}",
+        );
+    }
+
     /// Empty snapshot rows → empty map → renderer emits no
     /// `agent_disagreement_rate` series (the "missing = no data
     /// yet" convention).
@@ -3001,6 +3175,7 @@ mod tests {
                 fetched_at_ms: 1_700_000_009_000,
                 rows: Vec::new(),
             }),
+            agreement_window: None,
             risk: super::RiskLimits {
                 max_order_usd: 50.0,
                 kill_switch_path: PathBuf::from("/tmp/__definitely_nonexistent__"),
@@ -3043,6 +3218,7 @@ mod tests {
             ingest_restarts_binance: 7,
             ingest_restarts_polymarket: 2,
             agreement: None,
+            agreement_window: None,
             risk: super::RiskLimits {
                 max_order_usd: 50.0,
                 kill_switch_path: PathBuf::from("/tmp/__definitely_nonexistent__"),
@@ -3094,6 +3270,7 @@ mod tests {
             ingest_restarts_binance: 0,
             ingest_restarts_polymarket: 0,
             agreement: None,
+            agreement_window: None,
             risk: super::RiskLimits {
                 max_order_usd: 50.0,
                 kill_switch_path: PathBuf::from("/tmp/__definitely_nonexistent__"),
@@ -3140,6 +3317,7 @@ mod tests {
             ingest_restarts_binance: 0,
             ingest_restarts_polymarket: 0,
             agreement: None,
+            agreement_window: None,
             risk: super::RiskLimits {
                 max_order_usd: 50.0,
                 kill_switch_path: PathBuf::from("/tmp/__definitely_nonexistent__"),
@@ -3178,6 +3356,7 @@ mod tests {
             "agent_decisions_today",
             "agent_decisions_today_cache_age_seconds",
             "agent_disagreement_rate",
+            "agent_disagreement_rate_window",
             "agent_decisions_today_total",
             "agent_ingest_age_seconds",
             "agent_ingest_restarts_total",
