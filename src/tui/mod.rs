@@ -161,7 +161,7 @@ async fn main_loop(
     let mut comparison_sort: ComparisonSort = persisted
         .as_ref()
         .map(|p| p.sort)
-        .unwrap_or(ComparisonSort::Window7dDesc);
+        .unwrap_or(ComparisonSort::DEFAULT);
     // Restore the focused-strategy filter too so a restart
     // doesn't drop the operator back to "show every strategy."
     // Note: if the saved strategy is no longer in the current
@@ -290,13 +290,22 @@ async fn main_loop(
                     KeyCode::Char('-') | KeyCode::Char('_') => {
                         strategy_filter = cycle_strategy(&strategies, strategy_filter.as_deref(), -1);
                     }
-                    // Cycle the comparison panel's sort key. No
-                    // refresh required; the next terminal.draw
-                    // pick the new order. Operator preferences
-                    // stay session-scoped (resets on dashboard
-                    // restart, same as the strategy filter).
-                    KeyCode::Char('s') | KeyCode::Char('S') => {
-                        comparison_sort = comparison_sort.cycle();
+                    // `s` cycles the comparison panel's sort axis
+                    // (Window7d → Today → Yesterday → Strategy →
+                    // back). Each cycle step resets the direction
+                    // to that key's "natural" direction (desc for
+                    // money columns, asc for name) so the
+                    // operator's eye lands on the winning
+                    // strategy each time they cycle.
+                    KeyCode::Char('s') => {
+                        comparison_sort = comparison_sort.cycle_key();
+                    }
+                    // `S` flips the active axis's direction
+                    // without changing the key. Useful for
+                    // "show me the losers" inversions on any
+                    // of the money columns.
+                    KeyCode::Char('S') => {
+                        comparison_sort = comparison_sort.toggle_dir();
                     }
                     _ => {}
                 },
@@ -1943,41 +1952,91 @@ struct StrategyComparisonRow {
     agree_rate: Option<f64>,
 }
 
-/// Hotkey-driven sort key for the strategy-comparison table.
-/// Cycled by the `s` hotkey: default → today-desc → yesterday-desc
-/// → name-asc → back to default. Default mirrors the historical
-/// ranking the panel shipped with so dashboards behave unchanged
-/// for operators who never press `s`.
+/// Axis the strategy-comparison panel sorts by.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-enum ComparisonSort {
-    Window7dDesc,
-    TodayDesc,
-    YesterdayDesc,
-    StrategyAsc,
+enum SortKey {
+    Window7d,
+    Today,
+    Yesterday,
+    Strategy,
+}
+
+/// Direction toggle for the active sort axis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+enum SortDir {
+    Asc,
+    Desc,
+}
+
+/// Composite sort state for the strategy-comparison table.
+/// Split into `key` + `dir` so the dashboard can bind two hotkeys:
+///   - `s` (lowercase) → `cycle_key` (rotates through Window7d /
+///     Today / Yesterday / Strategy, resetting dir to that key's
+///     "natural" direction).
+///   - `S` (uppercase) → `toggle_dir` (flips Asc ↔ Desc on the
+///     current key without changing it).
+///
+/// Default = (Window7d, Desc). Matches the panel's historical
+/// behavior so dashboards behave unchanged for operators who
+/// never press either key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct ComparisonSort {
+    key: SortKey,
+    dir: SortDir,
 }
 
 impl ComparisonSort {
-    /// Step to the next sort key in the cycle. Used by the `s`
-    /// hotkey in main_loop.
-    fn cycle(self) -> Self {
-        match self {
-            ComparisonSort::Window7dDesc => ComparisonSort::TodayDesc,
-            ComparisonSort::TodayDesc => ComparisonSort::YesterdayDesc,
-            ComparisonSort::YesterdayDesc => ComparisonSort::StrategyAsc,
-            ComparisonSort::StrategyAsc => ComparisonSort::Window7dDesc,
+    const DEFAULT: ComparisonSort = ComparisonSort {
+        key: SortKey::Window7d,
+        dir: SortDir::Desc,
+    };
+
+    /// `s` lowercase hotkey: step to the next sort axis. Resets
+    /// `dir` to the natural direction of the new key (Desc for
+    /// money columns, Asc for the name column) so the operator
+    /// doesn't accidentally land in a config like "today asc"
+    /// just because they last reverse-sorted on yesterday.
+    fn cycle_key(self) -> Self {
+        let new_key = match self.key {
+            SortKey::Window7d => SortKey::Today,
+            SortKey::Today => SortKey::Yesterday,
+            SortKey::Yesterday => SortKey::Strategy,
+            SortKey::Strategy => SortKey::Window7d,
+        };
+        let natural_dir = match new_key {
+            SortKey::Strategy => SortDir::Asc,
+            _ => SortDir::Desc,
+        };
+        Self {
+            key: new_key,
+            dir: natural_dir,
         }
     }
 
-    /// Short label used in the comparison panel title so the
-    /// operator can see which axis is sorted-by at a glance.
-    /// Uses "desc" / "asc" rather than ↑/↓ glyphs so the title
-    /// doesn't collide with the Δ column's arrow indicators.
+    /// `S` uppercase hotkey: flip the active direction.
+    fn toggle_dir(self) -> Self {
+        Self {
+            key: self.key,
+            dir: match self.dir {
+                SortDir::Asc => SortDir::Desc,
+                SortDir::Desc => SortDir::Asc,
+            },
+        }
+    }
+
+    /// Short label used in the comparison panel title. Uses
+    /// "desc" / "asc" rather than ↑/↓ glyphs so the title doesn't
+    /// collide with the Δ column's arrow indicators.
     fn label(self) -> &'static str {
-        match self {
-            ComparisonSort::Window7dDesc => "7d desc",
-            ComparisonSort::TodayDesc => "today desc",
-            ComparisonSort::YesterdayDesc => "yesterday desc",
-            ComparisonSort::StrategyAsc => "name asc",
+        match (self.key, self.dir) {
+            (SortKey::Window7d, SortDir::Desc) => "7d desc",
+            (SortKey::Window7d, SortDir::Asc) => "7d asc",
+            (SortKey::Today, SortDir::Desc) => "today desc",
+            (SortKey::Today, SortDir::Asc) => "today asc",
+            (SortKey::Yesterday, SortDir::Desc) => "yesterday desc",
+            (SortKey::Yesterday, SortDir::Asc) => "yesterday asc",
+            (SortKey::Strategy, SortDir::Asc) => "name asc",
+            (SortKey::Strategy, SortDir::Desc) => "name desc",
         }
     }
 }
@@ -1986,7 +2045,7 @@ fn build_strategy_comparison_rows(
     s: &Snapshot,
     strategy_filter: Option<&str>,
 ) -> Vec<StrategyComparisonRow> {
-    build_strategy_comparison_rows_sorted(s, strategy_filter, ComparisonSort::Window7dDesc)
+    build_strategy_comparison_rows_sorted(s, strategy_filter, ComparisonSort::DEFAULT)
 }
 
 fn build_strategy_comparison_rows_sorted(
@@ -2057,31 +2116,37 @@ fn build_strategy_comparison_rows_sorted(
             strategy,
         });
     }
-    // Rank order: dictated by the operator's sort key (default
-    // Window7dDesc puts the winning strategy on top). Alphabetical
-    // tiebreak keeps the rendering deterministic when two
-    // strategies happen to be tied (e.g. both at $0.00 on a fresh
-    // deployment). NaN pnls — shouldn't happen in practice, but be
-    // defensive — sort last so they don't poison the top of the
-    // list via Equal-fallback in partial_cmp.
+    // Rank order: dictated by the operator's sort {key, dir}.
+    // Default (Window7d, Desc) puts the winning strategy on top.
+    // Alphabetical tiebreak keeps rendering deterministic when
+    // two strategies are tied on the active key (e.g. both at
+    // $0.00 on a fresh deployment). NaN pnls fall to Equal so
+    // they don't poison the head of the list.
     use std::cmp::Ordering;
-    let by_strategy = |a: &StrategyComparisonRow, b: &StrategyComparisonRow| -> Ordering {
+    let by_strategy_asc = |a: &StrategyComparisonRow, b: &StrategyComparisonRow| -> Ordering {
         a.strategy.cmp(&b.strategy)
     };
-    let cmp_desc = |x: f64, y: f64| -> Ordering {
-        y.partial_cmp(&x).unwrap_or(Ordering::Equal)
+    let cmp_num = |x: f64, y: f64, dir: SortDir| -> Ordering {
+        let base = x.partial_cmp(&y).unwrap_or(Ordering::Equal);
+        match dir {
+            SortDir::Asc => base,
+            SortDir::Desc => base.reverse(),
+        }
     };
-    match sort {
-        ComparisonSort::Window7dDesc => out.sort_by(|a, b| {
-            cmp_desc(a.window_pnl, b.window_pnl).then_with(|| by_strategy(a, b))
+    match sort.key {
+        SortKey::Window7d => out.sort_by(|a, b| {
+            cmp_num(a.window_pnl, b.window_pnl, sort.dir).then_with(|| by_strategy_asc(a, b))
         }),
-        ComparisonSort::TodayDesc => out.sort_by(|a, b| {
-            cmp_desc(a.today_pnl, b.today_pnl).then_with(|| by_strategy(a, b))
+        SortKey::Today => out.sort_by(|a, b| {
+            cmp_num(a.today_pnl, b.today_pnl, sort.dir).then_with(|| by_strategy_asc(a, b))
         }),
-        ComparisonSort::YesterdayDesc => out.sort_by(|a, b| {
-            cmp_desc(a.yesterday_pnl, b.yesterday_pnl).then_with(|| by_strategy(a, b))
+        SortKey::Yesterday => out.sort_by(|a, b| {
+            cmp_num(a.yesterday_pnl, b.yesterday_pnl, sort.dir).then_with(|| by_strategy_asc(a, b))
         }),
-        ComparisonSort::StrategyAsc => out.sort_by(by_strategy),
+        SortKey::Strategy => out.sort_by(|a, b| match sort.dir {
+            SortDir::Asc => by_strategy_asc(a, b),
+            SortDir::Desc => by_strategy_asc(a, b).reverse(),
+        }),
     }
     out
 }
@@ -2242,7 +2307,7 @@ fn draw_footer(
     strategy_filter: Option<&str>,
 ) {
     let mut lines = vec![Line::from(
-        " [q]/Esc quit   [r] refresh now   [s] cycle sort   (auto-refresh every 5 s) ",
+        " [q]/Esc quit   [r] refresh now   [s] cycle sort   [S] reverse sort   (auto-refresh every 5 s) ",
     )];
 
     // Strategy hotkeys line. Each visible strategy gets its digit
@@ -2640,7 +2705,7 @@ mod tests {
         ranks.insert("deepseek".to_string(), 2);
         let saved = super::PersistedDashboardState {
             ranks: ranks.clone(),
-            sort: super::ComparisonSort::TodayDesc,
+            sort: super::ComparisonSort { key: super::SortKey::Today, dir: super::SortDir::Desc },
             saved_at_ms: 1_700_000_000_000,
             strategy_filter: Some("baseline".to_string()),
         };
@@ -2653,7 +2718,7 @@ mod tests {
         )
         .expect("expected to round-trip");
         assert_eq!(loaded.ranks, ranks);
-        assert_eq!(loaded.sort, super::ComparisonSort::TodayDesc);
+        assert_eq!(loaded.sort, super::ComparisonSort { key: super::SortKey::Today, dir: super::SortDir::Desc });
         assert_eq!(loaded.saved_at_ms, 1_700_000_000_000);
         assert_eq!(
             loaded.strategy_filter.as_deref(),
@@ -2676,10 +2741,16 @@ mod tests {
             std::process::id(),
         ));
         // Hand-written JSON without the `strategy_filter` field
-        // mirrors a pre-2026-05 state file on disk.
+        // mirrors a state file from before that field existed.
+        // The `sort` shape matches the current
+        // `{ key, dir }` struct — operators upgrading past the
+        // S-hotkey commit get one fresh start when their old flat
+        // `"sort": "Window7dDesc"` JSON gets rejected by the
+        // schema change, and persisted state recovers on the next
+        // refresh.
         let pre_filter_json = serde_json::json!({
             "ranks": { "baseline": 1 },
-            "sort": "Window7dDesc",
+            "sort": { "key": "Window7d", "dir": "Desc" },
             "saved_at_ms": 1_700_000_000_000_i64,
         });
         std::fs::write(&tmp, pre_filter_json.to_string()).unwrap();
@@ -2707,7 +2778,7 @@ mod tests {
 
         let saved = super::PersistedDashboardState {
             ranks: Default::default(),
-            sort: super::ComparisonSort::Window7dDesc,
+            sort: super::ComparisonSort::DEFAULT,
             saved_at_ms: 1_700_000_000_000,
             strategy_filter: None,
         };
@@ -3142,7 +3213,7 @@ mod tests {
                     &strategies,
                     filter,
                     &prev_ranks,
-                    super::ComparisonSort::Window7dDesc,
+                    super::ComparisonSort::DEFAULT,
                 )
             })
             .unwrap();
@@ -3194,7 +3265,7 @@ mod tests {
                     &strategies,
                     None,
                     &prev_ranks,
-                    super::ComparisonSort::Window7dDesc,
+                    super::ComparisonSort::DEFAULT,
                 )
             })
             .unwrap();
@@ -3416,15 +3487,122 @@ mod tests {
     /// match arm doesn't silently break the hotkey UX.
     #[test]
     fn comparison_sort_cycles_through_all_four() {
-        let s0 = super::ComparisonSort::Window7dDesc;
-        let s1 = s0.cycle();
-        let s2 = s1.cycle();
-        let s3 = s2.cycle();
-        let s4 = s3.cycle();
-        assert_eq!(s1, super::ComparisonSort::TodayDesc);
-        assert_eq!(s2, super::ComparisonSort::YesterdayDesc);
-        assert_eq!(s3, super::ComparisonSort::StrategyAsc);
-        assert_eq!(s4, super::ComparisonSort::Window7dDesc, "cycle should wrap");
+        let s0 = super::ComparisonSort::DEFAULT;
+        let s1 = s0.cycle_key();
+        let s2 = s1.cycle_key();
+        let s3 = s2.cycle_key();
+        let s4 = s3.cycle_key();
+        assert_eq!(s1, super::ComparisonSort { key: super::SortKey::Today, dir: super::SortDir::Desc });
+        assert_eq!(s2, super::ComparisonSort { key: super::SortKey::Yesterday, dir: super::SortDir::Desc });
+        assert_eq!(s3, super::ComparisonSort { key: super::SortKey::Strategy, dir: super::SortDir::Asc });
+        assert_eq!(s4, super::ComparisonSort::DEFAULT, "cycle should wrap");
+    }
+
+    /// `toggle_dir` flips the active axis's direction without
+    /// touching `key`. Tests that pressing `S` repeatedly oscillates
+    /// between asc and desc without drifting to a different axis.
+    #[test]
+    fn comparison_sort_toggle_dir_flips_in_place() {
+        let s0 = super::ComparisonSort::DEFAULT;
+        assert_eq!(s0.dir, super::SortDir::Desc);
+        assert_eq!(s0.key, super::SortKey::Window7d);
+
+        let s1 = s0.toggle_dir();
+        assert_eq!(s1.dir, super::SortDir::Asc);
+        assert_eq!(s1.key, super::SortKey::Window7d, "key must not change");
+
+        let s2 = s1.toggle_dir();
+        assert_eq!(s2.dir, super::SortDir::Desc);
+        assert_eq!(s2, s0, "toggle×2 = identity");
+    }
+
+    /// `cycle_key` resets the direction to the new axis's natural
+    /// direction — important because the operator's mental model
+    /// after pressing `s` is "show me the winner of the next
+    /// axis", not "show me whatever I left this axis on last
+    /// time."
+    #[test]
+    fn comparison_sort_cycle_key_resets_to_natural_dir() {
+        // Start at Window7d Asc (operator reverse-sorted earlier).
+        let reversed = super::ComparisonSort {
+            key: super::SortKey::Window7d,
+            dir: super::SortDir::Asc,
+        };
+        // Cycle to Today: should land at Today Desc (natural for
+        // money columns), NOT Today Asc.
+        let next = reversed.cycle_key();
+        assert_eq!(next.key, super::SortKey::Today);
+        assert_eq!(next.dir, super::SortDir::Desc, "money column → desc");
+
+        // Cycle twice more lands at Strategy: should reset to Asc
+        // (natural for name column), NOT Desc.
+        let to_strategy = next.cycle_key().cycle_key();
+        assert_eq!(to_strategy.key, super::SortKey::Strategy);
+        assert_eq!(to_strategy.dir, super::SortDir::Asc, "name column → asc");
+    }
+
+    /// Label rendering covers every (key, dir) combination so
+    /// the title bar accurately reflects state.
+    #[test]
+    fn comparison_sort_label_for_each_combination() {
+        use super::{ComparisonSort, SortDir, SortKey};
+        assert_eq!(ComparisonSort { key: SortKey::Window7d, dir: SortDir::Desc }.label(), "7d desc");
+        assert_eq!(ComparisonSort { key: SortKey::Window7d, dir: SortDir::Asc }.label(), "7d asc");
+        assert_eq!(ComparisonSort { key: SortKey::Today, dir: SortDir::Desc }.label(), "today desc");
+        assert_eq!(ComparisonSort { key: SortKey::Today, dir: SortDir::Asc }.label(), "today asc");
+        assert_eq!(ComparisonSort { key: SortKey::Yesterday, dir: SortDir::Desc }.label(), "yesterday desc");
+        assert_eq!(ComparisonSort { key: SortKey::Yesterday, dir: SortDir::Asc }.label(), "yesterday asc");
+        assert_eq!(ComparisonSort { key: SortKey::Strategy, dir: SortDir::Asc }.label(), "name asc");
+        assert_eq!(ComparisonSort { key: SortKey::Strategy, dir: SortDir::Desc }.label(), "name desc");
+    }
+
+    /// Reversing an axis with `toggle_dir` flips the sort output
+    /// without changing the data — pin via build_strategy_comparison
+    /// against a 3-strategy fixture.
+    #[test]
+    fn build_strategy_comparison_reverses_with_toggle_dir() {
+        let mut s = super::Snapshot::default();
+        s.pnl_breakdown_window = vec![
+            super::PnlBreakdown {
+                bucket_day_ms: 0,
+                strategy: "deepseek".into(),
+                exec: "paper".into(),
+                realized_pnl: 100.0,
+                n_settled: 1,
+            },
+            super::PnlBreakdown {
+                bucket_day_ms: 0,
+                strategy: "anthropic".into(),
+                exec: "paper".into(),
+                realized_pnl: 50.0,
+                n_settled: 1,
+            },
+            super::PnlBreakdown {
+                bucket_day_ms: 0,
+                strategy: "baseline".into(),
+                exec: "paper".into(),
+                realized_pnl: -10.0,
+                n_settled: 1,
+            },
+        ];
+        // Default (desc): deepseek → anthropic → baseline.
+        let desc_rows: Vec<String> =
+            super::build_strategy_comparison_rows_sorted(&s, None, super::ComparisonSort::DEFAULT)
+                .into_iter()
+                .map(|r| r.strategy)
+                .collect();
+        assert_eq!(desc_rows, vec!["deepseek", "anthropic", "baseline"]);
+
+        // Toggle dir → asc: baseline → anthropic → deepseek.
+        let asc_rows: Vec<String> = super::build_strategy_comparison_rows_sorted(
+            &s,
+            None,
+            super::ComparisonSort::DEFAULT.toggle_dir(),
+        )
+        .into_iter()
+        .map(|r| r.strategy)
+        .collect();
+        assert_eq!(asc_rows, vec!["baseline", "anthropic", "deepseek"]);
     }
 
     /// Each sort key produces the expected ordering on a fixture
@@ -3492,22 +3670,22 @@ mod tests {
                     .collect()
             };
         assert_eq!(
-            head(super::ComparisonSort::Window7dDesc),
+            head(super::ComparisonSort::DEFAULT),
             vec!["deepseek", "anthropic", "baseline"],
             "7d-desc",
         );
         assert_eq!(
-            head(super::ComparisonSort::TodayDesc),
+            head(super::ComparisonSort { key: super::SortKey::Today, dir: super::SortDir::Desc }),
             vec!["baseline", "deepseek", "anthropic"],
             "today-desc",
         );
         assert_eq!(
-            head(super::ComparisonSort::YesterdayDesc),
+            head(super::ComparisonSort { key: super::SortKey::Yesterday, dir: super::SortDir::Desc }),
             vec!["anthropic", "deepseek", "baseline"],
             "yesterday-desc",
         );
         assert_eq!(
-            head(super::ComparisonSort::StrategyAsc),
+            head(super::ComparisonSort { key: super::SortKey::Strategy, dir: super::SortDir::Asc }),
             vec!["anthropic", "baseline", "deepseek"],
             "strategy-asc",
         );
@@ -3728,7 +3906,7 @@ mod tests {
                     &strategies,
                     None,
                     &prev_ranks,
-                    super::ComparisonSort::Window7dDesc,
+                    super::ComparisonSort::DEFAULT,
                 )
             })
             .unwrap();
@@ -3912,7 +4090,7 @@ mod tests {
                     &strategies,
                     None,
                     &prev_ranks,
-                    super::ComparisonSort::Window7dDesc,
+                    super::ComparisonSort::DEFAULT,
                 )
             })
             .unwrap();
