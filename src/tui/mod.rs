@@ -178,8 +178,15 @@ async fn main_loop(
     // every strategy. Set by digit-key hotkeys; cleared by `0` or `c`.
     // Survives refreshes so the operator's selection doesn't reset on
     // every auto-tick — and now survives a dashboard restart too,
-    // sourced from `restored_filter` above.
-    let mut strategy_filter: Option<String> = restored_filter;
+    // sourced from `restored_filter` above. Stale filter check: if
+    // the restored strategy isn't in the live snapshot's
+    // strategies-in-view, drop it. Otherwise the operator would
+    // see a phantom-focused state (no row highlights, "vs <name>"
+    // header pointing at a strategy that doesn't exist anymore)
+    // until they press `0` to clear. The check only runs once at
+    // startup; mid-session filter changes are unaffected.
+    let mut strategy_filter: Option<String> =
+        validate_restored_filter(restored_filter, &strategies_in_view(&snapshot));
 
     loop {
         let uptime = started_at.elapsed();
@@ -1008,6 +1015,26 @@ fn filter_aware_consensus<'a>(
 /// Returning early in that case also avoids modulus-by-zero math.
 ///
 /// A current filter that's no longer in the list (the strategy
+/// At dashboard startup, sanity-check a restored
+/// `strategy_filter` against the first frame's live strategies.
+/// Returns `None` when the saved strategy is absent (e.g.
+/// snapshot data shifted while the dashboard was down, or the
+/// operator's deployment changed its LLM presets). Otherwise
+/// passes the filter through unchanged.
+///
+/// Mid-session filter changes are unaffected — this only
+/// covers the "restore from disk" path, where a phantom focus
+/// state would otherwise live until the operator pressed `0`.
+fn validate_restored_filter(
+    restored: Option<String>,
+    strategies: &[String],
+) -> Option<String> {
+    match restored {
+        Some(name) if strategies.iter().any(|s| s == &name) => Some(name),
+        _ => None,
+    }
+}
+
 /// dropped out between refreshes) is treated as if `None` was
 /// selected — keeps the UI predictable when the underlying data
 /// shifts.
@@ -4141,6 +4168,45 @@ mod tests {
         assert!(tier0.contains("m-both"));
         // Tier 1 last: m-only-baseline.
         assert_eq!(out[2].market_slug, "m-only-baseline");
+    }
+
+    /// Restored filter matching a live strategy passes through.
+    /// Restored filter for a strategy no longer present (data
+    /// shifted during downtime) drops to None — otherwise the
+    /// dashboard would show a phantom-focus state.
+    #[test]
+    fn validate_restored_filter_keeps_present_strategy() {
+        let strats = vec!["baseline".to_string(), "deepseek".to_string()];
+        assert_eq!(
+            super::validate_restored_filter(Some("baseline".into()), &strats),
+            Some("baseline".to_string()),
+        );
+    }
+
+    #[test]
+    fn validate_restored_filter_drops_absent_strategy() {
+        let strats = vec!["baseline".to_string(), "deepseek".to_string()];
+        assert_eq!(
+            super::validate_restored_filter(Some("anthropic".into()), &strats),
+            None,
+            "absent strategy should drop",
+        );
+    }
+
+    #[test]
+    fn validate_restored_filter_none_stays_none() {
+        let strats = vec!["baseline".to_string()];
+        assert_eq!(super::validate_restored_filter(None, &strats), None);
+    }
+
+    #[test]
+    fn validate_restored_filter_empty_strategies_drops_everything() {
+        // No strategies visible (fresh deployment, no data yet)
+        // → any restored filter is stale by definition.
+        assert_eq!(
+            super::validate_restored_filter(Some("baseline".into()), &[]),
+            None,
+        );
     }
 
     #[test]
