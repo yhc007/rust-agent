@@ -355,12 +355,15 @@ pub async fn run(cfg: DaemonConfig) -> Result<()> {
         // once at startup so each /metrics hit just runs the query.
         // Wrapped in Arc so HealthAppState's Clone stays cheap.
         let decision_repo = DecisionRepo::new(db.session()).await.ok().map(Arc::new);
+        let order_repo = OrderRepo::new(db.session()).await.ok().map(Arc::new);
         let app_state = HealthAppState {
             health: health.clone(),
             btc_repo: btc_repo_for_health,
             market_repo: market_repo_for_health,
             decision_repo,
             decisions_cache: Arc::new(RwLock::new(None)),
+            order_repo,
+            orders_cache: Arc::new(RwLock::new(None)),
             ingest_cache: Arc::new(RwLock::new(None)),
         };
         let app = Router::new()
@@ -488,6 +491,16 @@ struct DecisionsCacheEntry {
     counts: std::collections::BTreeMap<(String, String), u32>,
 }
 
+/// Cached today's-orders tally keyed by (strategy, side, exec,
+/// status). Same stale-while-revalidate pattern + 10s TTL as
+/// decisions, since orders churn at the same backtest-tick cadence
+/// (~30 min) and a 10s freshness ceiling is plenty.
+#[derive(Debug, Clone)]
+struct OrdersCacheEntry {
+    fetched_at_ms: i64,
+    counts: std::collections::BTreeMap<(String, String, String, String), u32>,
+}
+
 /// Cached pair of ingest-staleness ages. Stored as a unit (not
 /// per-source) so a transient one-source outage shows up in the
 /// next refresh as `None` rather than being masked by per-source
@@ -515,6 +528,11 @@ struct HealthAppState {
     /// scraping. Refresh failures keep the previous entry around
     /// so transient CoreDB blips don't blank the Grafana panel.
     decisions_cache: Arc<RwLock<Option<DecisionsCacheEntry>>>,
+    /// Used by `/metrics` for the agent_orders_today gauge. Needs
+    /// the decision_repo too (above) to join orders back to their
+    /// originating strategy via decision_id.
+    order_repo: Option<Arc<OrderRepo>>,
+    orders_cache: Arc<RwLock<Option<OrdersCacheEntry>>>,
     /// Shared cache for the two ingest-staleness probes that
     /// `/health` and `/metrics` both need. Refresh on TTL expiry
     /// runs both probes once and stores whatever comes back, so a
@@ -723,6 +741,96 @@ async fn metrics_handler(State(s): State<HealthAppState>) -> impl IntoResponse {
                     "agent_decisions_today{{strategy=\"{}\",side=\"{}\"}} {}\n",
                     escape_label(strategy),
                     escape_label(side),
+                    n,
+                ));
+            }
+        }
+    }
+
+    // Today's order count per (strategy, side, exec, status).
+    // exec="paper" iff `order_id` starts with "paper-" (PaperExec's
+    // synthetic id format); else "live" — covers CLOB-issued IDs
+    // and any future executor that doesn't share the paper- prefix.
+    // status comes straight from the orders.status column ("filled"
+    // / "pending" / "partial" / "canceled" today).
+    //
+    // strategy is joined back via decisions.decision_id, same as
+    // settle-pnl does; orders that don't match a decision (legacy
+    // rows or tool-driven inserts) fall into "other".
+    //
+    // Shares the 10s cache TTL with decisions — orders churn at
+    // the same backtest cadence so freshness invariant matches.
+    if let (Some(order_repo), Some(decision_repo)) =
+        (s.order_repo.as_ref(), s.decision_repo.as_ref())
+    {
+        let mut cache_guard = s.orders_cache.write().await;
+        let need_refresh = cache_guard
+            .as_ref()
+            .map(|c| now - c.fetched_at_ms > METRICS_DECISIONS_CACHE_TTL_MS)
+            .unwrap_or(true);
+
+        if need_refresh {
+            let bd = bucket_day(now);
+            // Decisions read can fail independently — if it does, we
+            // fall back to "other" for every order's strategy.
+            let strategy_of: std::collections::HashMap<uuid::Uuid, String> =
+                match decision_repo.list_day(bd).await {
+                    Ok(rows) => rows
+                        .iter()
+                        .map(|d| (d.decision_id, d.effective_strategy().to_string()))
+                        .collect(),
+                    Err(_) => std::collections::HashMap::new(),
+                };
+            match order_repo.list_day(bd).await {
+                Ok(rows) => {
+                    use std::collections::BTreeMap;
+                    let mut counts: BTreeMap<(String, String, String, String), u32> =
+                        BTreeMap::new();
+                    for o in &rows {
+                        let strategy = strategy_of
+                            .get(&o.decision_id)
+                            .cloned()
+                            .unwrap_or_else(|| "other".to_string());
+                        let exec = if o.order_id.starts_with("paper-") {
+                            "paper".to_string()
+                        } else {
+                            "live".to_string()
+                        };
+                        *counts
+                            .entry((strategy, o.side.clone(), exec, o.status.clone()))
+                            .or_insert(0) += 1;
+                    }
+                    *cache_guard = Some(OrdersCacheEntry {
+                        fetched_at_ms: now,
+                        counts,
+                    });
+                }
+                Err(e) => {
+                    if cache_guard.is_none() {
+                        out.push_str(&format!(
+                            "# orders_today read failed (no cached fallback): {e}\n"
+                        ));
+                    } else {
+                        out.push_str(&format!(
+                            "# orders_today refresh failed; serving cached data: {e}\n"
+                        ));
+                    }
+                }
+            }
+        }
+
+        if let Some(cache) = cache_guard.as_ref() {
+            out.push_str(
+                "# HELP agent_orders_today Count of polymarket_btc.orders rows for today's UTC bucket, by strategy/side/exec/status.\n",
+            );
+            out.push_str("# TYPE agent_orders_today gauge\n");
+            for ((strategy, side, exec, status), n) in &cache.counts {
+                out.push_str(&format!(
+                    "agent_orders_today{{strategy=\"{}\",side=\"{}\",exec=\"{}\",status=\"{}\"}} {}\n",
+                    escape_label(strategy),
+                    escape_label(side),
+                    escape_label(exec),
+                    escape_label(status),
                     n,
                 ));
             }
