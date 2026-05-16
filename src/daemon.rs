@@ -364,6 +364,7 @@ pub async fn run(cfg: DaemonConfig) -> Result<()> {
             .await
             .ok()
             .map(Arc::new);
+        let position_repo_for_metrics = PositionRepo::new(db.session()).await.ok().map(Arc::new);
         let app_state = HealthAppState {
             health: health.clone(),
             btc_repo: btc_repo_for_health,
@@ -376,6 +377,8 @@ pub async fn run(cfg: DaemonConfig) -> Result<()> {
             pnl_daily_cache: Arc::new(RwLock::new(None)),
             pnl_breakdown_repo,
             pnl_breakdown_cache: Arc::new(RwLock::new(None)),
+            position_repo_for_metrics,
+            positions_cache: Arc::new(RwLock::new(None)),
             ingest_cache: Arc::new(RwLock::new(None)),
         };
         let app = Router::new()
@@ -540,6 +543,16 @@ struct PnlBreakdownCacheEntry {
     rows: Vec<crate::coredb::types::PnlBreakdown>,
 }
 
+/// Cached open-positions snapshot. Positions only change on fill
+/// events (paper fills land synchronously; live fills land
+/// through the user-channel WS listener), so a 10s TTL is plenty
+/// of freshness and saves CoreDB the per-scrape list_all call.
+#[derive(Debug, Clone)]
+struct PositionsCacheEntry {
+    fetched_at_ms: i64,
+    rows: Vec<crate::coredb::types::Position>,
+}
+
 /// Cached pair of ingest-staleness ages. Stored as a unit (not
 /// per-source) so a transient one-source outage shows up in the
 /// next refresh as `None` rather than being masked by per-source
@@ -580,6 +593,10 @@ struct HealthAppState {
     /// Also written by settle-pnl, also cached with the 60s pnl TTL.
     pnl_breakdown_repo: Option<Arc<PnlBreakdownRepo>>,
     pnl_breakdown_cache: Arc<RwLock<Option<PnlBreakdownCacheEntry>>>,
+    /// Open positions read from positions_v2 for the
+    /// agent_open_positions_* gauges. 10s scrape cache.
+    position_repo_for_metrics: Option<Arc<PositionRepo>>,
+    positions_cache: Arc<RwLock<Option<PositionsCacheEntry>>>,
     /// Shared cache for the two ingest-staleness probes that
     /// `/health` and `/metrics` both need. Refresh on TTL expiry
     /// runs both probes once and stores whatever comes back, so a
@@ -1030,6 +1047,73 @@ async fn metrics_handler(State(s): State<HealthAppState>) -> impl IntoResponse {
                         escape_label(&row.strategy),
                         escape_label(&row.exec),
                         row.n_settled,
+                    ));
+                }
+            }
+        }
+    }
+
+    // Open positions snapshot from polymarket_btc.positions_v2.
+    // Two gauges per (market, side) — shares and avg fill price.
+    // Grafana can compute notional via `shares * avg_price` if
+    // needed; pre-computing it here would just bake a third
+    // metric series that's redundant with the input data.
+    //
+    // 10s scrape cache — positions only change on fill events
+    // (paper fills land inline via route_decision, live fills
+    // through the user-channel WS listener). Stale-while-revalidate
+    // on CoreDB failure.
+    if let Some(position_repo) = s.position_repo_for_metrics.as_ref() {
+        let mut cache_guard = s.positions_cache.write().await;
+        let need_refresh = cache_guard
+            .as_ref()
+            .map(|c| now - c.fetched_at_ms > METRICS_DECISIONS_CACHE_TTL_MS)
+            .unwrap_or(true);
+        if need_refresh {
+            match position_repo.list_all().await {
+                Ok(rows) => {
+                    *cache_guard = Some(PositionsCacheEntry {
+                        fetched_at_ms: now,
+                        rows,
+                    });
+                }
+                Err(e) => {
+                    if cache_guard.is_none() {
+                        out.push_str(&format!(
+                            "# open_positions read failed (no cached fallback): {e}\n"
+                        ));
+                    } else {
+                        out.push_str(&format!(
+                            "# open_positions refresh failed; serving cached data: {e}\n"
+                        ));
+                    }
+                }
+            }
+        }
+        if let Some(cache) = cache_guard.as_ref() {
+            if !cache.rows.is_empty() {
+                out.push_str(
+                    "# HELP agent_open_positions_size Open position size (shares) per (market, side) from positions_v2.\n",
+                );
+                out.push_str("# TYPE agent_open_positions_size gauge\n");
+                for p in &cache.rows {
+                    out.push_str(&format!(
+                        "agent_open_positions_size{{market=\"{}\",side=\"{}\"}} {}\n",
+                        escape_label(&p.market_slug),
+                        escape_label(&p.side),
+                        p.size,
+                    ));
+                }
+                out.push_str(
+                    "# HELP agent_open_positions_avg_price Volume-weighted average fill price per (market, side) in [0,1] Polymarket outcome units.\n",
+                );
+                out.push_str("# TYPE agent_open_positions_avg_price gauge\n");
+                for p in &cache.rows {
+                    out.push_str(&format!(
+                        "agent_open_positions_avg_price{{market=\"{}\",side=\"{}\"}} {}\n",
+                        escape_label(&p.market_slug),
+                        escape_label(&p.side),
+                        p.avg_price,
                     ));
                 }
             }
