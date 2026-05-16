@@ -1135,6 +1135,29 @@ async fn metrics_handler(State(s): State<HealthAppState>) -> impl IntoResponse {
                         p.size * p.avg_price,
                     ));
                 }
+                // Headline summary gauges: count of non-empty
+                // positions and total notional across all of them.
+                // Derivable from the per-row gauges via
+                // `count(agent_open_positions_size > 0)` /
+                // `sum(agent_open_positions_notional_usd)` but a
+                // single named scalar is the right primitive for
+                // Grafana Stat panels — no PromQL needed for the
+                // "how exposed am I right now?" headline.
+                let nonzero = cache.rows.iter().filter(|p| p.size > 0.0).count();
+                let total_notional: f64 = cache.rows.iter().map(|p| p.size * p.avg_price).sum();
+                out.push_str(
+                    "# HELP agent_open_positions_count Number of non-empty open positions (size > 0).\n",
+                );
+                out.push_str("# TYPE agent_open_positions_count gauge\n");
+                out.push_str(&format!("agent_open_positions_count {}\n", nonzero));
+                out.push_str(
+                    "# HELP agent_open_positions_total_notional_usd Sum of notional ($) across every open position.\n",
+                );
+                out.push_str("# TYPE agent_open_positions_total_notional_usd gauge\n");
+                out.push_str(&format!(
+                    "agent_open_positions_total_notional_usd {}\n",
+                    total_notional
+                ));
             }
         }
     }
