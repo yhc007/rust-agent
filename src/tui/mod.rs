@@ -39,6 +39,15 @@ use crate::coredb::CoreDb;
 const REFRESH_EVERY: Duration = Duration::from_secs(5);
 const RECENT_DECISIONS: usize = 15;
 
+/// TTL on persisted dashboard state. After this many milliseconds
+/// without a refresh, the saved `prev_ranks` + sort key are
+/// treated as stale and the dashboard starts fresh. 2 hours
+/// balances "operator restarted within their session" (state
+/// usefully restored) against "stale ranks from 2 days ago
+/// produce a meaningless Δ column". Tuneable via
+/// `DASHBOARD_STATE_TTL_S` env (seconds).
+const DASHBOARD_STATE_TTL_MS_DEFAULT: i64 = 2 * 60 * 60 * 1000;
+
 /// Maximum number of points rendered in the strategy-pnl trend
 /// sparkline. Older snapshots still inform the min/max of the column
 /// shape via the slice we take, but only the last `SPARK_WIDTH` chars
@@ -133,13 +142,20 @@ async fn main_loop(
     // Per-strategy rank from the previous render's comparison
     // panel. Feeds the Δ column so the operator sees momentum
     // ("X moved up since last refresh") without diffing snapshots
-    // mentally. Empty on first frame → no indicator shown.
-    let mut prev_ranks: std::collections::HashMap<String, usize> =
-        std::collections::HashMap::new();
-    // Sort key for the strategy comparison panel. Hotkey 's'
-    // cycles. Resets on dashboard restart — intentional, since
-    // operator preferences are usually session-scoped.
-    let mut comparison_sort: ComparisonSort = ComparisonSort::Window7dDesc;
+    // mentally. Restored from disk when a recent dashboard run
+    // left a state file behind — a quick restart preserves
+    // momentum continuity.
+    let state_path = dashboard_state_path();
+    let state_ttl_ms = dashboard_state_ttl_ms();
+    let persisted = load_persisted_dashboard_state(&state_path, now_ms(), state_ttl_ms);
+    let mut prev_ranks: std::collections::HashMap<String, usize> = persisted
+        .as_ref()
+        .map(|p| p.ranks.clone())
+        .unwrap_or_default();
+    let mut comparison_sort: ComparisonSort = persisted
+        .as_ref()
+        .map(|p| p.sort)
+        .unwrap_or(ComparisonSort::Window7dDesc);
     let mut snapshot = fetch_snapshot(
         btc_repo, dec_repo, pos_repo, pnl_repo, agree_repo, breakdown_repo, health_url,
         health_client, pnl_days, prev_ingest_restarts,
@@ -190,6 +206,18 @@ async fn main_loop(
             .enumerate()
             .map(|(i, r)| (r.strategy.clone(), i + 1))
             .collect();
+        // Persist after each refresh so a quick restart picks up
+        // a meaningful baseline for the Δ column. Best-effort —
+        // I/O failures are debug-logged and don't break the
+        // render loop.
+        save_persisted_dashboard_state(
+            &state_path,
+            &PersistedDashboardState {
+                ranks: prev_ranks.clone(),
+                sort: comparison_sort,
+                saved_at_ms: now_ms(),
+            },
+        );
 
         // Drain pending input with a small budget so the auto-refresh
         // tick is still responsive. We poll for `min(REFRESH_EVERY -
@@ -774,6 +802,92 @@ fn short_err(s: &str) -> String {
         s.to_string()
     } else {
         s.chars().take(MAX).collect::<String>() + "…"
+    }
+}
+
+/// Dashboard state persisted across restarts. Just enough to keep
+/// the Δ rank-change column and the operator's last-active sort
+/// key meaningful after a restart — the actual data on the panels
+/// is always re-fetched from CoreDB.
+///
+/// `saved_at_ms` drives a 2-hour TTL: dashboards that have been
+/// dark for longer than that get a fresh start (a Δ comparing
+/// today's ranks against ranks from 2 days ago is more confusing
+/// than informative).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PersistedDashboardState {
+    pub ranks: std::collections::HashMap<String, usize>,
+    pub sort: ComparisonSort,
+    pub saved_at_ms: i64,
+}
+
+/// Resolve the persistence path: `$DASHBOARD_STATE_PATH` if set,
+/// else `~/.cache/rust-agent/dashboard_state.json`. The directory
+/// is created lazily by `save_persisted_dashboard_state` — read
+/// returns `None` cleanly when the path doesn't exist yet.
+fn dashboard_state_path() -> std::path::PathBuf {
+    if let Ok(p) = std::env::var("DASHBOARD_STATE_PATH") {
+        return std::path::PathBuf::from(p);
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    std::path::PathBuf::from(home)
+        .join(".cache")
+        .join("rust-agent")
+        .join("dashboard_state.json")
+}
+
+fn dashboard_state_ttl_ms() -> i64 {
+    std::env::var("DASHBOARD_STATE_TTL_S")
+        .ok()
+        .and_then(|s| s.parse::<i64>().ok())
+        .map(|s| s.saturating_mul(1000))
+        .unwrap_or(DASHBOARD_STATE_TTL_MS_DEFAULT)
+}
+
+/// Read the persisted dashboard state from disk. Returns `None`
+/// when (a) the file doesn't exist, (b) the file fails to parse,
+/// or (c) the saved state is older than the TTL window. None of
+/// these are operator-visible errors — the dashboard just
+/// starts fresh.
+fn load_persisted_dashboard_state(
+    path: &std::path::Path,
+    now_ms: i64,
+    ttl_ms: i64,
+) -> Option<PersistedDashboardState> {
+    let bytes = std::fs::read(path).ok()?;
+    let state: PersistedDashboardState = serde_json::from_slice(&bytes).ok()?;
+    if (now_ms - state.saved_at_ms).abs() > ttl_ms {
+        return None;
+    }
+    Some(state)
+}
+
+/// Best-effort write — creates the parent directory if missing,
+/// serializes the state, swallows I/O errors with a tracing
+/// warning. Called after every dashboard refresh; failures must
+/// not break rendering.
+fn save_persisted_dashboard_state(
+    path: &std::path::Path,
+    state: &PersistedDashboardState,
+) {
+    if let Some(parent) = path.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            tracing::debug!("dashboard state: mkdir {} failed: {e}", parent.display());
+            return;
+        }
+    }
+    match serde_json::to_vec(state) {
+        Ok(bytes) => {
+            if let Err(e) = std::fs::write(path, bytes) {
+                tracing::debug!(
+                    "dashboard state: write {} failed: {e}",
+                    path.display()
+                );
+            }
+        }
+        Err(e) => {
+            tracing::debug!("dashboard state: serialize failed: {e}");
+        }
     }
 }
 
@@ -1760,7 +1874,7 @@ struct StrategyComparisonRow {
 /// → name-asc → back to default. Default mirrors the historical
 /// ranking the panel shipped with so dashboards behave unchanged
 /// for operators who never press `s`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum ComparisonSort {
     Window7dDesc,
     TodayDesc,
@@ -2434,6 +2548,141 @@ mod tests {
         // sees this via empty-row dashboard state).
         let ages = super::HealthCacheAgesWire::default();
         assert!(super::stalest_cache_hint(&ages).is_none());
+    }
+
+    /// Persistence round-trip: write state to a temp path, read
+    /// it back, confirm ranks + sort are preserved.
+    #[test]
+    fn dashboard_state_round_trips_to_disk() {
+        let mut tmp = std::env::temp_dir();
+        tmp.push(format!(
+            "rust-agent-dashboard-state-test-{}.json",
+            std::process::id(),
+        ));
+        let _ = std::fs::remove_file(&tmp);
+
+        let mut ranks = std::collections::HashMap::new();
+        ranks.insert("baseline".to_string(), 1);
+        ranks.insert("deepseek".to_string(), 2);
+        let saved = super::PersistedDashboardState {
+            ranks: ranks.clone(),
+            sort: super::ComparisonSort::TodayDesc,
+            saved_at_ms: 1_700_000_000_000,
+        };
+        super::save_persisted_dashboard_state(&tmp, &saved);
+
+        let loaded = super::load_persisted_dashboard_state(
+            &tmp,
+            1_700_000_000_000, // same "now" → diff = 0 → within TTL
+            super::DASHBOARD_STATE_TTL_MS_DEFAULT,
+        )
+        .expect("expected to round-trip");
+        assert_eq!(loaded.ranks, ranks);
+        assert_eq!(loaded.sort, super::ComparisonSort::TodayDesc);
+        assert_eq!(loaded.saved_at_ms, 1_700_000_000_000);
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// State older than the TTL is discarded — operator gets a
+    /// fresh start rather than misleading Δ indicators against
+    /// ranks from days ago.
+    #[test]
+    fn dashboard_state_discarded_when_older_than_ttl() {
+        let mut tmp = std::env::temp_dir();
+        tmp.push(format!(
+            "rust-agent-dashboard-state-ttl-test-{}.json",
+            std::process::id(),
+        ));
+        let _ = std::fs::remove_file(&tmp);
+
+        let saved = super::PersistedDashboardState {
+            ranks: Default::default(),
+            sort: super::ComparisonSort::Window7dDesc,
+            saved_at_ms: 1_700_000_000_000,
+        };
+        super::save_persisted_dashboard_state(&tmp, &saved);
+
+        // 3 hours later — past the 2h default TTL → None.
+        let now = 1_700_000_000_000 + 3 * 60 * 60 * 1000;
+        let loaded = super::load_persisted_dashboard_state(
+            &tmp,
+            now,
+            super::DASHBOARD_STATE_TTL_MS_DEFAULT,
+        );
+        assert!(loaded.is_none(), "expected stale state to be discarded");
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// Missing file → None (not an error). A fresh dashboard
+    /// startup is the common case for this branch.
+    #[test]
+    fn dashboard_state_load_missing_file_returns_none() {
+        let nonexistent = std::env::temp_dir().join(format!(
+            "rust-agent-definitely-does-not-exist-{}.json",
+            std::process::id(),
+        ));
+        let _ = std::fs::remove_file(&nonexistent);
+        let loaded = super::load_persisted_dashboard_state(
+            &nonexistent,
+            1_700_000_000_000,
+            super::DASHBOARD_STATE_TTL_MS_DEFAULT,
+        );
+        assert!(loaded.is_none());
+    }
+
+    /// Corrupt file → None. A garbage state file shouldn't crash
+    /// the dashboard — operator just gets a fresh start.
+    #[test]
+    fn dashboard_state_load_corrupt_file_returns_none() {
+        let mut tmp = std::env::temp_dir();
+        tmp.push(format!(
+            "rust-agent-corrupt-state-{}.json",
+            std::process::id(),
+        ));
+        std::fs::write(&tmp, b"not json at all").unwrap();
+        let loaded = super::load_persisted_dashboard_state(
+            &tmp,
+            1_700_000_000_000,
+            super::DASHBOARD_STATE_TTL_MS_DEFAULT,
+        );
+        assert!(loaded.is_none());
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    /// Env-parsing for the TTL knob.
+    #[test]
+    fn dashboard_state_ttl_env_parsing() {
+        std::env::remove_var("DASHBOARD_STATE_TTL_S");
+        assert_eq!(
+            super::dashboard_state_ttl_ms(),
+            super::DASHBOARD_STATE_TTL_MS_DEFAULT,
+        );
+        std::env::set_var("DASHBOARD_STATE_TTL_S", "60");
+        assert_eq!(super::dashboard_state_ttl_ms(), 60_000);
+        std::env::set_var("DASHBOARD_STATE_TTL_S", "bogus");
+        assert_eq!(
+            super::dashboard_state_ttl_ms(),
+            super::DASHBOARD_STATE_TTL_MS_DEFAULT,
+        );
+        std::env::remove_var("DASHBOARD_STATE_TTL_S");
+    }
+
+    /// Path resolver respects DASHBOARD_STATE_PATH override.
+    #[test]
+    fn dashboard_state_path_respects_env_override() {
+        std::env::set_var("DASHBOARD_STATE_PATH", "/tmp/my-custom-state.json");
+        let path = super::dashboard_state_path();
+        assert_eq!(path.to_str(), Some("/tmp/my-custom-state.json"));
+        std::env::remove_var("DASHBOARD_STATE_PATH");
+        // Default falls back to $HOME/.cache/rust-agent/...
+        let default_path = super::dashboard_state_path();
+        let s = default_path.to_string_lossy();
+        assert!(
+            s.contains(".cache/rust-agent/dashboard_state.json"),
+            "default path looks wrong: {s}",
+        );
     }
 
     #[test]
