@@ -709,12 +709,22 @@ pub fn metrics_pnl_daily_cache_ttl_ms() -> i64 {
         .unwrap_or(METRICS_PNL_DAILY_CACHE_TTL_MS_DEFAULT)
 }
 
-/// Width of the rolling pnl_breakdown window metric, in days.
-/// Hard-coded — exposed to Grafana as the literal label `days="7"`
-/// in `agent_pnl_breakdown_window_*` so the panel query is
-/// trivially `sum by (strategy)(agent_pnl_breakdown_window_realized_usd)`.
-/// One UTC bucket_day per offset, anchored on `now`.
-const PNL_BREAKDOWN_WINDOW_DAYS: i64 = 7;
+/// Default width of the rolling pnl_breakdown window metric, in
+/// days. Exposed to Grafana as the literal label `days="<n>"` in
+/// `agent_pnl_breakdown_window_*` so the panel query is trivially
+/// `sum by (strategy)(agent_pnl_breakdown_window_realized_usd{days="7"})`.
+/// One UTC bucket_day per offset, anchored on `now`. Operator-
+/// tunable via `PNL_BREAKDOWN_WINDOW_DAYS` env; the `days` label
+/// reflects the active value.
+pub const PNL_BREAKDOWN_WINDOW_DAYS_DEFAULT: i64 = 7;
+
+pub fn pnl_breakdown_window_days() -> i64 {
+    std::env::var("PNL_BREAKDOWN_WINDOW_DAYS")
+        .ok()
+        .and_then(|s| s.parse::<i64>().ok())
+        .filter(|n| *n >= 1)
+        .unwrap_or(PNL_BREAKDOWN_WINDOW_DAYS_DEFAULT)
+}
 
 /// Default width of the rolling per-pair disagreement window
 /// metric, in days. Same shape as `PNL_BREAKDOWN_WINDOW_DAYS`.
@@ -1553,6 +1563,7 @@ pub fn render_metrics(s: &MetricsSnapshot) -> String {
     // sibling metric (cheaper than turning this one into a histogram).
     if let Some(cache) = s.pnl_breakdown_window.as_ref() {
         if !cache.rows.is_empty() {
+            let window_days = pnl_breakdown_window_days();
             out.push_str(
                 "# HELP agent_pnl_breakdown_window_realized_usd Realized PnL in USD summed over the last `days` UTC days per (strategy, exec). Anchored on today's UTC bucket.\n",
             );
@@ -1562,7 +1573,7 @@ pub fn render_metrics(s: &MetricsSnapshot) -> String {
                     "agent_pnl_breakdown_window_realized_usd{{strategy=\"{}\",exec=\"{}\",days=\"{}\"}} {}\n",
                     escape_label(&row.strategy),
                     escape_label(&row.exec),
-                    PNL_BREAKDOWN_WINDOW_DAYS,
+                    window_days,
                     row.realized_pnl,
                 ));
             }
@@ -1575,7 +1586,7 @@ pub fn render_metrics(s: &MetricsSnapshot) -> String {
                     "agent_pnl_breakdown_window_trades_count{{strategy=\"{}\",exec=\"{}\",days=\"{}\"}} {}\n",
                     escape_label(&row.strategy),
                     escape_label(&row.exec),
-                    PNL_BREAKDOWN_WINDOW_DAYS,
+                    window_days,
                     row.n_settled,
                 ));
             }
@@ -1966,7 +1977,8 @@ async fn gather_metrics_snapshot(s: &HealthAppState, now: i64) -> MetricsSnapsho
                 let mut agg: std::collections::BTreeMap<(String, String), (f64, i32)> =
                     std::collections::BTreeMap::new();
                 let mut any_err = false;
-                for i in 0..PNL_BREAKDOWN_WINDOW_DAYS {
+                let window_days = pnl_breakdown_window_days();
+                for i in 0..window_days {
                     let bd = today_bd - i * day_ms;
                     match breakdown_repo.list_day(bd).await {
                         Ok(rows) => {
@@ -2950,14 +2962,16 @@ mod tests {
             notes: Vec::new(),
         };
 
+        // The default window applies here (no env override).
+        std::env::remove_var("PNL_BREAKDOWN_WINDOW_DAYS");
         let out = super::render_metrics(&snap);
         let expected_realized = format!(
             "agent_pnl_breakdown_window_realized_usd{{strategy=\"deepseek\",exec=\"live\",days=\"{}\"}} -3.5",
-            super::PNL_BREAKDOWN_WINDOW_DAYS,
+            super::PNL_BREAKDOWN_WINDOW_DAYS_DEFAULT,
         );
         let expected_count = format!(
             "agent_pnl_breakdown_window_trades_count{{strategy=\"deepseek\",exec=\"live\",days=\"{}\"}} 7",
-            super::PNL_BREAKDOWN_WINDOW_DAYS,
+            super::PNL_BREAKDOWN_WINDOW_DAYS_DEFAULT,
         );
         assert!(
             out.contains(&expected_realized),
@@ -3451,6 +3465,36 @@ mod tests {
     /// explicit override, and malformed value all round-trip
     /// through the same accessors gather_metrics_snapshot uses.
     #[test]
+    /// Env-parsing for the pnl_breakdown window knob. Same shape
+    /// as the agreement variant — default / explicit / 0 /
+    /// negative / malformed all round-trip through the accessor.
+    #[test]
+    fn pnl_breakdown_window_days_env_parsing() {
+        std::env::remove_var("PNL_BREAKDOWN_WINDOW_DAYS");
+        assert_eq!(
+            super::pnl_breakdown_window_days(),
+            super::PNL_BREAKDOWN_WINDOW_DAYS_DEFAULT,
+        );
+        std::env::set_var("PNL_BREAKDOWN_WINDOW_DAYS", "30");
+        assert_eq!(super::pnl_breakdown_window_days(), 30);
+        std::env::set_var("PNL_BREAKDOWN_WINDOW_DAYS", "0");
+        assert_eq!(
+            super::pnl_breakdown_window_days(),
+            super::PNL_BREAKDOWN_WINDOW_DAYS_DEFAULT,
+        );
+        std::env::set_var("PNL_BREAKDOWN_WINDOW_DAYS", "-3");
+        assert_eq!(
+            super::pnl_breakdown_window_days(),
+            super::PNL_BREAKDOWN_WINDOW_DAYS_DEFAULT,
+        );
+        std::env::set_var("PNL_BREAKDOWN_WINDOW_DAYS", "bogus");
+        assert_eq!(
+            super::pnl_breakdown_window_days(),
+            super::PNL_BREAKDOWN_WINDOW_DAYS_DEFAULT,
+        );
+        std::env::remove_var("PNL_BREAKDOWN_WINDOW_DAYS");
+    }
+
     /// Env-parsing for the agreement window knob. Default,
     /// explicit override, "0/negative rejected (falls back to
     /// default — a 0-day window would emit nothing)", and
