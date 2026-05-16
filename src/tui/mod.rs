@@ -1475,8 +1475,8 @@ fn draw_consensus(
         Constraint::Min(40),
         Constraint::Length(10),
     ];
-    let title = if s.consensus.is_empty() {
-        " market consensus (no decisions today yet) ".to_string()
+    let title_line: Line<'static> = if s.consensus.is_empty() {
+        Line::from(" market consensus (no decisions today yet) ")
     } else {
         // Quick at-a-glance roll-up alongside the panel title.
         let mut all_agree = 0u32;
@@ -1493,9 +1493,10 @@ fn draw_consensus(
         }
         // Focused-strategy count when filter is active: how many
         // markets the focused strategy actually picked a side on
-        // (i.e. is present in active_picks). Mirrors the positions
-        // panel's "N <strategy>-related" annotation so the
-        // operator sees both signals consistently.
+        // (i.e. is present in active_picks). Same cyan+bold
+        // styling on the name as the comparison/positions/
+        // strategy-pnl titles so the operator's eye matches the
+        // name everywhere.
         let focused_count = strategy_filter.map(|name| {
             s.consensus
                 .iter()
@@ -1511,13 +1512,20 @@ fn draw_consensus(
             pass,
         );
         match (strategy_filter, focused_count) {
-            (Some(name), Some(n)) => format!("{base} — {n} {name}-involved) "),
-            _ => format!("{base}) "),
+            (Some(name), Some(n)) => Line::from(vec![
+                Span::raw(format!("{base} — {n} ")),
+                Span::styled(
+                    name.to_string(),
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("-involved) "),
+            ]),
+            _ => Line::from(format!("{base}) ")),
         }
     };
     let table = Table::new(rows, widths)
         .header(header)
-        .block(Block::default().borders(Borders::ALL).title(title));
+        .block(Block::default().borders(Borders::ALL).title(title_line));
     f.render_widget(table, area);
 }
 
@@ -1774,30 +1782,36 @@ fn draw_strategy_pnl(
     // --pnl-days 7 see "trend ~ 7 days" rather than a stale
     // "today's series" label, and an empty window still gets the
     // unambiguous "no snapshots yet" hint.
-    let title: String = if rows.is_empty() {
-        " strategy pnl (no snapshots yet — run `compare-pnl` or daemon) ".to_string()
+    let title_line: Line<'static> = if rows.is_empty() {
+        Line::from(" strategy pnl (no snapshots yet — run `compare-pnl` or daemon) ")
     } else {
         let span_label = ts_span_label(&s.snapshots);
+        let base = format!(
+            " strategy pnl (latest snapshot per strategy, trend ~ {span_label}",
+        );
         // Filter-aware annotation: append the focused strategy's
         // latest-snapshot stats (decisions count + Σ pnl) so the
         // operator sees their headline numbers in the title
-        // without scanning the row. Mirrors the positions +
-        // consensus titles' filter-aware annotations.
+        // without scanning the row. Same cyan+bold styling on the
+        // strategy name as the other panel titles so the operator
+        // matches names across the dashboard at a glance.
         let focused_stats = strategy_filter.and_then(|name| {
             by_strategy
                 .get(name)
                 .and_then(|series| series.last().copied())
-                .map(|latest| {
-                    format!(
-                        " — {name}: {} decisions, Σ${:+.2}",
-                        latest.n_decisions, latest.sum_pnl
-                    )
-                })
+                .map(|latest| (name.to_string(), latest.n_decisions, latest.sum_pnl))
         });
-        format!(
-            " strategy pnl (latest snapshot per strategy, trend ~ {span_label}{}) ",
-            focused_stats.as_deref().unwrap_or(""),
-        )
+        match focused_stats {
+            Some((name, n_decisions, sum_pnl)) => Line::from(vec![
+                Span::raw(format!("{base} — ")),
+                Span::styled(
+                    name,
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(format!(": {n_decisions} decisions, Σ${:+.2}) ", sum_pnl)),
+            ]),
+            None => Line::from(format!("{base}) ")),
+        }
     };
     let widths = [
         Constraint::Length(10),
@@ -1813,7 +1827,7 @@ fn draw_strategy_pnl(
     ];
     let table = Table::new(rows, widths)
         .header(header)
-        .block(Block::default().borders(Borders::ALL).title(title));
+        .block(Block::default().borders(Borders::ALL).title(title_line));
     f.render_widget(table, table_area);
 }
 
@@ -2433,25 +2447,31 @@ fn draw_positions(f: &mut ratatui::Frame, area: Rect, s: &Snapshot, strategy_fil
     // `focused_markets` set used for dim rendering; counts every
     // position whose market_slug is in the set (no "take N" cap
     // — we want the true count, not the on-screen count).
-    let title = match (strategy_filter, &focused_markets) {
+    // Build the title as a Line of Spans so the focused
+    // strategy name renders cyan+bold (matching the comparison
+    // panel title — operator's eye matches the name across
+    // every filter-aware title).
+    let title_line: Line<'static> = match (strategy_filter, &focused_markets) {
         (Some(name), Some(set)) => {
             let focused_count = s
                 .positions
                 .iter()
                 .filter(|p| set.contains(p.market_slug.as_str()))
                 .count();
-            format!(
-                " positions ({} open, {} {}-related) ",
-                s.positions.len(),
-                focused_count,
-                name,
-            )
+            Line::from(vec![
+                Span::raw(format!(" positions ({} open, {} ", s.positions.len(), focused_count)),
+                Span::styled(
+                    name.to_string(),
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("-related) "),
+            ])
         }
-        _ => format!(" positions ({} open) ", s.positions.len()),
+        _ => Line::from(format!(" positions ({} open) ", s.positions.len())),
     };
     let table = Table::new(rows, widths)
         .header(header)
-        .block(Block::default().borders(Borders::ALL).title(title));
+        .block(Block::default().borders(Borders::ALL).title(title_line));
     f.render_widget(table, area);
 }
 
@@ -3977,6 +3997,124 @@ mod tests {
         assert!(
             !dump_plain.contains(": rank #"),
             "no rank annotation should appear without filter:\n{dump_plain}",
+        );
+    }
+
+    /// Find the focus-name substring inside a specific panel
+    /// title and return whether it carries Cyan fg. Identifies
+    /// the title line by the `marker` substring (a known
+    /// per-panel prefix).
+    ///
+    /// Walks cell-by-cell (each ratatui cell is one displayed
+    /// char) rather than by byte position, so multi-byte chars
+    /// like ✓ / ✗ / — in the consensus title don't throw off the
+    /// offset.
+    fn focus_name_is_cyan_in_title(
+        buf: &ratatui::buffer::Buffer,
+        marker: &str,
+        name: &str,
+    ) -> bool {
+        let width = buf.area.width as usize;
+        let total = buf.content.len();
+        let name_chars: Vec<String> = name.chars().map(|c| c.to_string()).collect();
+        for row_start in (0..total).step_by(width) {
+            let row_end = (row_start + width).min(total);
+            // Per-cell symbol vector — each cell is exactly one
+            // displayed char.
+            let cells: Vec<&str> = buf.content[row_start..row_end]
+                .iter()
+                .map(|c| c.symbol())
+                .collect();
+            let row_str: String = cells.iter().copied().collect();
+            if !row_str.contains(marker) {
+                continue;
+            }
+            // Slide a window of `name_chars.len()` cells across
+            // the row, looking for a match by cell symbols.
+            if name_chars.is_empty() || name_chars.len() > cells.len() {
+                return false;
+            }
+            for start in 0..=(cells.len() - name_chars.len()) {
+                let window = &cells[start..start + name_chars.len()];
+                if window
+                    .iter()
+                    .zip(name_chars.iter())
+                    .all(|(c, n)| *c == n.as_str())
+                {
+                    let from = row_start + start;
+                    let to = from + name_chars.len();
+                    for cell in &buf.content[from..to] {
+                        if cell.fg == ratatui::style::Color::Cyan {
+                            return true;
+                        }
+                    }
+                    return false;
+                }
+            }
+            return false;
+        }
+        false
+    }
+
+    /// Focus name renders cyan + bold in positions / consensus /
+    /// strategy-pnl titles when filter is active. Mirrors the
+    /// comparison-title cyan-name test.
+    #[test]
+    fn panel_titles_cyan_focus_name_across_panels() {
+        use crate::coredb::types::{Decision, Position, StrategyPnlSnapshot};
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        use uuid::Uuid;
+        let mut s = super::Snapshot::default();
+        s.decisions = vec![Decision {
+            bucket_day_ms: 0, ts_ms: 1, decision_id: Uuid::nil(),
+            market_slug: "btc-100k".into(), side: "YES".into(),
+            size_usd: 1.0, confidence: 0.0, edge_bps: 0,
+            reasoning: String::new(), raw_response: String::new(),
+            entry_price: 0.5, strategy: "baseline".into(),
+        }];
+        s.consensus = super::build_consensus(&s.decisions);
+        s.positions = vec![Position {
+            market_slug: "btc-100k".into(), side: "YES".into(),
+            size: 10.0, avg_price: 0.5, updated_at_ms: 1,
+        }];
+        s.snapshots = vec![StrategyPnlSnapshot {
+            bucket_day_ms: 0, ts_ms: 1, strategy: "baseline".into(),
+            n_decisions: 100, sum_size_usd: 500.0, sum_pnl: 12.34,
+            n_yes: 30, n_no: 30, n_pass: 40,
+        }];
+        let strategies = super::strategies_in_view(&s);
+        let prev_ranks: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        let backend = TestBackend::new(140, 50);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                super::draw(
+                    f,
+                    &s,
+                    std::time::Duration::from_millis(0),
+                    std::time::Duration::from_secs(42),
+                    &strategies,
+                    Some("baseline"),
+                    &prev_ranks,
+                    super::ComparisonSort::DEFAULT,
+                )
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let dump = render_buffer(buf);
+        assert!(
+            focus_name_is_cyan_in_title(buf, "strategy pnl (", "baseline"),
+            "strategy-pnl title 'baseline' should be Cyan:\n{dump}"
+        );
+        assert!(
+            focus_name_is_cyan_in_title(buf, "market consensus (", "baseline"),
+            "consensus title 'baseline' should be Cyan:\n{dump}"
+        );
+        assert!(
+            focus_name_is_cyan_in_title(buf, "positions (", "baseline"),
+            "positions title 'baseline' should be Cyan:\n{dump}"
         );
     }
 
