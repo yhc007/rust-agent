@@ -1631,7 +1631,7 @@ pub fn render_metrics(s: &MetricsSnapshot) -> String {
                     "# HELP agent_pnl_delta_24h_usd Change in sum_pnl over the trailing 24h per strategy. Sourced from strategy_pnl_snapshots; baseline is the snapshot closest to (latest_ts - 24h) within \u{00B1}6h. No series for strategies with no usable baseline.\n",
                 );
                 out.push_str("# TYPE agent_pnl_delta_24h_usd gauge\n");
-                for (strategy, d) in deltas {
+                for (strategy, d) in &deltas {
                     out.push_str(&format!(
                         "agent_pnl_delta_24h_usd{{strategy=\"{}\"}} {}\n",
                         escape_label(strategy),
@@ -1659,11 +1659,57 @@ pub fn render_metrics(s: &MetricsSnapshot) -> String {
                     "# HELP agent_pnl_delta_12h_usd Change in sum_pnl over the trailing 12h per strategy. Sourced from strategy_pnl_snapshots; baseline is the snapshot closest to (latest_ts - 12h) within \u{00B1}3h. Pairs with agent_pnl_delta_24h_usd: when the 12h delta has the same sign and similar magnitude as the 24h delta, the recent half is the dominant contributor; opposite signs flag a reversal. No series for strategies with no usable baseline.\n",
                 );
                 out.push_str("# TYPE agent_pnl_delta_12h_usd gauge\n");
-                for (strategy, d) in deltas_12h {
+                for (strategy, d) in &deltas_12h {
                     out.push_str(&format!(
                         "agent_pnl_delta_12h_usd{{strategy=\"{}\"}} {}\n",
                         escape_label(strategy),
                         d
+                    ));
+                }
+            }
+
+            // Joined ratio: delta_12h / delta_24h per strategy.
+            // Lets a Grafana alert express "recent half reversing
+            // trend" as `agent_pnl_delta_12h_24h_ratio < 0` —
+            // a single-series rule rather than `(12h / 24h) < 0`
+            // which would either need a recording rule or naked
+            // arithmetic on two metrics.
+            //
+            // Interpretation:
+            //   ratio > 1   : recent 12h MORE than 24h headline
+            //                 (accelerating in headline direction)
+            //   0 < ratio ≤ 1: recent 12h same direction, smaller
+            //                 (cooling but not reversing)
+            //   ratio < 0   : recent 12h opposite direction — the
+            //                 "reversal" alert signal
+            //
+            // Skip strategies where |delta_24h| < $1 (noise floor).
+            // Ratios at near-zero denominators blow up wildly and
+            // don't carry meaning; "no series" is the honest
+            // response. Same skip-the-series contract as the
+            // individual delta families above when their baselines
+            // are missing.
+            const RATIO_DENOM_FLOOR_USD: f64 = 1.0;
+            let by_strategy_24h: std::collections::HashMap<&str, f64> =
+                deltas.iter().copied().collect();
+            let mut ratios: Vec<(&str, f64)> = Vec::new();
+            for (strategy, d12) in &deltas_12h {
+                if let Some(&d24) = by_strategy_24h.get(strategy) {
+                    if d24.abs() >= RATIO_DENOM_FLOOR_USD {
+                        ratios.push((strategy, d12 / d24));
+                    }
+                }
+            }
+            if !ratios.is_empty() {
+                out.push_str(
+                    "# HELP agent_pnl_delta_12h_24h_ratio Ratio of trailing 12h sum_pnl delta to trailing 24h sum_pnl delta, per strategy. Negative = recent half reversed the 24h headline. >1 = recent half accelerating; 0<r\u{2264}1 = recent half cooling; <0 = reversal. Skipped when |24h delta| < $1 (denominator noise floor).\n",
+                );
+                out.push_str("# TYPE agent_pnl_delta_12h_24h_ratio gauge\n");
+                for (strategy, r) in ratios {
+                    out.push_str(&format!(
+                        "agent_pnl_delta_12h_24h_ratio{{strategy=\"{}\"}} {}\n",
+                        escape_label(strategy),
+                        r
                     ));
                 }
             }
@@ -3131,6 +3177,7 @@ mod tests {
             "agent_pnl_breakdown_yesterday_trades_count",
             "agent_pnl_daily_realized_usd",
             "agent_pnl_daily_trades_count",
+            "agent_pnl_delta_12h_24h_ratio",
             "agent_pnl_delta_12h_usd",
             "agent_pnl_delta_24h_usd",
             "agent_risk_kill_switch_active",
@@ -3666,6 +3713,120 @@ mod tests {
         );
     }
 
+    /// 12h/24h ratio metric needs both deltas; pin the exact
+    /// emitted value + the noise-floor skip behavior. Build a
+    /// 3-point series spanning a full 24h with a 12h midpoint,
+    /// and a second strategy where the 24h delta is below the
+    /// $1 floor (must produce no ratio series).
+    #[test]
+    fn render_metrics_pnl_delta_12h_24h_ratio_emits_with_noise_floor() {
+        use std::path::PathBuf;
+        let hour = 3_600_000_i64;
+        let now = 1_700_000_010_000_i64;
+        let snap = super::MetricsSnapshot {
+            now_ms: now,
+            health: super::HealthState {
+                started_at_ms: 1_700_000_000_000,
+                backtest: super::SubtaskHealth::default(),
+                compare: super::SubtaskHealth::default(),
+                settle: super::SubtaskHealth::default(),
+                user_channel_present: false,
+            },
+            btc_age_ms: None,
+            polymarket_age_ms: None,
+            decisions: None,
+            orders: None,
+            pnl_daily: None,
+            pnl_breakdown: None,
+            pnl_breakdown_yesterday: None,
+            pnl_breakdown_window: None,
+            positions: None,
+            ingest_probe_age_ms: None,
+            ingest_restarts_binance: 0,
+            ingest_restarts_polymarket: 0,
+            agreement: None,
+            agreement_window: None,
+            strategy_pnl: Some(super::StrategyPnlCacheEntry {
+                fetched_at_ms: now,
+                anchor_bucket_day_ms: 1_700_000_000_000,
+                rows: vec![
+                    // baseline: spans full 24h, 12h midpoint.
+                    // 24h ago: pnl=0, 12h ago: pnl=15, now: pnl=20.
+                    //   delta_24h = +20, delta_12h = +5
+                    //   ratio = 5/20 = 0.25 (recent half cooling)
+                    crate::coredb::types::StrategyPnlSnapshot {
+                        bucket_day_ms: 1_700_000_000_000,
+                        ts_ms: now - 24 * hour,
+                        strategy: "baseline".into(),
+                        n_decisions: 0, sum_size_usd: 0.0, sum_pnl: 0.0,
+                        n_yes: 0, n_no: 0, n_pass: 0,
+                    },
+                    crate::coredb::types::StrategyPnlSnapshot {
+                        bucket_day_ms: 1_700_000_000_000,
+                        ts_ms: now - 12 * hour,
+                        strategy: "baseline".into(),
+                        n_decisions: 0, sum_size_usd: 0.0, sum_pnl: 15.0,
+                        n_yes: 0, n_no: 0, n_pass: 0,
+                    },
+                    crate::coredb::types::StrategyPnlSnapshot {
+                        bucket_day_ms: 1_700_000_000_000,
+                        ts_ms: now,
+                        strategy: "baseline".into(),
+                        n_decisions: 0, sum_size_usd: 0.0, sum_pnl: 20.0,
+                        n_yes: 0, n_no: 0, n_pass: 0,
+                    },
+                    // smallmove: 24h delta = +$0.50 (below $1 floor).
+                    // Δ12h = +$0.20. Ratio would be 0.4 but the
+                    // denominator floor must skip the series so
+                    // alerts don't flap on noise.
+                    crate::coredb::types::StrategyPnlSnapshot {
+                        bucket_day_ms: 1_700_000_000_000,
+                        ts_ms: now - 24 * hour,
+                        strategy: "smallmove".into(),
+                        n_decisions: 0, sum_size_usd: 0.0, sum_pnl: 10.0,
+                        n_yes: 0, n_no: 0, n_pass: 0,
+                    },
+                    crate::coredb::types::StrategyPnlSnapshot {
+                        bucket_day_ms: 1_700_000_000_000,
+                        ts_ms: now - 12 * hour,
+                        strategy: "smallmove".into(),
+                        n_decisions: 0, sum_size_usd: 0.0, sum_pnl: 10.30,
+                        n_yes: 0, n_no: 0, n_pass: 0,
+                    },
+                    crate::coredb::types::StrategyPnlSnapshot {
+                        bucket_day_ms: 1_700_000_000_000,
+                        ts_ms: now,
+                        strategy: "smallmove".into(),
+                        n_decisions: 0, sum_size_usd: 0.0, sum_pnl: 10.50,
+                        n_yes: 0, n_no: 0, n_pass: 0,
+                    },
+                ],
+            }),
+            risk: super::RiskLimits {
+                max_order_usd: 50.0,
+                kill_switch_path: PathBuf::from("/tmp/__definitely_nonexistent__"),
+            },
+            notes: Vec::new(),
+        };
+        let out = super::render_metrics(&snap);
+        assert!(
+            out.contains("# TYPE agent_pnl_delta_12h_24h_ratio gauge\n"),
+            "missing TYPE line for ratio gauge:\n{out}",
+        );
+        // baseline ratio = 5/20 = 0.25 — exact float.
+        assert!(
+            out.contains("agent_pnl_delta_12h_24h_ratio{strategy=\"baseline\"} 0.25\n"),
+            "expected baseline ratio 0.25; got:\n{out}",
+        );
+        // smallmove must NOT appear — 24h delta of +0.50 is below
+        // the $1 floor; emitting a ratio against a tiny denominator
+        // would flap wildly and alert noise.
+        assert!(
+            !out.contains("agent_pnl_delta_12h_24h_ratio{strategy=\"smallmove\""),
+            "smallmove with |Δ24h| < $1 should be skipped:\n{out}",
+        );
+    }
+
     /// Empty strategy_pnl cache (e.g. compare-pnl hasn't run yet)
     /// emits no HELP/TYPE preamble and no samples — no point in
     /// an empty family on every scrape.
@@ -3902,6 +4063,7 @@ mod tests {
             "agent_pnl_breakdown_yesterday_trades_count",
             "agent_pnl_daily_realized_usd",
             "agent_pnl_daily_trades_count",
+            "agent_pnl_delta_12h_24h_ratio",
             "agent_pnl_delta_12h_usd",
             "agent_pnl_delta_24h_usd",
             "agent_risk_kill_switch_active",
