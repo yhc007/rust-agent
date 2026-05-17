@@ -445,7 +445,16 @@ pub async fn run(cfg: DaemonConfig) -> Result<()> {
         "compare-pnl",
         TaskKind::Compare,
         Duration::from_secs(compare_every_secs),
-        /* skip_first = */ true,
+        // Fire on startup: on a brand-new deployment with no
+        // decisions the first run is a cheap no-op (~1 CoreDB read
+        // + 1 Polymarket Gamma call, finds 0 decisions, returns).
+        // On the much-more-common case of a daemon restart, the
+        // existing decisions / snapshots ARE meaningful and an
+        // immediate compare-pnl populates /health.compare.last_tick
+        // + writes a fresh snapshot row so the dashboard / Δ24h
+        // metric have current data right away instead of looking
+        // "cold" for the full interval (default 15 min).
+        /* skip_first = */ false,
         shutdown_rx.clone(),
         health.clone(),
         {
@@ -462,7 +471,14 @@ pub async fn run(cfg: DaemonConfig) -> Result<()> {
         "settle-pnl",
         TaskKind::Settle,
         Duration::from_secs(settle_every_secs),
-        /* skip_first = */ true,
+        // Fire on startup: cheap no-op when no orders exist
+        // (reads today's orders → 0 → returns). On a restart with
+        // existing orders that have since resolved on Polymarket,
+        // the immediate tick writes pnl_daily rows right away
+        // instead of waiting up to a full settle interval
+        // (default 1 h). Same /health-staleness rationale as
+        // compare-pnl above.
+        /* skip_first = */ false,
         shutdown_rx.clone(),
         health.clone(),
         {
@@ -2605,8 +2621,11 @@ async fn periodic<F>(
     let mut tick = interval(every);
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     if skip_first {
-        // tokio's interval's first tick fires immediately by default —
-        // for compare-pnl/settle-pnl that's wasteful on a cold daemon.
+        // Burn tokio's free first tick so the body's first run
+        // happens one full interval after spawn. Kept as a per-
+        // call knob (no current callers set it `true`) for the
+        // case where an operator explicitly wants a cold-start
+        // delay before the body executes.
         tick.tick().await;
     }
     loop {
