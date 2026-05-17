@@ -194,8 +194,14 @@ enum Commands {
         /// Number of UTC days back from "today" to include. 1 = today
         /// only, the historical default. Failed partition reads on
         /// one day are logged but don't abort the rest of the window.
-        #[arg(long, default_value_t = 1)]
+        #[arg(long, default_value_t = 1, conflicts_with = "since")]
         days: u32,
+        /// Anchor the window at a precise start (RFC3339 or N{s,m,h,d}).
+        /// Mutually exclusive with --days. Post-filters rows by
+        /// ts_ms ≥ resolved start so 'since 6h' returns the last 6h
+        /// exactly, not the rounded UTC day(s) that contain it.
+        #[arg(long)]
+        since: Option<String>,
         /// Emit one JSON object to stdout instead of the human-
         /// readable table. Same data, jq-friendly. Composes with
         /// --strategies / --days.
@@ -219,8 +225,13 @@ enum Commands {
         /// only, the historical default). Each day is a separate
         /// `strategy_pnl_snapshots` partition read; failures on one
         /// day don't abort the rest.
-        #[arg(long, default_value_t = 1)]
+        #[arg(long, default_value_t = 1, conflicts_with = "since")]
         days: u32,
+        /// Anchor the window at a precise start (RFC3339 or N{s,m,h,d}).
+        /// Mutually exclusive with --days. Post-filters snapshots
+        /// by ts_ms ≥ resolved start.
+        #[arg(long)]
+        since: Option<String>,
         /// Emit one JSON object to stdout instead of the human-
         /// readable table. Same data, jq-friendly. Composes with
         /// --strategies / --days.
@@ -242,8 +253,15 @@ enum Commands {
         #[arg(long, value_delimiter = ',')]
         execs: Vec<String>,
         /// Number of UTC days back from "today" to include.
-        #[arg(long, default_value_t = 1)]
+        #[arg(long, default_value_t = 1, conflicts_with = "since")]
         days: u32,
+        /// Anchor the window at a precise start (RFC3339 or N{s,m,h,d}).
+        /// Mutually exclusive with --days. NOTE: pnl_breakdown rows
+        /// are daily aggregates (no ts column) so --since rounds to
+        /// bucket_day granularity — useful for "since 2026-05-10" or
+        /// "since 14d" calls, but not finer-grained windows.
+        #[arg(long)]
+        since: Option<String>,
         /// Emit one JSON object to stdout instead of the human-
         /// readable table.
         #[arg(long)]
@@ -455,28 +473,51 @@ async fn main() -> Result<()> {
             };
             backtest::compare::run(&coredb_uri, filter.as_deref(), days, since_ms, json).await?;
         }
-        Some(Commands::PnlHistory { coredb_uri, strategies, days, json }) => {
+        Some(Commands::PnlHistory { coredb_uri, strategies, days, since, json }) => {
             let filter = if strategies.is_empty() { None } else { Some(strategies) };
-            backtest::history::run(&coredb_uri, filter.as_deref(), days, json).await?;
+            let since_ms = match since {
+                Some(s) => Some(
+                    backtest::compare::parse_since(&s, crate::coredb::types::now_ms())
+                        .map_err(|e| anyhow::anyhow!("parse --since: {e}"))?,
+                ),
+                None => None,
+            };
+            backtest::history::run(&coredb_uri, filter.as_deref(), days, since_ms, json).await?;
         }
-        Some(Commands::AgreementHistory { coredb_uri, strategies, days, json }) => {
+        Some(Commands::AgreementHistory { coredb_uri, strategies, days, since, json }) => {
             let filter = if strategies.is_empty() { None } else { Some(strategies) };
-            backtest::agreement_history::run(&coredb_uri, filter.as_deref(), days, json).await?;
+            let since_ms = match since {
+                Some(s) => Some(
+                    backtest::compare::parse_since(&s, crate::coredb::types::now_ms())
+                        .map_err(|e| anyhow::anyhow!("parse --since: {e}"))?,
+                ),
+                None => None,
+            };
+            backtest::agreement_history::run(&coredb_uri, filter.as_deref(), days, since_ms, json).await?;
         }
         Some(Commands::PnlBreakdownHistory {
             coredb_uri,
             strategies,
             execs,
             days,
+            since,
             json,
         }) => {
             let strat_filter = if strategies.is_empty() { None } else { Some(strategies) };
             let exec_filter = if execs.is_empty() { None } else { Some(execs) };
+            let since_ms = match since {
+                Some(s) => Some(
+                    backtest::compare::parse_since(&s, crate::coredb::types::now_ms())
+                        .map_err(|e| anyhow::anyhow!("parse --since: {e}"))?,
+                ),
+                None => None,
+            };
             backtest::pnl_breakdown_history::run(
                 &coredb_uri,
                 strat_filter.as_deref(),
                 exec_filter.as_deref(),
                 days,
+                since_ms,
                 json,
             )
             .await?;

@@ -25,6 +25,7 @@ pub async fn run(
     strategies_filter: Option<&[String]>,
     execs_filter: Option<&[String]>,
     days: u32,
+    since_ms: Option<i64>,
     json: bool,
 ) -> Result<()> {
     let days = days.max(1);
@@ -36,9 +37,21 @@ pub async fn run(
     let repo = PnlBreakdownRepo::new(db.session()).await?;
 
     let today = bucket_day(now_ms());
-    let mut buckets: Vec<Millis> = Vec::with_capacity(days as usize);
-    for i in 0..days as i64 {
-        buckets.push(today - (days as i64 - 1 - i) * DAY_MS);
+    // pnl_breakdown rows are daily aggregates with no ts column,
+    // so `--since` here can only round to bucket_day granularity
+    // (covered in the CLI help). Compute the span of bucket_days
+    // touched by the resolved start; post-filtering is a no-op
+    // because each row IS a daily aggregate.
+    let effective_days: u32 = match since_ms {
+        Some(since) => {
+            let start_bd = bucket_day(since);
+            ((today - start_bd) / DAY_MS).max(0) as u32 + 1
+        }
+        None => days,
+    };
+    let mut buckets: Vec<Millis> = Vec::with_capacity(effective_days as usize);
+    for i in 0..effective_days as i64 {
+        buckets.push(today - (effective_days as i64 - 1 - i) * DAY_MS);
     }
 
     let mut rows: Vec<PnlBreakdown> = Vec::new();
@@ -58,15 +71,21 @@ pub async fn run(
             }
         }
     }
-    if days > 1 {
+    if let Some(since) = since_ms {
+        say!(
+            "   --since {} → {} bucket_day(s) (granularity: bucket_day, not ts)",
+            since,
+            effective_days,
+        );
+    } else if effective_days > 1 {
         say!(
             "   spanning {} UTC days: {} → {} (today)",
-            days,
+            effective_days,
             buckets.first().copied().unwrap_or(0),
             today,
         );
         if empty_days > 0 {
-            say!("   {empty_days} of {days} days had no rows");
+            say!("   {empty_days} of {effective_days} days had no rows");
         }
     }
 
@@ -105,7 +124,8 @@ pub async fn run(
 
     if json {
         print_json_payload(JsonOut {
-            days,
+            days: effective_days,
+            since_ms,
             bucket_days: buckets,
             filter: JsonFilter {
                 strategies: strategies_filter.map(|s| s.to_vec()),
@@ -180,6 +200,11 @@ pub async fn run(
 #[derive(Serialize)]
 struct JsonOut {
     days: u32,
+    /// Resolved `--since` start. Rounds to bucket_day granularity
+    /// because pnl_breakdown rows are daily aggregates — see CLI
+    /// help text.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    since_ms: Option<i64>,
     bucket_days: Vec<Millis>,
     filter: JsonFilter,
     n_total: usize,

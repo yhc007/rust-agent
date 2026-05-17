@@ -17,6 +17,7 @@ pub async fn run(
     coredb_uri: &str,
     strategies_filter: Option<&[String]>,
     days: u32,
+    since_ms: Option<i64>,
     json: bool,
 ) -> Result<()> {
     let days = days.max(1);
@@ -27,13 +28,20 @@ pub async fn run(
     let db = CoreDb::connect(coredb_uri).await.context("connect coredb")?;
     let repo = StrategyPnlRepo::new(db.session()).await?;
 
-    // Compute the list of UTC-day buckets, oldest first. For days=1
-    // this collapses to "[today]" so the historical single-day call
-    // path is unchanged.
+    // --since takes precedence over --days: span every bucket_day
+    // from the resolved start to today, then post-filter on ts_ms.
+    // --days unchanged path: collapses to "[today]" when N=1.
     let today = bucket_day(now_ms());
-    let mut buckets: Vec<Millis> = Vec::with_capacity(days as usize);
-    for i in 0..days as i64 {
-        buckets.push(today - (days as i64 - 1 - i) * DAY_MS);
+    let effective_days: u32 = match since_ms {
+        Some(since) => {
+            let start_bd = bucket_day(since);
+            ((today - start_bd) / DAY_MS).max(0) as u32 + 1
+        }
+        None => days,
+    };
+    let mut buckets: Vec<Millis> = Vec::with_capacity(effective_days as usize);
+    for i in 0..effective_days as i64 {
+        buckets.push(today - (effective_days as i64 - 1 - i) * DAY_MS);
     }
 
     let mut snapshots: Vec<StrategyPnlSnapshot> = Vec::new();
@@ -57,16 +65,31 @@ pub async fn run(
             }
         }
     }
-    if days > 1 {
+    // Precise post-filter on the start boundary when --since is in
+    // effect. Without this a "since 6h" run would still pull in
+    // rows from earlier in the same UTC day.
+    if let Some(since) = since_ms {
+        snapshots.retain(|s| s.ts_ms >= since);
+        say!(
+            "   --since {} → window {}..{} ({} snapshots from {} bucket_day(s))",
+            since,
+            since,
+            now_ms(),
+            snapshots.len(),
+            effective_days,
+        );
+    } else if effective_days > 1 {
         say!(
             "   spanning {} UTC days ({} ms steps): {} → {} (today)",
-            days,
+            effective_days,
             DAY_MS,
             buckets.first().copied().unwrap_or(0),
             today,
         );
         if empty_days > 0 {
-            say!("   {empty_days} of {days} days had no snapshots");
+            say!(
+                "   {empty_days} of {effective_days} days had no snapshots",
+            );
         }
     }
 
@@ -91,7 +114,8 @@ pub async fn run(
 
     if json {
         print_json_payload(JsonOut {
-            days,
+            days: effective_days,
+            since_ms,
             bucket_days: buckets,
             filter: JsonFilter {
                 strategies: strategies_filter.map(|s| s.to_vec()),
@@ -161,6 +185,10 @@ pub async fn run(
 #[derive(Serialize)]
 struct JsonOut {
     days: u32,
+    /// Resolved start when `--since` was passed (ms-since-epoch).
+    /// `None` when --days governed the window.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    since_ms: Option<i64>,
     /// Each bucket_day_ms in the window, oldest first. `len()` ==
     /// `days` even when individual partitions came back empty so a
     /// downstream consumer can spot gaps.
