@@ -1623,6 +1623,34 @@ pub fn render_metrics(s: &MetricsSnapshot) -> String {
                     ));
                 }
             }
+            // Same shape as the 24h family above but the half-
+            // window 12h delta. Pairs with the dashboard's ↑/↓/→
+            // trend arrow — together with agent_pnl_delta_24h_usd
+            // a Prometheus alert can read "is the recent 12h
+            // delta accelerating or recovering vs the 24h
+            // headline?" without re-deriving anything client-side.
+            // Same "no usable baseline → no series" contract;
+            // pnl_delta_12h's tolerance is ±3h to keep the
+            // density-of-snapshots requirement proportional.
+            let mut deltas_12h: Vec<(&str, f64)> = Vec::new();
+            for (strategy, series) in &by_strategy {
+                if let Some(d) = crate::coredb::strategy_pnl::pnl_delta_12h(series) {
+                    deltas_12h.push((strategy, d));
+                }
+            }
+            if !deltas_12h.is_empty() {
+                out.push_str(
+                    "# HELP agent_pnl_delta_12h_usd Change in sum_pnl over the trailing 12h per strategy. Sourced from strategy_pnl_snapshots; baseline is the snapshot closest to (latest_ts - 12h) within \u{00B1}3h. Pairs with agent_pnl_delta_24h_usd: when the 12h delta has the same sign and similar magnitude as the 24h delta, the recent half is the dominant contributor; opposite signs flag a reversal. No series for strategies with no usable baseline.\n",
+                );
+                out.push_str("# TYPE agent_pnl_delta_12h_usd gauge\n");
+                for (strategy, d) in deltas_12h {
+                    out.push_str(&format!(
+                        "agent_pnl_delta_12h_usd{{strategy=\"{}\"}} {}\n",
+                        escape_label(strategy),
+                        d
+                    ));
+                }
+            }
         }
     }
 
@@ -3005,9 +3033,10 @@ mod tests {
                     matches: 4,
                 }],
             }),
-            // Two snapshots ~24h apart for one strategy so the
-            // Δ24h helper produces a real delta in the metrics
-            // body — exercises the "every-family" assertion below.
+            // Three snapshots spanning 24h with a 12h midpoint so
+            // both the Δ24h AND Δ12h helpers produce real deltas
+            // in the metrics body — exercises both delta families
+            // in the "every-family" assertion below.
             strategy_pnl: Some(super::StrategyPnlCacheEntry {
                 fetched_at_ms: 1_700_000_009_000,
                 anchor_bucket_day_ms: 1_700_000_000_000,
@@ -3022,6 +3051,17 @@ mod tests {
                         n_yes: 20,
                         n_no: 20,
                         n_pass: 10,
+                    },
+                    crate::coredb::types::StrategyPnlSnapshot {
+                        bucket_day_ms: 1_700_000_000_000,
+                        ts_ms: 1_700_000_010_000 - 43_200_000,
+                        strategy: "baseline".into(),
+                        n_decisions: 75,
+                        sum_size_usd: 375.0,
+                        sum_pnl: 10.00,
+                        n_yes: 25,
+                        n_no: 25,
+                        n_pass: 25,
                     },
                     crate::coredb::types::StrategyPnlSnapshot {
                         bucket_day_ms: 1_700_000_000_000,
@@ -3072,6 +3112,7 @@ mod tests {
             "agent_pnl_breakdown_yesterday_trades_count",
             "agent_pnl_daily_realized_usd",
             "agent_pnl_daily_trades_count",
+            "agent_pnl_delta_12h_usd",
             "agent_pnl_delta_24h_usd",
             "agent_risk_kill_switch_active",
             "agent_risk_max_order_usd",
@@ -3512,6 +3553,100 @@ mod tests {
         );
     }
 
+    /// 12h delta uses the same baseline-finding logic as the 24h
+    /// version (just halved). Pin the exact label + value, and
+    /// confirm that "no 12h baseline" doesn't emit a series even
+    /// when the 24h baseline IS available — important for the
+    /// dashboard trend-arrow contract (no arrow when 12h has no
+    /// usable history).
+    #[test]
+    fn render_metrics_pnl_delta_12h_emits_when_baseline_within_tolerance() {
+        use std::path::PathBuf;
+        let hour = 3_600_000_i64;
+        let now = 1_700_000_010_000_i64;
+        let snap = super::MetricsSnapshot {
+            now_ms: now,
+            health: super::HealthState {
+                started_at_ms: 1_700_000_000_000,
+                backtest: super::SubtaskHealth::default(),
+                compare: super::SubtaskHealth::default(),
+                settle: super::SubtaskHealth::default(),
+                user_channel_present: false,
+            },
+            btc_age_ms: None,
+            polymarket_age_ms: None,
+            decisions: None,
+            orders: None,
+            pnl_daily: None,
+            pnl_breakdown: None,
+            pnl_breakdown_yesterday: None,
+            pnl_breakdown_window: None,
+            positions: None,
+            ingest_probe_age_ms: None,
+            ingest_restarts_binance: 0,
+            ingest_restarts_polymarket: 0,
+            agreement: None,
+            agreement_window: None,
+            strategy_pnl: Some(super::StrategyPnlCacheEntry {
+                fetched_at_ms: now,
+                anchor_bucket_day_ms: 1_700_000_000_000,
+                rows: vec![
+                    // 12h ago: pnl=8, now: pnl=20 → delta_12h = +12.0
+                    crate::coredb::types::StrategyPnlSnapshot {
+                        bucket_day_ms: 1_700_000_000_000,
+                        ts_ms: now - 12 * hour,
+                        strategy: "baseline".into(),
+                        n_decisions: 0,
+                        sum_size_usd: 0.0,
+                        sum_pnl: 8.0,
+                        n_yes: 0,
+                        n_no: 0,
+                        n_pass: 0,
+                    },
+                    crate::coredb::types::StrategyPnlSnapshot {
+                        bucket_day_ms: 1_700_000_000_000,
+                        ts_ms: now,
+                        strategy: "baseline".into(),
+                        n_decisions: 0,
+                        sum_size_usd: 0.0,
+                        sum_pnl: 20.0,
+                        n_yes: 0,
+                        n_no: 0,
+                        n_pass: 0,
+                    },
+                ],
+            }),
+            risk: super::RiskLimits {
+                max_order_usd: 50.0,
+                kill_switch_path: PathBuf::from("/tmp/__definitely_nonexistent__"),
+            },
+            notes: Vec::new(),
+        };
+        let out = super::render_metrics(&snap);
+        assert!(
+            out.contains("# TYPE agent_pnl_delta_12h_usd gauge\n"),
+            "missing TYPE line for Δ12h gauge:\n{out}",
+        );
+        assert!(
+            out.contains("agent_pnl_delta_12h_usd{strategy=\"baseline\"} 12\n"),
+            "expected baseline delta of 12.0; got:\n{out}",
+        );
+        // Δ24h has no baseline here (only one snapshot before
+        // 'now', and it's at 12h, well outside the ±6h tolerance
+        // for the 24h target) — so no 24h sample line should
+        // appear. Anchor with `{` so the HELP text (which
+        // cross-references the 24h family by name) doesn't
+        // accidentally trip the assertion.
+        assert!(
+            !out.contains("agent_pnl_delta_24h_usd{"),
+            "Δ24h sample should not fire with only a 12h-old baseline:\n{out}",
+        );
+        assert!(
+            !out.contains("# TYPE agent_pnl_delta_24h_usd"),
+            "Δ24h TYPE line should not fire either:\n{out}",
+        );
+    }
+
     /// Empty strategy_pnl cache (e.g. compare-pnl hasn't run yet)
     /// emits no HELP/TYPE preamble and no samples — no point in
     /// an empty family on every scrape.
@@ -3748,6 +3883,7 @@ mod tests {
             "agent_pnl_breakdown_yesterday_trades_count",
             "agent_pnl_daily_realized_usd",
             "agent_pnl_daily_trades_count",
+            "agent_pnl_delta_12h_usd",
             "agent_pnl_delta_24h_usd",
             "agent_risk_kill_switch_active",
             "agent_risk_max_order_usd",
