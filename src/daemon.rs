@@ -963,6 +963,31 @@ pub struct IngestRestartCounters {
     pub polymarket: Arc<RestartTracker>,
 }
 
+/// Denominator floor (USD) below which the
+/// `agent_pnl_delta_12h_24h_ratio` metric skips a strategy.
+/// Default $1 — comfortably above paper-mode tick noise but
+/// below most meaningful trades. Live deployments with larger
+/// position sizing want a wider floor (e.g. $10) so the metric
+/// isn't sensitive to minor execution wobble.
+///
+/// Operator-tunable via `PNL_DELTA_RATIO_DENOM_FLOOR_USD`.
+/// Values ≤ 0 disable the noise gate entirely — every strategy
+/// with both deltas present gets a ratio, even when the
+/// denominator is essentially zero. Not recommended for
+/// alerting (the resulting series flap wildly) but useful when
+/// debugging the metric pipeline.
+pub const PNL_DELTA_RATIO_DENOM_FLOOR_USD_DEFAULT: f64 = 1.0;
+
+/// Read `PNL_DELTA_RATIO_DENOM_FLOOR_USD` env, fall back to the
+/// default. Malformed values fall back too — same forgiving
+/// pattern as the other env knobs in this module.
+pub fn pnl_delta_ratio_denom_floor_usd() -> f64 {
+    std::env::var("PNL_DELTA_RATIO_DENOM_FLOOR_USD")
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(PNL_DELTA_RATIO_DENOM_FLOOR_USD_DEFAULT)
+}
+
 /// Window during which a restart event keeps daemon status
 /// degraded (default). 5 min is long enough that a single
 /// transient flap stays visible to a Prometheus scrape but short
@@ -1683,26 +1708,29 @@ pub fn render_metrics(s: &MetricsSnapshot) -> String {
             //   ratio < 0   : recent 12h opposite direction — the
             //                 "reversal" alert signal
             //
-            // Skip strategies where |delta_24h| < $1 (noise floor).
-            // Ratios at near-zero denominators blow up wildly and
-            // don't carry meaning; "no series" is the honest
+            // Skip strategies where |delta_24h| < floor (default
+            // $1). Ratios at near-zero denominators blow up wildly
+            // and don't carry meaning; "no series" is the honest
             // response. Same skip-the-series contract as the
             // individual delta families above when their baselines
-            // are missing.
-            const RATIO_DENOM_FLOOR_USD: f64 = 1.0;
+            // are missing. Floor is env-tunable via
+            // `PNL_DELTA_RATIO_DENOM_FLOOR_USD` — see
+            // [`pnl_delta_ratio_denom_floor_usd`] for the parse
+            // contract.
+            let ratio_floor = pnl_delta_ratio_denom_floor_usd();
             let by_strategy_24h: std::collections::HashMap<&str, f64> =
                 deltas.iter().copied().collect();
             let mut ratios: Vec<(&str, f64)> = Vec::new();
             for (strategy, d12) in &deltas_12h {
                 if let Some(&d24) = by_strategy_24h.get(strategy) {
-                    if d24.abs() >= RATIO_DENOM_FLOOR_USD {
+                    if d24.abs() >= ratio_floor {
                         ratios.push((strategy, d12 / d24));
                     }
                 }
             }
             if !ratios.is_empty() {
                 out.push_str(
-                    "# HELP agent_pnl_delta_12h_24h_ratio Ratio of trailing 12h sum_pnl delta to trailing 24h sum_pnl delta, per strategy. Negative = recent half reversed the 24h headline. >1 = recent half accelerating; 0<r\u{2264}1 = recent half cooling; <0 = reversal. Skipped when |24h delta| < $1 (denominator noise floor).\n",
+                    "# HELP agent_pnl_delta_12h_24h_ratio Ratio of trailing 12h sum_pnl delta to trailing 24h sum_pnl delta, per strategy. Negative = recent half reversed the 24h headline. >1 = recent half accelerating; 0<r\u{2264}1 = recent half cooling; <0 = reversal. Skipped when |24h delta| < PNL_DELTA_RATIO_DENOM_FLOOR_USD (env, default $1) so near-zero denominators don't flap alerts.\n",
                 );
                 out.push_str("# TYPE agent_pnl_delta_12h_24h_ratio gauge\n");
                 for (strategy, r) in ratios {
@@ -4262,6 +4290,35 @@ mod tests {
             super::STALE_CACHE_HEALTH_MS_DEFAULT,
         );
         std::env::remove_var("STALE_CACHE_HEALTH_S");
+    }
+
+    /// Env parsing for the ratio-floor knob. Unset → default;
+    /// integer / float forms both parse; bogus → default;
+    /// negative is honored (effectively disables the floor —
+    /// every strategy with both deltas present gets a ratio).
+    #[test]
+    fn pnl_delta_ratio_denom_floor_usd_env_parsing() {
+        std::env::remove_var("PNL_DELTA_RATIO_DENOM_FLOOR_USD");
+        assert_eq!(
+            super::pnl_delta_ratio_denom_floor_usd(),
+            super::PNL_DELTA_RATIO_DENOM_FLOOR_USD_DEFAULT,
+        );
+        std::env::set_var("PNL_DELTA_RATIO_DENOM_FLOOR_USD", "10");
+        assert_eq!(super::pnl_delta_ratio_denom_floor_usd(), 10.0);
+        std::env::set_var("PNL_DELTA_RATIO_DENOM_FLOOR_USD", "0.25");
+        assert_eq!(super::pnl_delta_ratio_denom_floor_usd(), 0.25);
+        std::env::set_var("PNL_DELTA_RATIO_DENOM_FLOOR_USD", "0");
+        assert_eq!(super::pnl_delta_ratio_denom_floor_usd(), 0.0);
+        // Negative: legal (≤0 disables the gate). Lets ops debug
+        // the metric end-to-end without recomputing the threshold.
+        std::env::set_var("PNL_DELTA_RATIO_DENOM_FLOOR_USD", "-1");
+        assert_eq!(super::pnl_delta_ratio_denom_floor_usd(), -1.0);
+        std::env::set_var("PNL_DELTA_RATIO_DENOM_FLOOR_USD", "bogus");
+        assert_eq!(
+            super::pnl_delta_ratio_denom_floor_usd(),
+            super::PNL_DELTA_RATIO_DENOM_FLOOR_USD_DEFAULT,
+        );
+        std::env::remove_var("PNL_DELTA_RATIO_DENOM_FLOOR_USD");
     }
 
     /// Same parsing contract for the recent-restart window.
