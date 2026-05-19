@@ -409,6 +409,13 @@ enum Commands {
         /// Seconds between settle-pnl runs.
         #[arg(long, default_value_t = 3600)]
         settle_every: u64,
+        /// Seconds between daily Slack digest posts. Default
+        /// 86400 (24 h). Task skips its first tick so a daemon
+        /// restart doesn't fire a digest at a random wall-clock
+        /// time; the first message lands one full interval after
+        /// startup. Silent no-op when SLACK_WEBHOOK_URL is unset.
+        #[arg(long, default_value_t = 86_400)]
+        digest_every: u64,
         /// Suppress paper-execute on the periodic backtests (decisions
         /// only). Off by default — paper trading is the point.
         #[arg(long)]
@@ -622,6 +629,7 @@ async fn main() -> Result<()> {
             backtest_every,
             compare_every,
             settle_every,
+            digest_every,
             no_execute,
             live,
             llms,
@@ -631,6 +639,7 @@ async fn main() -> Result<()> {
             cfg.backtest_every_secs = backtest_every;
             cfg.compare_every_secs = compare_every;
             cfg.settle_every_secs = settle_every;
+            cfg.digest_every_secs = digest_every;
             cfg.execute = !no_execute;
             cfg.live = live;
             cfg.llm_presets = llms;

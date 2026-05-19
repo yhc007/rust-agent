@@ -51,6 +51,13 @@ pub struct DaemonConfig {
     pub backtest_every_secs: u64,
     pub compare_every_secs: u64,
     pub settle_every_secs: u64,
+    /// Phase 4 daily Slack digest cadence. Default 86400 = once per
+    /// day. The task skips its first tick (`skip_first = true`) so a
+    /// daemon restart doesn't fire an immediate digest at a random
+    /// wall-clock time; the first message lands one full interval
+    /// after startup. Operator-tunable via `--digest-every-secs` and
+    /// env `DIGEST_EVERY_S`.
+    pub digest_every_secs: u64,
     /// When false, the periodic backtests stop at decision insert and
     /// don't execute. Default true.
     pub execute: bool,
@@ -77,6 +84,7 @@ impl DaemonConfig {
             backtest_every_secs: 30 * 60,
             compare_every_secs: 15 * 60,
             settle_every_secs: 60 * 60,
+            digest_every_secs: 24 * 60 * 60,
             execute: true,
             live: false,
             llm_presets: Vec::new(),
@@ -137,6 +145,12 @@ pub struct HealthState {
     pub backtest: SubtaskHealth,
     pub compare: SubtaskHealth,
     pub settle: SubtaskHealth,
+    /// Phase 4: daily digest subtask. Posts a curated summary to
+    /// SLACK_WEBHOOK_URL every DIGEST_EVERY_S seconds (default
+    /// 86400 = once per day). Heartbeat tracked here so /health
+    /// surfaces "digest is silent" before the operator notices
+    /// the daily Slack message stopped arriving.
+    pub digest: SubtaskHealth,
     pub user_channel_present: bool,
 }
 
@@ -153,6 +167,10 @@ struct HealthResponse {
     backtest: SubtaskHealth,
     compare: SubtaskHealth,
     settle: SubtaskHealth,
+    /// Phase 4 daily Slack digest. `last_tick_ms: null` is normal
+    /// for the first 24h of a daemon's life — the digest task
+    /// skips its first tick so it doesn't post at startup time.
+    digest: SubtaskHealth,
     /// True when the user-channel WS listener was spawned at startup.
     /// False is normal for paper-only deployments and doesn't degrade
     /// the overall status.
@@ -222,6 +240,7 @@ enum TaskKind {
     Backtest,
     Compare,
     Settle,
+    Digest,
 }
 
 pub async fn run(cfg: DaemonConfig) -> Result<()> {
@@ -230,6 +249,7 @@ pub async fn run(cfg: DaemonConfig) -> Result<()> {
         backtest_every_secs,
         compare_every_secs,
         settle_every_secs,
+        digest_every_secs,
         execute,
         live,
         llm_presets,
@@ -248,6 +268,7 @@ pub async fn run(cfg: DaemonConfig) -> Result<()> {
     );
     println!("    compare-pnl every = {compare_every_secs}s");
     println!("    settle-pnl every  = {settle_every_secs}s");
+    println!("    digest every      = {digest_every_secs}s (Slack post; skips first tick)");
     if let Some(port) = health_port {
         println!("    health endpoint   = http://0.0.0.0:{port}/health");
     }
@@ -491,6 +512,49 @@ pub async fn run(cfg: DaemonConfig) -> Result<()> {
         },
     ));
 
+    // Phase 4 daily digest. Skips its first tick (every restart
+    // would otherwise spray a digest at a random wall-clock time);
+    // first message arrives one full interval after daemon spawn.
+    // The task body is a no-op when SLACK_WEBHOOK_URL is unset —
+    // a stdout-only digest run with --post=false still completes
+    // successfully and updates /health.digest.last_success_ms, so
+    // an operator gets a heartbeat signal without a configured
+    // sink. With a webhook configured, the curated summary lands
+    // in the channel automatically.
+    let h_digest = tokio::spawn(periodic(
+        "digest",
+        TaskKind::Digest,
+        Duration::from_secs(digest_every_secs),
+        /* skip_first = */ true,
+        shutdown_rx.clone(),
+        health.clone(),
+        {
+            let uri = coredb_uri.clone();
+            move || {
+                let uri = uri.clone();
+                Box::pin(async move {
+                    let plan = backtest::digest::DigestPlan {
+                        // 24h window matches the default daily
+                        // cadence — if the operator widens the
+                        // cadence (e.g. weekly), the window
+                        // should grow too via env. Phase 4 keeps
+                        // it simple; tunable in a follow-up.
+                        days: 1,
+                        since_ms: None,
+                        strategies_filter: None,
+                        top_n: 5,
+                        json: false,
+                        // Only post when a webhook is configured;
+                        // digest::run silently skips if URL unset.
+                        post: true,
+                    };
+                    backtest::digest::run(&uri, plan).await
+                })
+                    as std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>>
+            }
+        },
+    ));
+
     // Optional /health HTTP endpoint. The handler reads `health`
     // (periodic-task heartbeats), plus `btc_repo` / `market_repo`
     // for ingest staleness, so it always reflects the latest state
@@ -578,7 +642,7 @@ pub async fn run(cfg: DaemonConfig) -> Result<()> {
     // logs from each subtask. Ignore JoinError — that just means the
     // task panicked, which we want to log but not promote to the
     // caller's exit code.
-    let _ = tokio::join!(h_binance, h_polymarket, h_backtest, h_compare, h_settle);
+    let _ = tokio::join!(h_binance, h_polymarket, h_backtest, h_compare, h_settle, h_digest);
     if let Some(h) = h_user_channel {
         let _ = h.await;
     }
@@ -1210,7 +1274,8 @@ pub fn compute_health_response(inp: &HealthInputs) -> HealthResponse {
     };
     let periodic_ok = inp.health.backtest.consecutive_errors < UNHEALTHY_AFTER_ERRORS
         && inp.health.compare.consecutive_errors < UNHEALTHY_AFTER_ERRORS
-        && inp.health.settle.consecutive_errors < UNHEALTHY_AFTER_ERRORS;
+        && inp.health.settle.consecutive_errors < UNHEALTHY_AFTER_ERRORS
+        && inp.health.digest.consecutive_errors < UNHEALTHY_AFTER_ERRORS;
     // Cache staleness disabled when threshold == 0 (operator opt-out).
     let cache_ok =
         inp.stale_cache_health_ms <= 0 || !any_cache_stale(&inp.cache_ages, inp.stale_cache_health_ms);
@@ -1246,6 +1311,7 @@ pub fn compute_health_response(inp: &HealthInputs) -> HealthResponse {
         backtest: inp.health.backtest.clone(),
         compare: inp.health.compare.clone(),
         settle: inp.health.settle.clone(),
+        digest: inp.health.digest.clone(),
         user_channel_present: inp.health.user_channel_present,
         ingest_btc_age_ms: inp.btc_age_ms,
         ingest_polymarket_age_ms: inp.polymarket_age_ms,
@@ -1354,6 +1420,7 @@ pub fn render_metrics(s: &MetricsSnapshot) -> String {
         ("backtest", &snap.backtest),
         ("compare", &snap.compare),
         ("settle", &snap.settle),
+        ("digest", &snap.digest),
     ] {
         out.push_str(&format!(
             "agent_subtask_consecutive_errors{{task=\"{label}\"}} {}\n",
@@ -1369,6 +1436,7 @@ pub fn render_metrics(s: &MetricsSnapshot) -> String {
         ("backtest", &snap.backtest),
         ("compare", &snap.compare),
         ("settle", &snap.settle),
+        ("digest", &snap.digest),
     ] {
         if let Some(t) = sub.last_tick_ms {
             let age = (now - t).max(0) / 1000;
@@ -1386,6 +1454,7 @@ pub fn render_metrics(s: &MetricsSnapshot) -> String {
         ("backtest", &snap.backtest),
         ("compare", &snap.compare),
         ("settle", &snap.settle),
+        ("digest", &snap.digest),
     ] {
         if let Some(t) = sub.last_success_ms {
             let age = (now - t).max(0) / 1000;
@@ -2737,6 +2806,7 @@ fn slot_mut(h: &mut HealthState, kind: TaskKind) -> &mut SubtaskHealth {
         TaskKind::Backtest => &mut h.backtest,
         TaskKind::Compare => &mut h.compare,
         TaskKind::Settle => &mut h.settle,
+        TaskKind::Digest => &mut h.digest,
     }
 }
 
@@ -2808,6 +2878,7 @@ mod tests {
                 backtest: super::SubtaskHealth::default(),
                 compare: super::SubtaskHealth::default(),
                 settle: super::SubtaskHealth::default(),
+                digest: super::SubtaskHealth::default(),
                 user_channel_present: false,
             },
             btc_age_ms: Some(500),
@@ -3037,6 +3108,7 @@ mod tests {
                 },
                 compare: super::SubtaskHealth::default(),
                 settle: super::SubtaskHealth::default(),
+                digest: super::SubtaskHealth::default(),
                 user_channel_present: true,
             },
             btc_age_ms: Some(500),
@@ -3254,6 +3326,7 @@ mod tests {
                 backtest: super::SubtaskHealth::default(),
                 compare: super::SubtaskHealth::default(),
                 settle: super::SubtaskHealth::default(),
+                digest: super::SubtaskHealth::default(),
                 user_channel_present: false,
             },
             btc_age_ms: None,
@@ -3330,6 +3403,7 @@ mod tests {
                 backtest: super::SubtaskHealth::default(),
                 compare: super::SubtaskHealth::default(),
                 settle: super::SubtaskHealth::default(),
+                digest: super::SubtaskHealth::default(),
                 user_channel_present: false,
             },
             btc_age_ms: None,
@@ -3450,6 +3524,7 @@ mod tests {
                 backtest: super::SubtaskHealth::default(),
                 compare: super::SubtaskHealth::default(),
                 settle: super::SubtaskHealth::default(),
+                digest: super::SubtaskHealth::default(),
                 user_channel_present: false,
             },
             btc_age_ms: None,
@@ -3513,6 +3588,7 @@ mod tests {
                 backtest: super::SubtaskHealth::default(),
                 compare: super::SubtaskHealth::default(),
                 settle: super::SubtaskHealth::default(),
+                digest: super::SubtaskHealth::default(),
                 user_channel_present: false,
             },
             btc_age_ms: None,
@@ -3565,6 +3641,7 @@ mod tests {
                 backtest: super::SubtaskHealth::default(),
                 compare: super::SubtaskHealth::default(),
                 settle: super::SubtaskHealth::default(),
+                digest: super::SubtaskHealth::default(),
                 user_channel_present: false,
             },
             btc_age_ms: None,
@@ -3665,6 +3742,7 @@ mod tests {
                 backtest: super::SubtaskHealth::default(),
                 compare: super::SubtaskHealth::default(),
                 settle: super::SubtaskHealth::default(),
+                digest: super::SubtaskHealth::default(),
                 user_channel_present: false,
             },
             btc_age_ms: None,
@@ -3758,6 +3836,7 @@ mod tests {
                 backtest: super::SubtaskHealth::default(),
                 compare: super::SubtaskHealth::default(),
                 settle: super::SubtaskHealth::default(),
+                digest: super::SubtaskHealth::default(),
                 user_channel_present: false,
             },
             btc_age_ms: None,
@@ -3868,6 +3947,7 @@ mod tests {
                 backtest: super::SubtaskHealth::default(),
                 compare: super::SubtaskHealth::default(),
                 settle: super::SubtaskHealth::default(),
+                digest: super::SubtaskHealth::default(),
                 user_channel_present: false,
             },
             btc_age_ms: None,
@@ -3916,6 +3996,7 @@ mod tests {
                 backtest: super::SubtaskHealth::default(),
                 compare: super::SubtaskHealth::default(),
                 settle: super::SubtaskHealth::default(),
+                digest: super::SubtaskHealth::default(),
                 user_channel_present: false,
             },
             btc_age_ms: None,
@@ -3969,6 +4050,7 @@ mod tests {
                 backtest: super::SubtaskHealth::default(),
                 compare: super::SubtaskHealth::default(),
                 settle: super::SubtaskHealth::default(),
+                digest: super::SubtaskHealth::default(),
                 user_channel_present: false,
             },
             btc_age_ms: None,
@@ -4013,6 +4095,7 @@ mod tests {
                 backtest: super::SubtaskHealth::default(),
                 compare: super::SubtaskHealth::default(),
                 settle: super::SubtaskHealth::default(),
+                digest: super::SubtaskHealth::default(),
                 user_channel_present: false,
             },
             btc_age_ms: None,
