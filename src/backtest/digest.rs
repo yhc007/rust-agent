@@ -24,6 +24,7 @@ use serde::Serialize;
 use serde_json::json;
 
 use crate::coredb::decisions::DecisionRepo;
+use crate::coredb::pnl_breakdown::PnlBreakdownRepo;
 use crate::coredb::types::{bucket_day, now_ms, Decision, Millis};
 use crate::coredb::CoreDb;
 use crate::notification::{decision_score, NotificationConfig};
@@ -46,6 +47,13 @@ pub struct DigestPlan {
 }
 
 /// Per-strategy aggregate for the summary table / JSON payload.
+///
+/// `realized_pnl_usd` and `n_settled` are joined in from
+/// `pnl_breakdown` (Phase 3 hindsight): the "what actually
+/// happened" view alongside "what was recommended". Both default
+/// to 0 when no rows have been written for this strategy in the
+/// window — settle-pnl hasn't run yet, or the markets haven't
+/// resolved on Polymarket.
 #[derive(Debug, Clone, Serialize)]
 pub struct StrategyAgg {
     pub strategy: String,
@@ -55,6 +63,8 @@ pub struct StrategyAgg {
     pub n_pass: usize,
     pub avg_score: f64,
     pub max_score: f64,
+    pub realized_pnl_usd: f64,
+    pub n_settled: i32,
 }
 
 /// One ranked decision in the top-N list — projects only what the
@@ -92,6 +102,7 @@ pub async fn build_payload(
 ) -> Result<(DigestPayload, String)> {
     let db = CoreDb::connect(coredb_uri).await.context("connect coredb")?;
     let repo = DecisionRepo::new(db.session()).await?;
+    let breakdown_repo = PnlBreakdownRepo::new(db.session()).await?;
 
     let snapshot_ts = now_ms();
     let today = bucket_day(snapshot_ts);
@@ -130,6 +141,26 @@ pub async fn build_payload(
         today - (effective_days as i64 - 1) * DAY_MS
     });
 
+    // Phase 3 hindsight: pull realized PnL across the same window
+    // and aggregate per strategy (across paper + live execs — the
+    // operator wants total "what the bot did" not split by exec).
+    // Failures on individual bucket_day reads degrade gracefully:
+    // the aggregate stays at 0 for that day rather than aborting.
+    let mut realized_per_strategy: std::collections::HashMap<String, (f64, i32)> =
+        std::collections::HashMap::new();
+    for i in 0..effective_days as i64 {
+        let day_bd = today - (effective_days as i64 - 1 - i) * DAY_MS;
+        if let Ok(part) = breakdown_repo.list_day(day_bd).await {
+            for row in part {
+                let entry = realized_per_strategy
+                    .entry(row.strategy.clone())
+                    .or_insert((0.0, 0));
+                entry.0 += row.realized_pnl;
+                entry.1 += row.n_settled;
+            }
+        }
+    }
+
     // Per-strategy aggregate.
     use std::collections::BTreeMap;
     let mut groups: BTreeMap<String, Vec<&Decision>> = BTreeMap::new();
@@ -137,12 +168,12 @@ pub async fn build_payload(
         groups.entry(d.effective_strategy().to_string()).or_default().push(d);
     }
     let mut strategies: Vec<StrategyAgg> = groups
-        .into_iter()
+        .iter()
         .map(|(strategy, ds)| {
             let mut sum_score = 0.0;
             let mut max_score: f64 = 0.0;
             let (mut n_yes, mut n_no, mut n_pass) = (0, 0, 0);
-            for d in &ds {
+            for d in ds {
                 let s = decision_score(d.confidence, d.edge_bps);
                 sum_score += s;
                 if s > max_score {
@@ -156,17 +187,43 @@ pub async fn build_payload(
                 }
             }
             let n = ds.len();
+            let (realized_pnl_usd, n_settled) = realized_per_strategy
+                .get(strategy)
+                .copied()
+                .unwrap_or((0.0, 0));
             StrategyAgg {
-                strategy,
+                strategy: strategy.clone(),
                 n_decisions: n,
                 n_yes,
                 n_no,
                 n_pass,
                 avg_score: if n > 0 { sum_score / n as f64 } else { 0.0 },
                 max_score,
+                realized_pnl_usd,
+                n_settled,
             }
         })
         .collect();
+    // Surface strategies that have only realized data in the window
+    // (settled trades from decisions made earlier). They show 0
+    // decisions for the window but a non-zero realized PnL, which
+    // is still useful operator signal: "this strategy is still
+    // generating returns even though it wasn't active today."
+    for (strategy, (realized_pnl_usd, n_settled)) in &realized_per_strategy {
+        if !groups.contains_key(strategy) {
+            strategies.push(StrategyAgg {
+                strategy: strategy.clone(),
+                n_decisions: 0,
+                n_yes: 0,
+                n_no: 0,
+                n_pass: 0,
+                avg_score: 0.0,
+                max_score: 0.0,
+                realized_pnl_usd: *realized_pnl_usd,
+                n_settled: *n_settled,
+            });
+        }
+    }
     // Sort by avg_score desc so the "best strategy of the window"
     // surfaces first.
     strategies.sort_by(|a, b| b.avg_score.partial_cmp(&a.avg_score).unwrap_or(std::cmp::Ordering::Equal));
@@ -214,16 +271,44 @@ pub async fn build_payload(
 /// fit one Slack notification card without scrolling.
 fn format_slack_body(p: &DigestPayload) -> String {
     let mut out = String::new();
+    let total_realized: f64 = p.strategies.iter().map(|s| s.realized_pnl_usd).sum();
+    let total_settled: i32 = p.strategies.iter().map(|s| s.n_settled).sum();
+    let realized_summary = if total_settled > 0 {
+        format!(" · realized ${:+.2} from {} settled", total_realized, total_settled)
+    } else {
+        // No settled trades in the window — surface that fact so
+        // the operator doesn't wonder where the P&L column is.
+        " · no settled trades in window".to_string()
+    };
     out.push_str(&format!(
-        "📊 *Polymarket BTC digest* — {} decisions across {} day(s)\n",
-        p.n_decisions_total, p.days_spanned,
+        "📊 *Polymarket BTC digest* — {} decisions across {} day(s){}\n",
+        p.n_decisions_total, p.days_spanned, realized_summary,
     ));
     out.push_str("\n*Per-strategy:*\n");
     for s in &p.strategies {
-        out.push_str(&format!(
-            "  `{}` — {} dec (Y{} N{} P{}) · avg score {:.2} · max {:.2}\n",
-            s.strategy, s.n_decisions, s.n_yes, s.n_no, s.n_pass, s.avg_score, s.max_score,
-        ));
+        // Realized P&L column only renders when there are settled
+        // trades for this strategy — keeps lines short for
+        // strategies that haven't had any markets resolve yet.
+        let realized_part = if s.n_settled > 0 {
+            format!(" · realized ${:+.2} ({} settled)", s.realized_pnl_usd, s.n_settled)
+        } else {
+            String::new()
+        };
+        // Strategies that only have realized data (no decisions in
+        // window) deserve a slightly different shape — no "0 dec"
+        // gymnastics, just the realized number.
+        if s.n_decisions == 0 && s.n_settled > 0 {
+            out.push_str(&format!(
+                "  `{}` — no new decisions in window{}\n",
+                s.strategy, realized_part,
+            ));
+        } else {
+            out.push_str(&format!(
+                "  `{}` — {} dec (Y{} N{} P{}) · avg score {:.2} · max {:.2}{}\n",
+                s.strategy, s.n_decisions, s.n_yes, s.n_no, s.n_pass,
+                s.avg_score, s.max_score, realized_part,
+            ));
+        }
     }
     if !p.top.is_empty() {
         out.push_str(&format!("\n*Top {} recommendations:*\n", p.top.len()));
@@ -346,6 +431,17 @@ mod tests {
         assert!(s_neg.abs() < 1e-9);
     }
 
+    fn agg(strategy: &str, decisions: usize, score: f64, realized: f64, settled: i32) -> StrategyAgg {
+        StrategyAgg {
+            strategy: strategy.into(),
+            n_decisions: decisions,
+            n_yes: 0, n_no: 0, n_pass: 0,
+            avg_score: score, max_score: score,
+            realized_pnl_usd: realized,
+            n_settled: settled,
+        }
+    }
+
     #[test]
     fn slack_body_renders_strategies_and_top() {
         let payload = DigestPayload {
@@ -355,16 +451,8 @@ mod tests {
             days_spanned: 1,
             n_decisions_total: 2,
             strategies: vec![
-                StrategyAgg {
-                    strategy: "baseline".into(),
-                    n_decisions: 1, n_yes: 1, n_no: 0, n_pass: 0,
-                    avg_score: 0.5, max_score: 0.5,
-                },
-                StrategyAgg {
-                    strategy: "llm".into(),
-                    n_decisions: 1, n_yes: 0, n_no: 1, n_pass: 0,
-                    avg_score: 0.85, max_score: 0.85,
-                },
+                agg("baseline", 1, 0.5, 0.0, 0),
+                agg("llm", 1, 0.85, 0.0, 0),
             ],
             top: vec![
                 RankedDecision {
@@ -393,18 +481,16 @@ mod tests {
 
     #[test]
     fn slack_body_truncates_long_reasoning() {
-        let mut top = vec![RankedDecision {
-            score: 0.9, strategy: "x".into(),
-            market_slug: "m".into(), side: "YES".into(),
-            size_usd: 10.0, confidence: 0.9, edge_bps: 5000,
-            entry_price: 0.5, reasoning: "x".repeat(500), ts_ms: 0,
-        }];
-        let _ = decision_score(0.0, 0); // touch reference so it stays in scope
         let payload = DigestPayload {
             generated_at_ms: 0, window_start_ms: 0, window_end_ms: 0,
             days_spanned: 1, n_decisions_total: 1,
             strategies: vec![],
-            top: std::mem::take(&mut top),
+            top: vec![RankedDecision {
+                score: 0.9, strategy: "x".into(),
+                market_slug: "m".into(), side: "YES".into(),
+                size_usd: 10.0, confidence: 0.9, edge_bps: 5000,
+                entry_price: 0.5, reasoning: "x".repeat(500), ts_ms: 0,
+            }],
         };
         let body = format_slack_body(&payload);
         assert!(body.contains("…"), "expected truncation ellipsis");
@@ -417,11 +503,6 @@ mod tests {
 
     #[test]
     fn pass_decisions_excluded_from_top() {
-        // build_payload uses an in-memory Vec but its CoreDB read is
-        // mocked-out via a helper would be ideal; for now we just
-        // assert the filter intent in the source — see ranked.iter()
-        // .filter(|d| d.side != "PASS"). Build a synthetic mix and
-        // verify the slack_body wouldn't list any PASS lines.
         let payload = DigestPayload {
             generated_at_ms: 0, window_start_ms: 0, window_end_ms: 0,
             days_spanned: 1, n_decisions_total: 3,
@@ -438,7 +519,69 @@ mod tests {
         let body = format_slack_body(&payload);
         assert!(body.contains("active"));
         assert!(!body.contains("PASS"), "PASS lines should never appear in top");
-        // Suppress unused warning on the helper.
         let _ = d("baseline", "PASS", 0.0, 0, "x");
+    }
+
+    /// Phase 3: realized P&L row gets rendered in the per-strategy
+    /// table when n_settled > 0. Negative P&L formats with the
+    /// leading sign so it's instantly distinguishable from a win.
+    #[test]
+    fn slack_body_renders_realized_pnl_when_settled() {
+        let payload = DigestPayload {
+            generated_at_ms: 0, window_start_ms: 0, window_end_ms: 0,
+            days_spanned: 1, n_decisions_total: 2,
+            strategies: vec![
+                agg("baseline", 1, 0.5, 12.34, 3),
+                agg("llm", 1, 0.85, -2.50, 1),
+            ],
+            top: vec![],
+        };
+        let body = format_slack_body(&payload);
+        assert!(body.contains("realized $+12.34 (3 settled)"));
+        assert!(body.contains("realized $-2.50 (1 settled)"));
+        // Header should aggregate total + count.
+        assert!(body.contains("realized $+9.84 from 4 settled"));
+    }
+
+    /// When no markets have resolved yet, the realized columns are
+    /// suppressed entirely (no zero-noise lines) and the header
+    /// surfaces a "no settled trades" hint so the operator knows
+    /// the P&L data is absent by design, not by bug.
+    #[test]
+    fn slack_body_suppresses_realized_pnl_when_no_settled() {
+        let payload = DigestPayload {
+            generated_at_ms: 0, window_start_ms: 0, window_end_ms: 0,
+            days_spanned: 1, n_decisions_total: 1,
+            strategies: vec![agg("baseline", 1, 0.5, 0.0, 0)],
+            top: vec![],
+        };
+        let body = format_slack_body(&payload);
+        assert!(body.contains("no settled trades in window"));
+        // Should NOT show "$+0.00 (0 settled)" noise on the per-strategy line.
+        assert!(!body.contains("(0 settled)"));
+    }
+
+    /// Phase 3: a strategy that has realized data but no new
+    /// decisions in the window (decisions from earlier days that
+    /// just settled) still surfaces, with a distinct shape that
+    /// doesn't pretend it had recent activity.
+    #[test]
+    fn slack_body_renders_realized_only_strategies() {
+        let payload = DigestPayload {
+            generated_at_ms: 0, window_start_ms: 0, window_end_ms: 0,
+            days_spanned: 1, n_decisions_total: 0,
+            strategies: vec![StrategyAgg {
+                strategy: "deepseek".into(),
+                n_decisions: 0, n_yes: 0, n_no: 0, n_pass: 0,
+                avg_score: 0.0, max_score: 0.0,
+                realized_pnl_usd: 8.40, n_settled: 2,
+            }],
+            top: vec![],
+        };
+        let body = format_slack_body(&payload);
+        assert!(body.contains("no new decisions in window"));
+        assert!(body.contains("realized $+8.40"));
+        // Sanity: no garbled per-strategy line like "0 dec (Y0 N0 P0)".
+        assert!(!body.contains("0 dec (Y0"));
     }
 }
