@@ -181,6 +181,37 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Phase 2 curation — rank the chosen window's decisions by
+    /// score (confidence × saturated edge), print top N + per-
+    /// strategy aggregate. Replaces the per-decision Slack firehose
+    /// with one curated summary suitable for daily cron.
+    Digest {
+        #[arg(long, env = "COREDB_URI", default_value = "127.0.0.1:9042")]
+        coredb_uri: String,
+        /// Restrict to a comma-separated subset of strategy labels.
+        #[arg(long, value_delimiter = ',')]
+        strategies: Vec<String>,
+        /// Number of UTC days back from "today" to include.
+        #[arg(long, default_value_t = 1, conflicts_with = "since")]
+        days: u32,
+        /// Anchor the window at a precise start (RFC3339 or N{s,m,h,d}).
+        /// Same parser as compare-pnl --since.
+        #[arg(long)]
+        since: Option<String>,
+        /// How many top-scored decisions to render. Top-N is
+        /// "across all strategies after PASS exclusion."
+        #[arg(long, default_value_t = 5)]
+        top: usize,
+        /// Emit one JSON object to stdout instead of the human-
+        /// readable summary.
+        #[arg(long)]
+        json: bool,
+        /// Also POST the curated summary to SLACK_WEBHOOK_URL.
+        /// Useful for daily cron: `* 0 * * * rust-agent digest --since 24h --post`.
+        /// Silent no-op when SLACK_WEBHOOK_URL is unset.
+        #[arg(long)]
+        post: bool,
+    },
     /// Dump pairwise strategy agreement rates from CoreDB as a time
     /// series. Pairs with `pnl-history` — same --days / --strategies
     /// knobs, populated by the same cron-driven `compare-pnl` writes.
@@ -473,6 +504,25 @@ async fn main() -> Result<()> {
                 None => None,
             };
             backtest::compare::run(&coredb_uri, filter.as_deref(), days, since_ms, json).await?;
+        }
+        Some(Commands::Digest { coredb_uri, strategies, days, since, top, json, post }) => {
+            let strategies_filter = if strategies.is_empty() { None } else { Some(strategies) };
+            let since_ms = match since {
+                Some(s) => Some(
+                    backtest::compare::parse_since(&s, crate::coredb::types::now_ms())
+                        .map_err(|e| anyhow::anyhow!("parse --since: {e}"))?,
+                ),
+                None => None,
+            };
+            let plan = backtest::digest::DigestPlan {
+                days,
+                since_ms,
+                strategies_filter,
+                top_n: top,
+                json,
+                post,
+            };
+            backtest::digest::run(&coredb_uri, plan).await?;
         }
         Some(Commands::PnlHistory { coredb_uri, strategies, days, since, json }) => {
             let filter = if strategies.is_empty() { None } else { Some(strategies) };

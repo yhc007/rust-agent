@@ -12,6 +12,7 @@
 pub mod agreement_history;
 pub mod baseline;
 pub mod compare;
+pub mod digest;
 pub mod history;
 pub mod llm;
 pub mod pnl_breakdown_history;

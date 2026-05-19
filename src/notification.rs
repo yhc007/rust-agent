@@ -114,6 +114,24 @@ impl NotificationConfig {
     }
 }
 
+/// Compute a normalized 0..1 score for ranking decisions. Pure
+/// function combining the two signals each strategy already emits:
+/// `confidence` (raw 0..1) and `|edge_bps|` saturated at 5000 bps
+/// (50 %) — anything beyond that is so large that further differences
+/// don't change the ranking decision. Phase 2's `digest` subcommand
+/// sorts by this score; the per-decision Slack notification shows it
+/// inline so an operator scrolling the channel can spot the
+/// strongest signal at a glance.
+///
+/// The score is intentionally agnostic to side / strategy / market —
+/// it ranks by "how notable is this opinion", not by expected dollar
+/// return. PnL realization comes from later phases (digest v2 will
+/// join with `pnl_daily` for hindsight calibration).
+pub fn decision_score(confidence: f64, edge_bps: i32) -> f64 {
+    let edge_norm = (edge_bps.abs() as f64).min(5000.0) / 5000.0;
+    (confidence.max(0.0).min(1.0)) * edge_norm
+}
+
 /// Format the Slack message body for one decision. Pure function so
 /// the formatting can be tested without an HTTP mock.
 ///
@@ -135,13 +153,15 @@ pub fn format_message(decision: &Decision, outcome_label: &str) -> String {
         let truncated: String = reasoning.chars().take(237).collect();
         reasoning = format!("{truncated}…");
     }
+    let score = decision_score(decision.confidence, decision.edge_bps);
     format!(
-        "*{}* @ `{}`\n{}  ${:.2}  @{:.4} entry\nconf {:.2} · edge {:+} bps · {}\n_{}_",
+        "*{}* @ `{}`\n{}  ${:.2}  @{:.4} entry\nscore {:.2} · conf {:.2} · edge {:+} bps · {}\n_{}_",
         decision.strategy,
         decision.market_slug,
         arrow,
         decision.size_usd,
         decision.entry_price,
+        score,
         decision.confidence,
         decision.edge_bps,
         outcome_label,
