@@ -77,6 +77,7 @@ pub async fn run(coredb_uri: &str, plan: BacktestPlan, execute: bool, live: bool
             pos_repo: PositionRepo::new(db.session()).await?,
             exec,
             limits: RiskLimits::default(),
+            notif: crate::notification::NotificationConfig::from_env(),
         })
     } else {
         if live {
@@ -260,15 +261,38 @@ pub async fn run(coredb_uri: &str, plan: BacktestPlan, execute: bool, live: bool
             // execution is more useful than no execution. In --both mode
             // this runs once per strategy per market.
             if let Some(ctx) = exec_ctx.as_ref() {
-                match route_decision(
+                let routed = route_decision(
                     decision,
                     ctx.exec.as_ref(),
                     &ctx.limits,
                     &ctx.order_repo,
                     &ctx.pos_repo,
                 )
-                .await
-                {
+                .await;
+
+                // Build a short outcome label for the notification
+                // (and for the match below). Done once here so the
+                // Slack message reflects the same status the
+                // `exec_stats` counters get bumped on.
+                let outcome_label: String = match &routed {
+                    Ok(Outcome::Filled(_)) => {
+                        if live { "live-filled".to_string() } else { "paper-filled".to_string() }
+                    }
+                    Ok(Outcome::Skipped(reason)) => format!("skipped: {reason}"),
+                    Ok(Outcome::Blocked(reason)) => format!("risk-blocked: {reason}"),
+                    Ok(Outcome::ExecError(reason)) => format!("exec error: {reason}"),
+                    Err(e) => format!("router error: {e}"),
+                };
+
+                // Phase 1 hook: surface high-signal decisions to
+                // Slack. Best-effort — `notify_decision` swallows
+                // every webhook error so a Slack outage / 4xx
+                // never breaks the trading loop. When
+                // SLACK_WEBHOOK_URL is unset the call exits before
+                // any HTTP work.
+                crate::notification::notify_decision(decision, &outcome_label, &ctx.notif).await;
+
+                match routed {
                     Ok(Outcome::Filled(_)) => exec_stats.filled += 1,
                     Ok(Outcome::Skipped(_)) => exec_stats.skipped += 1,
                     Ok(Outcome::Blocked(reason)) => {
@@ -321,6 +345,11 @@ struct ExecCtx {
     pos_repo: PositionRepo,
     exec: Box<dyn Executor>,
     limits: RiskLimits,
+    /// Phase 1 observability: optional Slack webhook. Resolved once
+    /// from env at backtest start so the inner loop doesn't re-read
+    /// env per decision. When `SLACK_WEBHOOK_URL` is unset, every
+    /// notify call short-circuits — no HTTP, no overhead.
+    notif: crate::notification::NotificationConfig,
 }
 
 #[derive(Default)]

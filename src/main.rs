@@ -17,6 +17,7 @@ mod execution;
 mod risk;
 mod tools;
 mod memory;
+mod notification;
 mod tui;
 mod web;
 

@@ -13,6 +13,7 @@ pub mod execution;
 pub mod risk;
 pub mod tools;
 pub mod memory;
+pub mod notification;
 pub mod tui;
 pub mod web;
 
