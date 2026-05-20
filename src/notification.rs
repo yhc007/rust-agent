@@ -49,6 +49,13 @@ pub struct NotificationConfig {
     /// Include PASS decisions. Off by default — PASS is not
     /// actionable and would drown the channel in non-bets.
     pub include_pass: bool,
+    /// When false, drop notifications whose outcome label
+    /// indicates paper execution (e.g. "paper-filled"). Useful
+    /// when the bot runs paper trading 24/7 but the operator only
+    /// wants to be paged when real money moves. Default true
+    /// (notify on paper too — preserves Phase 1 behavior). Set
+    /// `NOTIFY_PAPER=0` to suppress; `NOTIFY_PAPER=1` to include.
+    pub notify_paper: bool,
 }
 
 impl Default for NotificationConfig {
@@ -58,6 +65,7 @@ impl Default for NotificationConfig {
             min_confidence: 0.7,
             min_edge_bps: 500,
             include_pass: false,
+            notify_paper: true,
         }
     }
 }
@@ -82,11 +90,20 @@ impl NotificationConfig {
             .ok()
             .map(|s| matches!(s.trim(), "1" | "true" | "yes" | "on"))
             .unwrap_or(false);
+        // notify_paper defaults TRUE so existing deployments keep
+        // their per-paper-decision pings (Phase 1 behavior). Set
+        // NOTIFY_PAPER=0/false/no/off to silence paper outcomes
+        // while still notifying on live trades.
+        let notify_paper = std::env::var("NOTIFY_PAPER")
+            .ok()
+            .map(|s| !matches!(s.trim(), "0" | "false" | "no" | "off"))
+            .unwrap_or(true);
         Self {
             webhook_url,
             min_confidence,
             min_edge_bps,
             include_pass,
+            notify_paper,
         }
     }
 
@@ -182,6 +199,16 @@ pub async fn notify_decision(
     if !cfg.passes_filter(decision) {
         return;
     }
+    // Phase 1.1: paper-outcome suppression. When NOTIFY_PAPER=0
+    // an operator running paper trading 24/7 stops being paged
+    // for non-actionable simulated trades but still hears about
+    // real money moves (live-filled / live-blocked / etc.). The
+    // label prefix "paper-" is set by the caller (currently
+    // backtest::run::run); keep that contract in sync with this
+    // check if a new executor introduces another prefix.
+    if !cfg.notify_paper && outcome_label.starts_with("paper-") {
+        return;
+    }
     let payload = json!({ "text": format_message(decision, outcome_label) });
     let client = match reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(3))
@@ -222,6 +249,28 @@ mod tests {
         assert_eq!(c.min_confidence, 0.7);
         assert_eq!(c.min_edge_bps, 500);
         assert!(!c.include_pass);
+        // Default preserves Phase 1 behavior — notify on paper too.
+        assert!(c.notify_paper);
+    }
+
+    #[test]
+    fn from_env_reads_notify_paper_off() {
+        for off in ["0", "false", "no", "off"] {
+            std::env::set_var("NOTIFY_PAPER", off);
+            let c = NotificationConfig::from_env();
+            assert!(!c.notify_paper, "NOTIFY_PAPER={off} should disable paper notifications");
+        }
+        std::env::remove_var("NOTIFY_PAPER");
+    }
+
+    #[test]
+    fn from_env_reads_notify_paper_on() {
+        for on in ["1", "true", "yes", "on", ""] {
+            std::env::set_var("NOTIFY_PAPER", on);
+            let c = NotificationConfig::from_env();
+            assert!(c.notify_paper, "NOTIFY_PAPER={on:?} should leave paper notifications on");
+        }
+        std::env::remove_var("NOTIFY_PAPER");
     }
 
     #[test]
