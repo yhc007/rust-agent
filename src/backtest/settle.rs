@@ -26,10 +26,49 @@ use crate::coredb::decisions::DecisionRepo;
 use crate::coredb::orders::OrderRepo;
 use crate::coredb::pnl::PnlRepo;
 use crate::coredb::pnl_breakdown::PnlBreakdownRepo;
-use crate::coredb::types::{bucket_day, now_ms, PnlBreakdown, PnlDaily};
+use crate::coredb::types::{bucket_day, now_ms, Millis, PnlBreakdown, PnlDaily};
 use crate::coredb::CoreDb;
 
+const DAY_MS: Millis = 86_400_000;
+
+/// Multi-day settle plan. Phase 5 added the window dimension so
+/// paper positions written on past days (whose markets have since
+/// resolved on Polymarket) actually get settled instead of being
+/// permanently stranded in the "today-only" bucket the original
+/// flow couldn't reach.
+///
+/// `days = 1` + `since_ms = None` keeps the historical default
+/// (today only), so existing callers — including the daemon's
+/// periodic settle tick — are byte-for-byte compatible.
+pub struct SettlePlan {
+    pub days: u32,
+    pub since_ms: Option<i64>,
+    pub json: bool,
+}
+
+impl SettlePlan {
+    pub fn today_only(json: bool) -> Self {
+        Self { days: 1, since_ms: None, json }
+    }
+}
+
+/// Backwards-compatible single-day entry point. Existing callers
+/// (the daemon, the standalone `rust-agent settle-pnl` without
+/// window flags) keep working unchanged.
 pub async fn run(coredb_uri: &str, json: bool) -> Result<()> {
+    run_with_plan(coredb_uri, SettlePlan::today_only(json)).await
+}
+
+/// Window-aware settle pass. Iterates every bucket_day in the
+/// resolved window, settles each day's orders independently
+/// (so pnl_daily / pnl_breakdown stay correctly keyed by their
+/// own day_ms), and prints both a per-day and a grand-total
+/// summary. The resolved-markets feed from Polymarket Gamma is
+/// fetched once and shared across days — Gamma returns every
+/// recently-closed market regardless of which day it resolved on,
+/// so per-day re-fetch would be redundant.
+pub async fn run_with_plan(coredb_uri: &str, plan: SettlePlan) -> Result<()> {
+    let SettlePlan { days, since_ms, json } = plan;
     macro_rules! say {
         ($($t:tt)*) => { if !json { println!($($t)*); } };
     }
@@ -40,39 +79,25 @@ pub async fn run(coredb_uri: &str, json: bool) -> Result<()> {
     let pnl_repo = PnlRepo::new(db.session()).await?;
     let breakdown_repo = PnlBreakdownRepo::new(db.session()).await?;
 
-    let bd = bucket_day(now_ms());
-    let orders = order_repo.list_day(bd).await.context("read orders")?;
-    say!("   {} orders for bucket_day = {} (UTC ms)", orders.len(), bd);
-    if orders.is_empty() {
-        if json {
-            // Stable shape even when there's nothing to settle —
-            // mirrors the empty-input behavior of compare-pnl --json.
-            print_json_payload(JsonOut {
-                bucket_day_ms: bd,
-                n_orders: 0,
-                n_settled: 0,
-                n_unresolved: 0,
-                realized_pnl_total: 0.0,
-                strategies: Vec::new(),
-                pnl_daily_written: false,
-            });
-            return Ok(());
+    // --since takes precedence; otherwise --days. Same shape as
+    // compare-pnl / digest so an operator fluent in one is fluent
+    // in all three.
+    let today = bucket_day(now_ms());
+    let effective_days: u32 = match since_ms {
+        Some(since) => {
+            let start_bd = bucket_day(since);
+            ((today - start_bd) / DAY_MS).max(0) as u32 + 1
         }
-        println!(
-            "   (no orders to settle — run `backtest --execute` first to populate.)"
-        );
-        return Ok(());
+        None => days.max(1),
+    };
+    let mut bucket_days: Vec<Millis> = Vec::with_capacity(effective_days as usize);
+    for i in 0..effective_days as i64 {
+        bucket_days.push(today - (effective_days as i64 - 1 - i) * DAY_MS);
     }
-
-    // Map each Order back to its Decision via decision_id so we know which
-    // strategy emitted it. Pre-schema or tool-driven decisions land in
-    // "other" — separate from baseline/llm — so they don't silently
-    // inflate one bucket.
-    let decisions = dec_repo.list_day(bd).await.context("read decisions")?;
-    let strategy_of: HashMap<Uuid, String> = decisions
-        .iter()
-        .map(|d| (d.decision_id, d.effective_strategy().to_string()))
-        .collect();
+    say!(
+        "   window: {} bucket_day(s), {} → {} (today)",
+        effective_days, bucket_days[0], today,
+    );
 
     let http = Client::builder()
         .timeout(Duration::from_secs(15))
@@ -82,22 +107,198 @@ pub async fn run(coredb_uri: &str, json: bool) -> Result<()> {
     let resolved = fetch_resolved_markets(&http).await?;
     say!("   {} resolved markets visible", resolved.len());
 
+    // Grand totals across the entire window. Per-day numbers stay
+    // in `day_summaries` for the operator-facing breakdown.
+    let mut grand_realized = 0.0f64;
+    let mut grand_settled = 0i32;
+    let mut grand_orders = 0usize;
+    let mut grand_unresolved = 0u32;
+    let mut grand_by_strategy: HashMap<String, StrategyTotal> = HashMap::new();
+    let mut day_summaries: Vec<DaySummary> = Vec::with_capacity(effective_days as usize);
+
+    for &bd in &bucket_days {
+        let orders = match order_repo.list_day(bd).await {
+            Ok(o) => o,
+            Err(e) => {
+                eprintln!("  ! settle-pnl: orders.list_day({bd}) failed: {e}");
+                continue;
+            }
+        };
+        let decisions = match dec_repo.list_day(bd).await {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("  ! settle-pnl: decisions.list_day({bd}) failed: {e}");
+                continue;
+            }
+        };
+        let strategy_of: HashMap<Uuid, String> = decisions
+            .iter()
+            .map(|d| (d.decision_id, d.effective_strategy().to_string()))
+            .collect();
+
+        let day = settle_one_day(bd, &orders, &strategy_of, &resolved);
+
+        // Per-strategy roll-up into the grand total (across days).
+        for (strategy, t) in &day.by_strategy {
+            let agg = grand_by_strategy.entry(strategy.clone()).or_default();
+            agg.n_orders += t.n_orders;
+            agg.n_settled += t.n_settled;
+            agg.n_unresolved += t.n_unresolved;
+            agg.realized_pnl += t.realized_pnl;
+        }
+        grand_realized += day.realized_total;
+        grand_settled += day.n_settled;
+        grand_orders += day.n_orders;
+        grand_unresolved += day.n_unresolved;
+
+        // Write pnl_daily + pnl_breakdown rows for this day if
+        // anything settled. We persist per-day even in a multi-day
+        // run so the daily-resolution time series stays correct;
+        // pnl_breakdown is keyed by (bucket_day, strategy, exec)
+        // and pnl_daily by day_ms — neither expects aggregation
+        // across days.
+        if day.n_settled > 0 {
+            let row = PnlDaily {
+                day_ms: bd,
+                realized: day.realized_total,
+                unrealized: 0.0,
+                n_trades: day.n_settled,
+                llm_cost_usd: 0.0,
+            };
+            if let Err(e) = pnl_repo.upsert(&row).await {
+                eprintln!("  ! pnl_daily.upsert({bd}) failed: {e}");
+            }
+            let mut breakdown_keys: Vec<&(String, String)> =
+                day.by_strategy_exec.keys().collect();
+            breakdown_keys.sort();
+            for key in breakdown_keys {
+                let t = &day.by_strategy_exec[key];
+                if t.n_settled == 0 {
+                    continue;
+                }
+                let b = PnlBreakdown {
+                    bucket_day_ms: bd,
+                    strategy: key.0.clone(),
+                    exec: key.1.clone(),
+                    realized_pnl: t.realized_pnl,
+                    n_settled: t.n_settled as i32,
+                };
+                if let Err(e) = breakdown_repo.upsert(&b).await {
+                    eprintln!(
+                        "  ! pnl_breakdown upsert failed for ({}, {}, {}): {e}",
+                        bd, b.strategy, b.exec,
+                    );
+                }
+            }
+        }
+        day_summaries.push(day);
+    }
+
+    // Print per-day + grand-total summary.
+    if !json {
+        for ds in &day_summaries {
+            println!("\n⚖️  Realized PnL — bucket_day = {} (UTC ms)", ds.bucket_day_ms);
+            println!(
+                "   {:<10} {:>10} {:>10} {:>11} {:>12}",
+                "strategy", "n_orders", "settled", "unresolved", "realized $"
+            );
+            let mut keys: Vec<&String> = ds.by_strategy.keys().collect();
+            keys.sort();
+            for k in &keys {
+                let t = &ds.by_strategy[*k];
+                println!(
+                    "   {:<10} {:>10} {:>10} {:>11} {:>12}",
+                    k, t.n_orders, t.n_settled, t.n_unresolved,
+                    format!("${:+.2}", t.realized_pnl),
+                );
+            }
+            println!(
+                "   {:<10} {:>10} {:>10} {:>11} {:>12}",
+                "TOTAL", ds.n_orders, ds.n_settled, ds.n_unresolved,
+                format!("${:+.2}", ds.realized_total),
+            );
+        }
+        if effective_days > 1 {
+            println!("\n📈 Window total ({} days):", effective_days);
+            println!(
+                "   {:<10} {:>10} {:>10} {:>11} {:>12}",
+                "strategy", "n_orders", "settled", "unresolved", "realized $"
+            );
+            let mut gkeys: Vec<&String> = grand_by_strategy.keys().collect();
+            gkeys.sort();
+            for k in &gkeys {
+                let t = &grand_by_strategy[*k];
+                println!(
+                    "   {:<10} {:>10} {:>10} {:>11} {:>12}",
+                    k, t.n_orders, t.n_settled, t.n_unresolved,
+                    format!("${:+.2}", t.realized_pnl),
+                );
+            }
+            println!(
+                "   {:<10} {:>10} {:>10} {:>11} {:>12}",
+                "TOTAL", grand_orders, grand_settled, grand_unresolved,
+                format!("${:+.2}", grand_realized),
+            );
+        }
+    }
+
+    if grand_settled == 0 {
+        if json {
+            print_json_payload(build_json_payload_multi(
+                &bucket_days, &day_summaries,
+                grand_orders, grand_settled, grand_unresolved, grand_realized,
+                &grand_by_strategy, /* pnl_daily_written = */ false,
+            ));
+            return Ok(());
+        }
+        println!(
+            "\n   (no orders settled in window — markets still open or none decisive yet.)"
+        );
+        return Ok(());
+    }
+
+    if json {
+        print_json_payload(build_json_payload_multi(
+            &bucket_days, &day_summaries,
+            grand_orders, grand_settled, grand_unresolved, grand_realized,
+            &grand_by_strategy, /* pnl_daily_written = */ true,
+        ));
+    }
+    Ok(())
+}
+
+/// Per-day settlement result. Used to keep multi-day aggregation
+/// readable + to drive the per-day section of the operator output.
+struct DaySummary {
+    bucket_day_ms: i64,
+    n_orders: usize,
+    n_settled: i32,
+    n_unresolved: u32,
+    realized_total: f64,
+    by_strategy: HashMap<String, StrategyTotal>,
+    by_strategy_exec: HashMap<(String, String), StrategyTotal>,
+}
+
+/// Pure settlement function: given one day's orders + the resolved-
+/// markets map, produce the per-strategy + per-(strategy, exec)
+/// roll-up. No I/O — the caller writes pnl_daily / pnl_breakdown.
+fn settle_one_day(
+    bucket_day_ms: i64,
+    orders: &[crate::coredb::types::Order],
+    strategy_of: &HashMap<Uuid, String>,
+    resolved: &HashMap<String, bool>,
+) -> DaySummary {
     let mut by_strategy: HashMap<String, StrategyTotal> = HashMap::new();
-    // Parallel tally with the exec dimension added. Used to write
-    // pnl_breakdown rows so Grafana can panel-split paper vs live
-    // PnL by strategy without reaching back into the orders table.
     let mut by_strategy_exec: HashMap<(String, String), StrategyTotal> = HashMap::new();
     let mut realized_total = 0.0;
     let mut n_settled = 0i32;
     let mut n_unresolved = 0u32;
-    for o in &orders {
+
+    for o in orders {
         let strategy = strategy_of
             .get(&o.decision_id)
             .cloned()
             .unwrap_or_else(|| "other".to_string());
-        // Same paper/live distinguishing rule as the
-        // agent_orders_today metric — PaperExec writes
-        // `order_id: paper-{uuid}`; everything else is live.
         let exec = if o.order_id.starts_with("paper-") {
             "paper".to_string()
         } else {
@@ -131,123 +332,15 @@ pub async fn run(coredb_uri: &str, json: bool) -> Result<()> {
         }
     }
 
-    let mut keys: Vec<_> = by_strategy.keys().cloned().collect();
-    keys.sort();
-    if !json {
-        println!("\n⚖️  Realized PnL — bucket_day = {bd} (UTC ms)");
-        println!(
-            "   {:<10} {:>10} {:>10} {:>11} {:>12}",
-            "strategy", "n_orders", "settled", "unresolved", "realized $"
-        );
-        for k in &keys {
-            let t = &by_strategy[k];
-            println!(
-                "   {:<10} {:>10} {:>10} {:>11} {:>12}",
-                k,
-                t.n_orders,
-                t.n_settled,
-                t.n_unresolved,
-                format!("${:+.2}", t.realized_pnl)
-            );
-        }
-        println!(
-            "   {:<10} {:>10} {:>10} {:>11} {:>12}",
-            "TOTAL",
-            orders.len(),
-            n_settled,
-            n_unresolved,
-            format!("${:+.2}", realized_total)
-        );
+    DaySummary {
+        bucket_day_ms,
+        n_orders: orders.len(),
+        n_settled,
+        n_unresolved,
+        realized_total,
+        by_strategy,
+        by_strategy_exec,
     }
-
-    if n_settled == 0 {
-        if json {
-            // Emit the payload even with zero settled rows so the
-            // operator's `jq` chain doesn't have to special-case
-            // "markets still open" — `pnl_daily_written: false`
-            // is the structural signal.
-            print_json_payload(build_json_payload(
-                bd,
-                &orders,
-                n_settled,
-                n_unresolved,
-                realized_total,
-                &keys,
-                &by_strategy,
-                /* pnl_daily_written = */ false,
-            ));
-            return Ok(());
-        }
-        println!(
-            "\n   (no orders settled yet — markets are still open. Re-run after resolution.)"
-        );
-        return Ok(());
-    }
-
-    let row = PnlDaily {
-        day_ms: bd,
-        realized: realized_total,
-        unrealized: 0.0,        // separate concern; populated by compare-pnl-flavoured rollups
-        n_trades: n_settled,
-        llm_cost_usd: 0.0,      // not tracked yet
-    };
-    pnl_repo
-        .upsert(&row)
-        .await
-        .context("pnl_daily.upsert")?;
-    say!(
-        "\n   ✓ upserted polymarket_btc.pnl_daily for day {bd}: realized={:+.2}, n_trades={}",
-        realized_total, n_settled
-    );
-
-    // Write the per-(strategy, exec) breakdown alongside the daily
-    // total. Skip pairs that had no settled trades — there's
-    // nothing to plot for an unresolved-only bucket. Failures are
-    // logged but don't bail the run; the operator-readable output
-    // and pnl_daily upsert above have already landed.
-    let mut n_breakdown = 0u32;
-    let mut breakdown_keys: Vec<&(String, String)> = by_strategy_exec.keys().collect();
-    breakdown_keys.sort();
-    for key in breakdown_keys {
-        let t = &by_strategy_exec[key];
-        if t.n_settled == 0 {
-            continue;
-        }
-        let b = PnlBreakdown {
-            bucket_day_ms: bd,
-            strategy: key.0.clone(),
-            exec: key.1.clone(),
-            realized_pnl: t.realized_pnl,
-            n_settled: t.n_settled as i32,
-        };
-        if let Err(e) = breakdown_repo.upsert(&b).await {
-            eprintln!(
-                "  ! pnl_breakdown upsert failed for ({}, {}): {e}",
-                b.strategy, b.exec
-            );
-        } else {
-            n_breakdown += 1;
-        }
-    }
-    if n_breakdown > 0 {
-        say!(
-            "   ✓ upserted {n_breakdown} pnl_breakdown row(s) for day {bd}"
-        );
-    }
-
-    if json {
-        print_json_payload(build_json_payload(
-            bd,
-            &orders,
-            n_settled,
-            n_unresolved,
-            realized_total,
-            &keys,
-            &by_strategy,
-            /* pnl_daily_written = */ true,
-        ));
-    }
-    Ok(())
 }
 
 #[derive(Default, Debug)]
@@ -262,23 +355,33 @@ struct StrategyTotal {
 
 #[derive(Serialize)]
 struct JsonOut {
+    /// Latest day in the settled window. Kept for backward
+    /// compatibility with single-day callers that grep this field;
+    /// the full list of days is in `bucket_days` below.
     bucket_day_ms: i64,
-    /// Total orders read from the bucket_day partition.
+    /// Every bucket_day processed, oldest first. `len() ==
+    /// days_spanned`. Single-day calls produce a 1-element array
+    /// so downstream tooling can treat the field uniformly.
+    bucket_days: Vec<i64>,
+    days_spanned: u32,
+    /// Grand-total order count across the window.
     n_orders: usize,
-    /// Subset whose market was resolved at scrape time.
+    /// Grand-total settled (resolved-and-paid) order count.
     n_settled: i32,
-    /// Subset whose market is still open (unresolved). Sum of
-    /// `n_settled + n_unresolved` is `n_orders` minus any orders
-    /// that didn't appear in the resolved feed but also weren't
-    /// counted as unresolved (currently none — every order goes
-    /// into one bucket).
+    /// Grand-total still-open order count.
     n_unresolved: u32,
+    /// Grand-total realized PnL ($) across every settled order
+    /// in the window.
     realized_pnl_total: f64,
-    /// Per-strategy roll-up, sorted by strategy name for stable JSON.
+    /// Per-strategy roll-up aggregated across the window.
     strategies: Vec<JsonStrategyAggregate>,
-    /// Whether settle-pnl wrote a row to `polymarket_btc.pnl_daily`
-    /// this run. `false` when zero orders settled — the caller is
-    /// expected to retry post-resolution.
+    /// Per-day breakdown. Useful for charting daily realized PnL
+    /// without recomputing from pnl_daily; mirrors what gets
+    /// written to that table in the same loop.
+    per_day: Vec<JsonDaySummary>,
+    /// True iff at least one bucket_day got a pnl_daily row
+    /// written. Same "anything actually settled" structural
+    /// signal callers used in single-day mode.
     pnl_daily_written: bool,
 }
 
@@ -291,33 +394,53 @@ struct JsonStrategyAggregate {
     realized_pnl: f64,
 }
 
-fn build_json_payload(
-    bd: i64,
-    orders: &[crate::coredb::types::Order],
+#[derive(Serialize)]
+struct JsonDaySummary {
+    bucket_day_ms: i64,
+    n_orders: usize,
     n_settled: i32,
     n_unresolved: u32,
-    realized_total: f64,
-    keys: &[String],
-    by_strategy: &HashMap<String, StrategyTotal>,
+    realized_pnl: f64,
+}
+
+fn build_json_payload_multi(
+    bucket_days: &[Millis],
+    day_summaries: &[DaySummary],
+    grand_orders: usize,
+    grand_settled: i32,
+    grand_unresolved: u32,
+    grand_realized: f64,
+    grand_by_strategy: &HashMap<String, StrategyTotal>,
     pnl_daily_written: bool,
 ) -> JsonOut {
+    let mut keys: Vec<&String> = grand_by_strategy.keys().collect();
+    keys.sort();
     JsonOut {
-        bucket_day_ms: bd,
-        n_orders: orders.len(),
-        n_settled,
-        n_unresolved,
-        realized_pnl_total: realized_total,
+        bucket_day_ms: *bucket_days.last().unwrap_or(&0),
+        bucket_days: bucket_days.to_vec(),
+        days_spanned: bucket_days.len() as u32,
+        n_orders: grand_orders,
+        n_settled: grand_settled,
+        n_unresolved: grand_unresolved,
+        realized_pnl_total: grand_realized,
         strategies: keys
             .iter()
-            .map(|k| {
-                let t = &by_strategy[k];
-                JsonStrategyAggregate {
-                    strategy: k.clone(),
-                    n_orders: t.n_orders,
-                    n_settled: t.n_settled,
-                    n_unresolved: t.n_unresolved,
-                    realized_pnl: t.realized_pnl,
-                }
+            .map(|k| JsonStrategyAggregate {
+                strategy: (*k).clone(),
+                n_orders: grand_by_strategy[*k].n_orders,
+                n_settled: grand_by_strategy[*k].n_settled,
+                n_unresolved: grand_by_strategy[*k].n_unresolved,
+                realized_pnl: grand_by_strategy[*k].realized_pnl,
+            })
+            .collect(),
+        per_day: day_summaries
+            .iter()
+            .map(|d| JsonDaySummary {
+                bucket_day_ms: d.bucket_day_ms,
+                n_orders: d.n_orders,
+                n_settled: d.n_settled,
+                n_unresolved: d.n_unresolved,
+                realized_pnl: d.realized_total,
             })
             .collect(),
         pnl_daily_written,

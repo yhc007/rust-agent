@@ -305,11 +305,23 @@ enum Commands {
     SettlePnl {
         #[arg(long, env = "COREDB_URI", default_value = "127.0.0.1:9042")]
         coredb_uri: String,
+        /// Number of UTC days back from "today" to process (default
+        /// 1 = today only, the historical behavior). Phase 5
+        /// addition: paper positions written on earlier days whose
+        /// markets have since resolved on Polymarket weren't
+        /// settleable in single-day mode. Widening the window
+        /// recovers them.
+        #[arg(long, default_value_t = 1, conflicts_with = "since")]
+        days: u32,
+        /// Anchor the window at a precise start (RFC3339 or
+        /// `N{s,m,h,d}`). Same parser shape as compare-pnl /
+        /// digest --since. Conflicts with --days.
+        #[arg(long)]
+        since: Option<String>,
         /// Emit one JSON object to stdout instead of the human-
         /// readable table. Same data, jq-friendly. The
-        /// `pnl_daily_written` field signals whether the
-        /// `pnl_daily` upsert actually fired (false when no orders
-        /// settled yet — re-run after market resolution).
+        /// `pnl_daily_written` field signals whether ≥1 bucket_day
+        /// got a pnl_daily upsert this run.
         #[arg(long)]
         json: bool,
     },
@@ -580,8 +592,16 @@ async fn main() -> Result<()> {
             )
             .await?;
         }
-        Some(Commands::SettlePnl { coredb_uri, json }) => {
-            backtest::settle::run(&coredb_uri, json).await?;
+        Some(Commands::SettlePnl { coredb_uri, days, since, json }) => {
+            let since_ms = match since {
+                Some(s) => Some(
+                    backtest::compare::parse_since(&s, crate::coredb::types::now_ms())
+                        .map_err(|e| anyhow::anyhow!("parse --since: {e}"))?,
+                ),
+                None => None,
+            };
+            let plan = backtest::settle::SettlePlan { days, since_ms, json };
+            backtest::settle::run_with_plan(&coredb_uri, plan).await?;
         }
         Some(Commands::Positions { coredb_uri }) => {
             run_positions(&coredb_uri).await?;
