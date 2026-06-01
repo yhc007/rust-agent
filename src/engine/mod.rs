@@ -308,9 +308,10 @@ impl QueryEngine {
             // Emit text content
             for block in &response.content {
                 if let ContentBlock::Text { text } = block {
-                    let _ = tx.send(AgentEvent::Text {
-                        content: text.clone(),
-                    });
+                    let content = strip_thinking_tokens(text);
+                    if !content.is_empty() {
+                        let _ = tx.send(AgentEvent::Text { content });
+                    }
                 }
             }
 
@@ -405,6 +406,25 @@ impl QueryEngine {
 /// Hanja could trip it. In practice the failure mode we're catching
 /// is "model emits a whole Chinese sentence" which has dozens of CJK
 /// chars and zero Hangul, so the heuristic is comfortable.
+/// Strip Gemma4-style thinking channel tokens: `<|channel>thought\n<channel|>`.
+/// Also handles variants without the newline. Returns the remaining prose trimmed.
+fn strip_thinking_tokens(text: &str) -> String {
+    // Pattern: <|channel>...<channel|>  (greedy — removes all occurrences)
+    let mut s = text;
+    let mut out = String::new();
+    while let Some(start) = s.find("<|channel>") {
+        out.push_str(&s[..start]);
+        if let Some(end) = s[start..].find("<channel|>") {
+            s = &s[start + end + "<channel|>".len()..];
+        } else {
+            // Unclosed tag — drop the rest
+            s = "";
+        }
+    }
+    out.push_str(s);
+    out.trim().to_string()
+}
+
 fn has_chinese_prose(text: &str) -> bool {
     let mut cjk = 0usize;
     let mut hangul = 0usize;
